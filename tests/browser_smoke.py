@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Browser integration checks against an already running local server.
+
+Run: python3 tests/browser_smoke.py --url http://127.0.0.1:8080
+Requires Playwright and its Chromium browser. Game-launch tests use an explicit
+mock runtime; passing these checks does not establish Warcraft compatibility.
+"""
+import argparse
+import asyncio
+import json
+import time
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+
+
+async def wait_for(page, expression):
+    # Evaluate via DevTools rather than injecting eval into a CSP-protected page.
+    async with asyncio.timeout(30):
+        while not await page.evaluate(expression):
+            await asyncio.sleep(.05)
+
+
+async def check_storage(page):
+    result = await page.evaluate("""async () => {
+      const {SaveStore} = await import('/src/storage.mjs');
+      const store = new SaveStore();
+      const db = await store.open();
+      const check = (condition, message) => { if (!condition) throw new Error(message); };
+      const rejects = async callback => { try { await callback(); return false; } catch { return true; } };
+      const seed = (count, size = 0) => new Promise((resolve, reject) => {
+        const tx = db.transaction('files', 'readwrite');
+        tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+        const files = tx.objectStore('files'); files.clear();
+        const data = new ArrayBuffer(size);
+        for (let i = 0; i < count; i++) files.put({path: `save-${i}`, data, modified: 1});
+      });
+      const archive = async paths => {
+        const value = new Uint8Array([7]);
+        const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', value)), b => b.toString(16).padStart(2, '0')).join('');
+        return JSON.stringify({format: 'wc3-web-saves-v1', files: paths.map(path => ({path, data: 'Bw==', sha256, modified: 1}))});
+      };
+      await seed(0);
+      await store.write('Profiles/Test.w3v', new Uint8Array([1, 2, 3]));
+      const exported = await store.export();
+      await store.remove('Profiles/Test.w3v');
+      await store.import(exported);
+      check((await store.read('Profiles/Test.w3v')).join(',') === '1,2,3', 'Save roundtrip');
+      check(await rejects(() => store.write('../escape', new Uint8Array())), 'Traversal rejected');
+      const corrupt = JSON.parse(exported); corrupt.files[0].sha256 = 'bad';
+      check(await rejects(() => store.import(JSON.stringify(corrupt))), 'Integrity check');
+      check((await store.read('Profiles/Test.w3v'))[0] === 1, 'Corrupt import preserved data');
+      await store.applyChanges({files:[{path:'Save/new.w3z',data:new Uint8Array([4,5])}],deleted:['Profiles/Test.w3v']});
+      check(await store.read('Profiles/Test.w3v')===null&&(await store.read('Save/new.w3z')).join(',')==='4,5','Overlay replacement and deletion');
+      check(await rejects(()=>store.applyChanges({files:[{path:'bad',data:new Uint8Array(32*1024*1024+1)}],deleted:['Save/new.w3z']})), 'Oversized overlay rejected');
+      check((await store.read('Save/new.w3z')).join(',')==='4,5'&&await store.read('bad')===null,'Overlay deletion rolls back with failed replacement');
+
+      await seed(4096);
+      check(await rejects(() => store.write('extra', new Uint8Array([1]))), 'Write file-count quota');
+      const countImport = await archive(['save-0', 'extra']);
+      check(await rejects(() => store.import(countImport)), 'Import merged file-count quota');
+      check((await store.read('save-0')).length === 0 && await store.read('extra') === null, 'Quota import atomicity');
+
+      await seed(4095);
+      const concurrent = await Promise.allSettled([
+        store.write('concurrent-a', new Uint8Array([1])),
+        store.write('concurrent-b', new Uint8Array([1])),
+      ]);
+      check(concurrent.filter(x => x.status === 'fulfilled').length === 1, 'Concurrent quota serialized');
+      check((await store.list()).length === 4096, 'Concurrent file-count cap');
+
+      await seed(4, 32 * 1024 * 1024);
+      check(await rejects(() => store.write('extra', new Uint8Array([1]))), 'Write total-size quota');
+      const sizeImport = await archive(['extra']);
+      check(await rejects(() => store.import(sizeImport)), 'Import merged total-size quota');
+      check(await store.read('extra') === null, 'No partial oversized import');
+      await store.write('save-0', new Uint8Array([2]));
+      await store.write('extra', new Uint8Array([3]));
+      check((await store.read('extra'))[0] === 3, 'Replacing a file releases quota');
+      await seed(0);
+      return {roundtrip: true, integrity: true, countQuota: true, concurrentQuota: true, sizeQuota: true};
+    }""")
+    print("IndexedDB:", json.dumps(result))
+
+
+async def check_default_language(browser, base):
+    # Without a chosen language the page follows the visitor's country
+    # (/api/locale), else the browser; a chosen language always wins.
+    async def open_page(locale, country=None, hang=False):
+        context = await browser.new_context(locale=locale)
+        page = await context.new_page()
+        if hang:
+            await page.route('**/api/locale', lambda route: None)  # never answers
+        elif country is not None:
+            await page.route('**/api/locale', lambda route: route.fulfill(json={'language': country}))
+        started = time.monotonic()
+        await page.goto(base)
+        await wait_for(page, '!document.documentElement.hasAttribute("data-pending-language")')
+        return context, page, time.monotonic() - started
+
+    context, page, _ = await open_page('en-US')
+    assert await page.evaluate('document.documentElement.lang') == 'en', 'Unknown country: browser language'
+    assert await page.locator('#launch').inner_text() == 'Play\nEnter'
+    await context.close()
+    context, page, _ = await open_page('en-US', 'ru')
+    assert await page.evaluate('document.documentElement.lang') == 'ru', 'CIS country: Russian'
+    assert await page.locator('#language').input_value() == 'ru'
+    await page.locator('#language').select_option('en')
+    await page.reload()
+    await wait_for(page, '!document.documentElement.hasAttribute("data-pending-language")')
+    assert await page.evaluate('document.documentElement.lang') == 'en', 'A chosen language wins over the country'
+    await context.close()
+    context, page, _ = await open_page('ru-RU', 'en')
+    assert await page.evaluate('document.documentElement.lang') == 'en', 'Other countries: English'
+    await context.close()
+    context, page, elapsed = await open_page('ru-RU', hang=True)
+    assert await page.evaluate('document.documentElement.lang') == 'ru' and elapsed < 4, 'A silent server must not hold the page'
+    assert await page.locator('#launch').is_visible()
+    await context.close()
+    print('Default page language: country, browser fallback and chosen language passed')
+
+
+async def check_launch_and_lobby(browser, base):
+    context = await browser.new_context(viewport={"width": 1440, "height": 1000}, locale='ru-RU')
+    page = await context.new_page()
+    errors = []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    async def status(route):
+        response = await route.fetch()
+        value = await response.json()
+        value['runtime'].update(diagnostics=True, installed=True, moduleUrl='/runtime/launcher-fixture.mjs')
+        value['game']['prepared'] = True
+        await route.fulfill(json=value)
+    await page.route('**/api/status', status)
+    await page.route('**/runtime/launcher-fixture.mjs', lambda route: route.fulfill(
+        content_type='text/javascript', body='''
+          // Only launcher lifecycle is tested; no Warcraft code executes here.
+          export async function runDiagnostics(options) {
+            window.fixtureOptions=options;
+            options.onStatus('Launcher fixture started');
+            await new Promise(resolve=>window.fixtureReady=resolve);
+            options.onFrame({frames:12,width:options.resolution.width,height:options.resolution.height});
+            return {async stop(){window.fixtureStopped=true;},
+              async finish(){await options.saves.write('save/launcher.bin',new Uint8Array([11,12]));
+                options.onReport({fixture:true});}};
+          }
+        '''))
+    await page.goto(base)
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    await page.locator('#tab-game').click()
+    assert await page.locator('#resolution').input_value() == '1280x960', 'Default resolution'
+    assert await page.locator('#resolution option').count() == 8
+    # Settings saved before version 2 recorded the old default 1024×768.
+    for saved, expected in (({'resolution': '1024x768'}, '1280x960'), ({'version': 2, 'resolution': '1024x768'}, '1024x768'),
+                            ({'resolution': '1600x1200'}, '1600x1200')):
+        await page.evaluate('value => localStorage.setItem("wc3-launch-settings", JSON.stringify(value))', saved)
+        await page.reload()
+        await wait_for(page, '!document.getElementById("launch").disabled')
+        assert await page.locator('#resolution').input_value() == expected, (saved, expected)
+    await page.locator('#tab-game').click()
+    await page.locator('#resolution').select_option('800x600')
+    await page.locator('#audio-enabled').uncheck()
+    # Warcraft's own Video options, chosen before launch.
+    await page.locator('#video-texquality').select_option('0')
+    await page.locator('#video-unitshadows').uncheck()
+    await page.locator('#video-gamma').fill('55')
+    await page.reload()
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert await page.locator('#resolution').input_value() == '800x600', 'Resolution was not persisted'
+    assert not await page.locator('#audio-enabled').is_checked(), 'Audio setting was not persisted'
+    assert await page.locator('#video-texquality').input_value() == '0', 'Texture quality was not persisted'
+    assert not await page.locator('#video-unitshadows').is_checked(), 'Shadows were not persisted'
+    assert await page.locator('#video-gamma').input_value() == '55', 'Gamma was not persisted'
+    await page.locator('#tab-online').click()
+    await page.locator('#lobby-name').fill('Launcher browser test')
+    await page.locator('#create-lobby').click()
+    await wait_for(page, '!document.getElementById("joined-lobby").hidden && !document.getElementById("launch").disabled')
+    assert await page.locator('#joined-name').inner_text() == 'Launcher browser test'
+    assert '1 / 200' in await page.locator('#joined-players').inner_text()
+
+    # Second browser joins the listed lobby through the same UI and real relay.
+    guest_context = await browser.new_context(locale='ru-RU')
+    guest = await guest_context.new_page()
+    await guest.goto(base)
+    await wait_for(guest, '!document.getElementById("launch").disabled')
+    await guest.locator('#tab-online').click()
+    await guest.locator('.lobby-row', has_text='Launcher browser test').locator('button').click()
+    await wait_for(page, 'document.getElementById("joined-players").textContent.includes("2 / 200")')
+    await wait_for(guest, 'document.getElementById("joined-players").textContent.includes("2 / 200")')
+    await guest.locator('#leave-lobby').click()
+    await wait_for(page, 'document.getElementById("joined-players").textContent.includes("1 / 200")')
+    await guest_context.close()
+    await page.bring_to_front()
+    # Delay completion of the real fullscreen request to make the startup/stop
+    # race deterministic, while still exercising Chromium's true fullscreen.
+    await page.evaluate('''() => {
+      window.originalFullscreen = Element.prototype.requestFullscreen;
+      Element.prototype.requestFullscreen = function(options) {
+        const entered = window.originalFullscreen.call(this, options);
+        return Promise.all([entered, new Promise(resolve => window.fixtureFullscreenReady = resolve)]);
+      };
+    }''')
+
+    await page.locator('#launch').click()
+    await wait_for(page, '!!window.fixtureReady')
+    await wait_for(page, 'document.fullscreenElement?.id === "game-view"')
+    assert await page.evaluate('document.fullscreenElement?.id') == 'game-view', 'Launch must request true fullscreen during user gesture'
+    assert await page.locator('#launch').is_disabled(), 'A second session must not start'
+    assert await page.evaluate('fixtureOptions.timeout === 0 && fixtureOptions.dispatchBudget === 0'), 'Interactive launch must not expire'
+    assert await page.evaluate('fixtureOptions.transport.peerId > 0'), 'Actual lobby was not passed'
+    assert await page.evaluate('fixtureOptions.resolution.width === 800 && fixtureOptions.resolution.height === 600 && fixtureOptions.audioEnabled === false')
+    assert await page.evaluate('!fixtureOptions.map'), 'Browser must not choose a game map'
+    assert await page.evaluate('fixtureOptions.language') == 'ru', 'The game language must follow the page language'
+    assert await page.evaluate('fixtureOptions.graphicsSettings') == {'gamma': 55, 'modeldetail': 2, 'animquality': 2, 'texquality': 0, 'particles': 2, 'lights': 2, 'unitshadows': 0, 'occlusion': 1, 'spellfilter': 2}
+    assert await page.locator('#video-modeldetail').is_disabled(), 'Graphics settings must not change during a session'
+    # OK in the game's Video options updates the launcher; invalid values are ignored.
+    await page.evaluate("fixtureOptions.onGraphicsSetting('modeldetail', 1); fixtureOptions.onGraphicsSetting('modeldetail', 7)")
+    assert await page.locator('#video-modeldetail').input_value() == '1', 'In-game graphics change was not shown'
+    assert await page.evaluate("JSON.parse(localStorage.getItem('wc3-launch-settings')).graphics.modeldetail") == 1, 'In-game graphics change was not stored'
+    # "Playing now": this page's game runs over its LAN lobby.
+    await wait_for(page, 'document.getElementById("online-playing").textContent === "1" && document.getElementById("online-lan").textContent === "1" && +document.getElementById("online-site").textContent >= 1')
+    assert await page.locator('#stop-diagnostic').is_hidden(), 'The toolbar must not cover the fullscreen game'
+    # A user leaves fullscreen with a held Escape first. Clicking the hidden
+    # button directly keeps the cancellation race with an unsettled request.
+    await page.locator('#stop-diagnostic').dispatch_event('click')
+    assert await page.locator('#launch').is_disabled(), 'A late controller is still pending'
+    await page.evaluate('fixtureReady()')
+    await wait_for(page, 'window.fixtureStopped')
+    assert await page.locator('#launch').is_disabled(), 'Fullscreen transition must settle before another game starts'
+    await page.evaluate('() => { fixtureFullscreenReady(); Element.prototype.requestFullscreen = originalFullscreen; }')
+    await wait_for(page, 'window.fixtureStopped && !document.getElementById("launch").disabled')
+    assert await page.evaluate('document.fullscreenElement === null'), 'Fullscreen was not released on cancellation'
+    await wait_for(page, 'document.getElementById("online-playing").textContent === "0" && document.getElementById("online-lan").textContent === "0"')
+    assert await page.evaluate('fixtureOptions.transport.socket.readyState === WebSocket.OPEN'), 'Stopping must retain Garena-style lobby membership'
+    await page.evaluate('window.fixtureReady=null')
+    await page.locator('#launch').click()
+    await wait_for(page, '!!window.fixtureReady')
+    await page.evaluate('fixtureReady()')
+    await wait_for(page, 'document.body.dataset.phase === "running"')
+    bounds = await page.locator('#diagnostic-canvas').bounding_box()
+    assert abs(bounds['width']/bounds['height']-4/3)<.002, 'Fullscreen must preserve actual canvas bounds without internal letterboxing'
+    assert await page.locator('#diagnostic-fullscreen').is_hidden(), 'The toolbar must not cover the fullscreen game'
+    await page.evaluate('document.exitFullscreen()')  # what a held Escape does
+    await wait_for(page, 'document.fullscreenElement === null')
+    assert await page.locator('#diagnostic-fullscreen').is_visible(), 'The toolbar must return after fullscreen'
+    await page.set_viewport_size({'width': 900, 'height': 650})
+    await page.wait_for_timeout(100)
+    bounds = await page.locator('#diagnostic-canvas').bounding_box()
+    assert abs(bounds['width']/bounds['height']-4/3)<.002, 'Window resize must preserve game coordinates'
+    await page.locator('#diagnostic-fullscreen').click()
+    await wait_for(page, 'document.fullscreenElement?.id === "game-view"')
+    await page.evaluate('document.exitFullscreen()')
+    await wait_for(page, 'document.fullscreenElement === null')
+    await page.locator('#stop-diagnostic').click()
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert await page.evaluate('fixtureOptions.transport.socket.readyState === WebSocket.OPEN'), 'Finished game disconnected the lobby'
+    assert await page.evaluate("async()=>Array.from(await fixtureOptions.saves.read('save/launcher.bin')).join(',')") == '11,12'
+    await page.locator('#leave-lobby').click()
+    await wait_for(page, 'fixtureOptions.transport.socket === null')
+    # Play outside a lobby: the server seats the player in the first shared
+    # lobby with a free seat, and the game gets that lobby's transport.
+    await page.evaluate('window.fixtureReady=null')
+    await page.locator('#launch').click()
+    await wait_for(page, '!!window.fixtureReady')
+    assert await page.evaluate('fixtureOptions.transport.room') == 'shared-ru-1', 'Play did not join Russian shared lobby 1'
+    assert await page.evaluate('fixtureOptions.transport.lobby.language') == 'ru'
+    assert await page.evaluate('fixtureOptions.transport.lobby.maxPlayers') == 200
+    await page.evaluate('fixtureReady()')
+    await wait_for(page, 'document.body.dataset.phase === "running"')
+    assert await page.locator('#joined-name').inner_text() == 'Общее лобби 1'
+    await page.evaluate('document.fullscreenElement && document.exitFullscreen()')
+    await wait_for(page, 'document.fullscreenElement === null')
+    await page.locator('#stop-diagnostic').click()
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    await page.locator('#leave-lobby').click()
+    await wait_for(page, 'fixtureOptions.transport.socket === null')
+    await page.reload()
+    async with page.expect_download() as downloaded:
+        await page.locator('#download-log').click()
+    downloaded = await downloaded.value
+    assert 'Launcher fixture started' in Path(await downloaded.path()).read_text(), 'Last game log must survive reload'
+    assert not errors, errors
+    await context.close()
+    print('Launcher fixture: public lobby/create/join/leave, late cancellation, settings, fullscreen/resize, restart, persistent log and save passed')
+
+
+async def main(base):
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            context = await browser.new_context(viewport={"width": 1440, "height": 1000}, locale='ru-RU')
+            page = await context.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            map_requests = []
+            page.on('request', lambda request: map_requests.append(request.url) if '/api/maps' in request.url else None)
+            await page.goto(base)
+            await wait_for(page, 'document.body.dataset.phase !== "loading"')
+            assert await page.locator('h1').inner_text() == 'The Frozen Throne Revived'
+            assert await page.evaluate('crossOriginIsolated'), 'COOP/COEP headers missing'
+            assert await page.locator('#map-list, .crest, .hero, [data-mode]').count() == 0, 'Old marketing/map selection UI remains'
+            assert not map_requests, 'Launcher must not fetch the map catalog'
+            assert 'Donate' not in await page.locator('body').inner_text()
+            assert await page.locator('[data-info-tab]').count() == 2
+            assert await page.locator('#info-pane-about').is_visible()
+            assert await page.locator('#info-pane-credits').is_hidden()
+            assert 'русская и английская версии Warcraft' in await page.locator('#info-pane-about').inner_text()
+            await page.locator('#info-tab-credits').click()
+            assert await page.locator('#info-pane-credits').is_visible()
+            assert await page.locator('#tab-saves').get_attribute('aria-selected') == 'true', 'Info tabs changed the game pane'
+            assert await page.locator('#info-pane-credits a').first.get_attribute('href') == 'https://github.com/alexeyskov/w3ft-web'
+            await page.keyboard.press('Home')
+            assert await page.locator('#info-tab-about').get_attribute('aria-selected') == 'true'
+            await page.keyboard.press('ArrowRight')
+            assert await page.locator('#info-tab-credits').get_attribute('aria-selected') == 'true'
+            assert await page.locator('#info-tab-credits').evaluate('(node)=>node===document.activeElement')
+            # A standalone diagnostic canvas has its own Enter handling while
+            # the site's normal session flag is false. Do not launch another
+            # original game in response to that canvas's keyboard input.
+            await page.evaluate('''() => {
+              window.fixtureLaunchEvents=0;
+              window.fixturePreventLaunch=event=>{window.fixtureLaunchEvents++;event.preventDefault();event.stopImmediatePropagation();};
+              document.getElementById('launch').addEventListener('click',fixturePreventLaunch,true);
+              const canvas=document.createElement('canvas');canvas.id='outside-game-canvas';canvas.tabIndex=0;
+              canvas.style='position:fixed;left:0;bottom:0;width:8px;height:8px';
+              document.body.append(canvas);
+              const handled=document.createElement('div');handled.id='handled-key';handled.tabIndex=0;
+              handled.addEventListener('keydown',event=>event.preventDefault());document.body.append(handled);
+            }''')
+            await page.locator('#outside-game-canvas').press('Enter')
+            await page.locator('#handled-key').press('Enter')
+            await page.evaluate("document.getElementById('outside-game-canvas').addEventListener('keydown',event=>event.preventDefault())")
+            await page.locator('#outside-game-canvas').press('Enter')
+            assert await page.evaluate('fixtureLaunchEvents') == 0, 'Handled/canvas Enter tried to launch a second game'
+            await page.evaluate('''() => {
+              document.getElementById('launch').removeEventListener('click',fixturePreventLaunch,true);
+              document.getElementById('outside-game-canvas').remove();document.getElementById('handled-key').remove();
+            }''')
+            discord = page.locator('#discord')
+            assert await discord.get_attribute('href') == 'https://discord.gg/pN2896BKA'
+            # The invitation opens in a new tab; the launcher stays.
+            assert (await discord.get_attribute('target'), await discord.get_attribute('rel')) == ('_blank', 'noopener noreferrer')
+            assert await discord.get_attribute('aria-disabled') is None
+            await page.locator('#changelog-open').click()
+            assert await page.locator('#changelog').is_visible()
+            await page.keyboard.press('Escape')
+            assert await page.locator('#changelog').is_hidden()
+            await page.locator('#language').select_option('en')
+            assert await page.locator('#launch').inner_text() == 'Play\nEnter'
+            assert await page.locator('#info-tab-about').inner_text() == 'About'
+            assert await page.locator('#info-tab-credits').inner_text() == 'Credits'
+            assert await page.locator('#info-pane-credits').is_visible(), 'Language change reset the info tab'
+            assert 'The launcher layout, static recompilation tools' in await page.locator('#info-pane-credits').inner_text()
+            Path('var/qa').mkdir(parents=True, exist_ok=True)
+            await page.locator('#about-project').screenshot(path='var/qa/info-credits-en.png')
+            await page.locator('#info-tab-about').click()
+            assert 'Russian and English editions of Warcraft' in await page.locator('#info-pane-about').inner_text()
+            await page.locator('#about-project').screenshot(path='var/qa/info-about-en.png')
+            await page.locator('#language').select_option('ru')
+            assert await page.locator('#info-tab-about').inner_text() == 'О проекте'
+            await page.locator('#info-tab-credits').click()
+            assert 'Оформление лаунчера' in await page.locator('#info-pane-credits').inner_text()
+            await page.locator('#about-project').screenshot(path='var/qa/info-credits-ru.png')
+            await page.locator('#info-tab-about').click()
+            await page.locator('#tab-saves').focus()
+            await page.keyboard.press('ArrowRight')
+            assert await page.locator('#tab-online').get_attribute('aria-selected') == 'true'
+            await page.locator('#tab-saves').click()
+            Path('var/qa').mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path='var/qa/launcher-desktop.png', full_page=True)
+            for width in [1024, 820, 768, 390, 320]:
+                await page.set_viewport_size({'width': width, 'height': 844})
+                assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth'), f'Horizontal overflow at {width}px'
+                assert await page.locator('#about-project').is_visible(), f'About card hidden at {width}px'
+                if width <= 800:
+                    content=await page.locator('.content').bounding_box()
+                    info=await page.locator('#about-project').bounding_box()
+                    assert info['y']>=content['y']+content['height'], 'Mobile info precedes game controls'
+            await page.set_viewport_size({'width': 390, 'height': 844})
+            await page.screenshot(path='var/qa/launcher-mobile.png', full_page=True)
+            await check_storage(page)
+            await page.evaluate("""async () => {
+                const {SaveStore} = await import('/src/storage.mjs');
+                await new SaveStore().write('Profiles/Reload.w3v', new Uint8Array([4, 5, 6]));
+            }""")
+            await page.reload()
+            await wait_for(page, "document.getElementById('save-count').textContent === '1'")
+            async with page.expect_download() as downloaded:
+                await page.locator('#export-saves').click()
+            exported = Path(await (await downloaded.value).path()).read_bytes()
+            archive = json.loads(exported)
+            assert archive['format'] == 'wc3-web-saves-v1' and len(archive['files']) == 1
+            await page.evaluate("""async () => {
+                const {SaveStore} = await import('/src/storage.mjs');
+                await new SaveStore().remove('Profiles/Reload.w3v');
+            }""")
+            await page.locator('#import-saves').set_input_files({'name':'saves.json','mimeType':'application/json','buffer':exported})
+            await wait_for(page, 'document.getElementById("save-status").textContent.includes("восстановлены")')
+            assert await page.evaluate("""async () => {
+                const {SaveStore} = await import('/src/storage.mjs');
+                return (await new SaveStore().read('Profiles/Reload.w3v')).join(',');
+            }""") == '4,5,6'
+            assert not errors, errors
+            await context.close()
+            await check_launch_and_lobby(browser, base)
+            await check_default_language(browser, base)
+            print('Browser integration passed. Warcraft execution was not tested.')
+        finally:
+            await browser.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", default="http://127.0.0.1:8080")
+    asyncio.run(main(parser.parse_args().url))

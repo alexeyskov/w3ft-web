@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ru" data-pending-language>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b1118">
+<meta name="description" content="Warcraft III: The Frozen Throne в браузере. Кампания, сохранения и LAN-лобби.">
+<title>The Frozen Throne Revived</title>
+<link rel="stylesheet" href="/styles/main.css">
+<script type="module" src="/src/app.mjs"></script>
+</head>
+<body data-phase="loading">
+<main class="app" id="app">
+  <header class="top">
+    <div class="brand"><h1>The Frozen Throne Revived</h1><p class="hint" data-i18n="fan">Фанатский проект. Не связан с Blizzard Entertainment.</p></div>
+    <nav class="top-end" aria-label="Сайт">
+      <label class="language"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c5 5 5 13 0 18M12 3c-5 5-5 13 0 18"/></svg><select id="language" aria-label="Язык страницы"><option value="ru">Русский</option><option value="en">English</option></select></label>
+      <button class="btn" id="changelog-open" aria-haspopup="dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12M3 6h1M3 12h1M3 18h1"/></svg><span data-i18n="changelog">Изменения</span></button>
+      <a class="btn" id="discord" href="https://discord.gg/pN2896BKA" target="_blank" rel="noopener noreferrer">Discord</a>
+    </nav>
+  </header>
+  <aside class="side">
+    <section class="panel launch-panel" aria-label="Запуск игры">
+      <h2 class="status" id="status" role="status">Загрузка</h2><p class="status-sub" id="status-sub">Проверяем файлы игры.</p>
+      <button class="play" id="launch" disabled><span data-i18n="play">Играть</span><kbd>Enter</kbd></button>
+      <button class="text-button" id="download-log" data-i18n="downloadLog">Скачать журнал</button>
+      <p class="hint" data-i18n="logHint">После перезагрузки журнал последней игры остаётся доступен.</p>
+      <p class="notice" id="launch-message" role="status" hidden></p>
+    </section>
+    <section class="panel online" aria-labelledby="online-title"><h2 id="online-title" data-i18n="playingNow">Сейчас играют</h2><dl class="online-counts"><div><dt data-i18n="onlinePlaying">в игре</dt><dd id="online-playing">—</dd></div><div><dt data-i18n="onlineLan">по сети</dt><dd id="online-lan">—</dd></div><div><dt data-i18n="onlineSite">на сайте</dt><dd id="online-site">—</dd></div></dl></section>
+    <section class="panel about-card" id="about-project" aria-label="О проекте" data-info-label>
+      <div class="tabs" role="tablist" aria-label="О проекте" data-info-label>
+        <button class="tab" id="info-tab-about" type="button" role="tab" aria-selected="true" aria-controls="info-pane-about" data-info-tab="about" data-i18n="about">О проекте</button>
+        <button class="tab" id="info-tab-credits" type="button" role="tab" aria-selected="false" aria-controls="info-pane-credits" tabindex="-1" data-info-tab="credits" data-i18n="credits">Авторы</button>
+      </div>
+      <div class="prose" id="info-pane-about" role="tabpanel" aria-labelledby="info-tab-about">
+        <p data-i18n="aboutLead">Оригинальный Warcraft III: The Frozen Throne в браузере. Игровой код перекомпилирован в WebAssembly, графика работает через WebGL 2, звук — через Web Audio.</p>
+        <p data-i18n="aboutPlay">Кампания, сражения и карты выбираются в самой игре. Сохранения остаются в браузере, а с друзьями можно играть через LAN-лобби.</p>
+        <p data-i18n="aboutEditions">Поддерживаются русская и английская версии Warcraft. Язык игры совпадает с выбранным языком сайта.</p>
+        <p><span data-i18n="aboutHelp">Вопросы и сообщения об ошибках — в</span> <a href="https://github.com/alexeyskov/w3ft-web/issues" target="_blank" rel="noopener noreferrer">GitHub Issues</a>.</p>
+        <p class="hint"><span data-i18n="aboutDisclaimer">Независимый фанатский проект. Не связан с Blizzard Entertainment и не одобрен компанией.</span> <a href="https://github.com/alexeyskov/w3ft-web/blob/main/docs/SELF_HOSTING.md" target="_blank" rel="noopener noreferrer" data-i18n="aboutSelfHosting">Запуск со своей копией игры</a>.</p>
+      </div>
+      <div class="prose" id="info-pane-credits" role="tabpanel" aria-labelledby="info-tab-credits" hidden>
+        <p><span data-i18n="creditsSource">Исходный код — на</span> <a href="https://github.com/alexeyskov/w3ft-web" target="_blank" rel="noopener noreferrer">GitHub</a>.</p>
+        <p><span data-i18n="creditsAdapted">Оформление лаунчера, инструменты статической перекомпиляции и CPU-функции адаптированы из</span> <a href="https://github.com/th0mk/nfsu2-web" target="_blank" rel="noopener noreferrer">nfsu2-web</a> (th0mk), <span data-i18n="creditsBased">основанного на</span> <a href="https://github.com/TalhaMudo/NFSU2Recomp" target="_blank" rel="noopener noreferrer">NFSU2Recomp</a> <span data-i18n="creditsAuthor">авторства Talha Müderrisoğlu</span>. <span data-i18n="creditsPinned">Заимствованные файлы взяты из закреплённой</span> <a href="https://github.com/th0mk/nfsu2-web/tree/3e61f9c37cb7ce4084dde182047c1b782bd9ac1a" target="_blank" rel="noopener noreferrer" data-i18n="creditsMitVersion">MIT-версии</a>.</p>
+        <p><span data-i18n="creditsMpq">Справочная реализация формата MPQ —</span> <a href="https://github.com/ladislav-zezula/StormLib" target="_blank" rel="noopener noreferrer">StormLib</a>. <span data-i18n="creditsGeo">IP-геолокация —</span> <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">DB-IP</a> (<a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">CC BY 4.0</a>).</p>
+        <p><a href="/runtime/LICENSE.txt" target="_blank" rel="noopener" data-i18n="creditsLicense">Лицензия MIT</a> · <a href="/runtime/THIRD_PARTY_NOTICES.txt" target="_blank" rel="noopener" data-i18n="creditsNotices">Сторонние компоненты и уведомления</a></p>
+        <p class="hint" data-i18n="creditsWarcraft">Warcraft III: The Frozen Throne и Blizzard Entertainment — товарные знаки Blizzard Entertainment, Inc. Права на игровые материалы сохраняются за их правообладателями.</p>
+      </div>
+    </section>
+  </aside>
+  <section class="panel content">
+    <div class="tabs" role="tablist" aria-label="Параметры игры">
+      <button class="tab" id="tab-saves" role="tab" aria-selected="true" aria-controls="pane-saves" data-tab="saves" data-i18n="saves">Сохранения</button>
+      <button class="tab" id="tab-online" role="tab" aria-selected="false" aria-controls="pane-online" tabindex="-1" data-tab="online" data-i18n="online">Сеть</button>
+      <button class="tab" id="tab-game" role="tab" aria-selected="false" aria-controls="pane-game" tabindex="-1" data-tab="game" data-i18n="game">Игра</button>
+      <button class="tab" id="tab-controls" role="tab" aria-selected="false" aria-controls="pane-controls" tabindex="-1" data-tab="controls" data-i18n="controls">Управление</button>
+    </div>
+    <div id="pane-saves" role="tabpanel" aria-labelledby="tab-saves">
+      <div class="panel-head"><h2><span data-i18n="profiles">Профили и сохранения</span> <span class="count" id="save-count">0</span></h2></div>
+      <div class="row save-actions"><button class="btn" id="export-saves" data-i18n="backup">Скачать копию</button><label class="btn file-button"><span data-i18n="restore">Восстановить</span><input id="import-saves" type="file" accept="application/json,.json" aria-label="Восстановить сохранения"></label></div>
+      <p class="hint" data-i18n="saveHint">Сохранения остаются в этом браузере. Скачайте копию, чтобы перенести их на другое устройство.</p><div class="file-list" id="save-list"></div><p class="notice" id="save-status" role="status" hidden></p>
+    </div>
+    <div id="pane-online" role="tabpanel" aria-labelledby="tab-online" hidden>
+      <div class="panel-head"><h2 data-i18n="lobbies">LAN-лобби</h2><button class="text-button" id="refresh-lobbies" data-i18n="refresh">Обновить</button></div>
+      <p class="hint" data-i18n="lanHint">«Играть» без выбранного лобби добавляет вас в первое общее лобби вашего языка, где есть место (до 200 игроков). Можно войти в любое лобби: игроки с разным языком игры играют вместе. Можно и создать своё. В Warcraft откройте «Локальная сеть»: один игрок создаёт матч, остальные присоединяются.</p>
+      <div id="joined-lobby" class="joined" hidden><div><strong id="joined-name"></strong><p class="hint" id="joined-players"></p></div><button class="btn" id="leave-lobby" data-i18n="leave">Выйти</button></div>
+      <form class="row lobby-form" id="create-lobby-form"><label class="sr-only" for="lobby-name" data-i18n="lobbyName">Название лобби</label><input id="lobby-name" type="text" maxlength="48" placeholder="Название лобби" required autocomplete="off"><button class="btn" id="create-lobby" data-i18n="create">Создать</button></form>
+      <div class="lobby-list" id="lobby-list"></div>
+      <details class="private-room"><summary data-i18n="privateRoom">Войти по коду</summary><form class="row" id="join-code-form"><label class="sr-only" for="room-code" data-i18n="roomCode">Код лобби</label><input id="room-code" type="text" minlength="8" maxlength="64" pattern="[A-Za-z0-9_-]{8,64}" placeholder="Код лобби" required autocomplete="off"><button class="btn" id="join-code" data-i18n="join">Войти</button></form></details><p class="notice" id="lobby-status" role="status" hidden></p>
+    </div>
+    <div id="pane-game" role="tabpanel" aria-labelledby="tab-game" hidden>
+      <p class="hint" data-i18n="settingsHint">Параметры применяются при следующем запуске.</p>
+      <div class="setting"><span><strong data-i18n="gameLanguage">Язык игры</strong><small data-i18n="gameLanguageHint">Совпадает с языком страницы.</small><small class="setting-warning" id="game-language-missing" role="status" hidden></small></span><span class="setting-value" id="game-language-value">Русский</span></div>
+      <label class="setting" for="resolution"><span><strong data-i18n="resolution">Разрешение</strong><small data-i18n="resolutionHint">Выше — чётче изображение, ниже — меньше нагрузка на видеокарту.</small></span><select id="resolution"><option value="800x600">800 × 600</option><option value="1024x768">1024 × 768</option><option value="1152x864">1152 × 864</option><option value="1280x960" selected>1280 × 960</option><option value="1400x1050">1400 × 1050</option><option value="1600x1200">1600 × 1200</option><option value="1920x1440">1920 × 1440</option><option value="2048x1536">2048 × 1536</option></select></label>
+      <div class="setting setting-wide"><span><strong id="fps-label" data-i18n="frameRate">Частота кадров</strong><small data-i18n="frameRateHint">«Авто» — как у экрана. 30 — ровнее на слабых устройствах и бережёт батарею.</small></span><div class="segmented" role="radiogroup" aria-labelledby="fps-label"><label><input type="radio" name="fps" value="0" checked><span data-i18n="fpsAuto">Авто</span></label><label><input type="radio" name="fps" value="30"><span>30</span></label><label><input type="radio" name="fps" value="60"><span>60</span></label><label><input type="radio" name="fps" value="120"><span>120</span></label></div></div>
+      <label class="setting" for="audio-enabled"><span><strong data-i18n="sound">Звук</strong></span><input id="audio-enabled" class="switch" type="checkbox" checked></label>
+      <label class="setting" for="fullscreen-enabled"><span><strong data-i18n="fullscreen">На весь экран</strong><small data-i18n="fullscreenHint">Полноэкранный режим при запуске.</small></span><input id="fullscreen-enabled" class="switch" type="checkbox" checked></label>
+      <h3 class="settings-group" data-i18n="graphics">Графика</h3>
+      <p class="hint" data-i18n="graphicsHint">Те же настройки, что «Настройки → Изображение» в игре. Изменения, сделанные в игре, сохраняются и здесь.</p>
+      <div class="setting"><span><strong id="gamma-label" data-i18n="gamma">Гамма</strong></span><span class="range"><small data-i18n="darker">Темнее</small><input id="video-gamma" type="range" min="0" max="100" step="1" value="30" aria-labelledby="gamma-label"><small data-i18n="brighter">Светлее</small></span></div>
+      <label class="setting" for="video-modeldetail"><span><strong data-i18n="modelDetail">Детализация</strong></span><select id="video-modeldetail"><option value="0" data-i18n="lowF">Низкая</option><option value="1" data-i18n="mediumF">Средняя</option><option value="2" data-i18n="highF">Высокая</option></select></label>
+      <label class="setting" for="video-animquality"><span><strong data-i18n="animQuality">Качество анимации</strong></span><select id="video-animquality"><option value="0" data-i18n="lowN">Низкое</option><option value="1" data-i18n="mediumN">Среднее</option><option value="2" data-i18n="highN">Высокое</option></select></label>
+      <label class="setting" for="video-texquality"><span><strong data-i18n="texQuality">Качество текстур</strong></span><select id="video-texquality"><option value="0" data-i18n="lowN">Низкое</option><option value="1" data-i18n="mediumN">Среднее</option><option value="2" data-i18n="highN">Высокое</option></select></label>
+      <label class="setting" for="video-particles"><span><strong data-i18n="particles">Эффекты</strong></span><select id="video-particles"><option value="0" data-i18n="minimum">Минимум</option><option value="1" data-i18n="normal">Нормально</option><option value="2" data-i18n="maximum">Максимум</option></select></label>
+      <label class="setting" for="video-lights"><span><strong data-i18n="lights">Освещение</strong></span><select id="video-lights"><option value="0" data-i18n="minimum">Минимум</option><option value="1" data-i18n="normal">Нормально</option><option value="2" data-i18n="maximum">Максимум</option></select></label>
+      <label class="setting" for="video-unitshadows"><span><strong data-i18n="shadows">Тени</strong></span><input id="video-unitshadows" class="switch" type="checkbox" checked></label>
+      <label class="setting" for="video-occlusion"><span><strong data-i18n="occlusion">Преграды</strong></span><input id="video-occlusion" class="switch" type="checkbox" checked></label>
+      <label class="setting" for="video-spellfilter"><span><strong data-i18n="spellDetail">Качество эффектов</strong></span><select id="video-spellfilter"><option value="0" data-i18n="lowN">Низкое</option><option value="1" data-i18n="mediumN">Среднее</option><option value="2" data-i18n="highN">Высокое</option></select></label>
+      <h3 class="settings-group" data-i18n="gameData">Данные игры на этом устройстве</h3>
+      <p class="hint" id="game-data-summary" role="status"></p>
+      <div class="row game-data-actions"><button class="btn" id="preload-game-data" hidden></button><button class="btn" id="delete-game-data" data-i18n="deleteGameData" hidden>Удалить данные игры</button></div>
+      <p class="notice" id="game-data-status" role="status" hidden></p>
+      <div class="settings-footer"><button class="text-button" id="reset-settings" data-i18n="resetSettings">Сбросить все настройки</button></div>
+    </div>
+    <div id="pane-controls" role="tabpanel" aria-labelledby="tab-controls" hidden>
+      <dl class="keys"><div><dt><kbd>Enter</kbd></dt><dd data-i18n="startKey">Запустить игру со страницы</dd></div><div><dt><kbd data-i18n="lmb">ЛКМ</kbd></dt><dd data-i18n="selectKey">Выбрать юнита или здание</dd></div><div><dt><kbd data-i18n="rmb">ПКМ</kbd></dt><dd data-i18n="orderKey">Переместиться, атаковать, отдать приказ</dd></div><div><dt><kbd>F10</kbd></dt><dd data-i18n="menuKey">Игровое меню и сохранение</dd></div><div><dt><kbd>Esc</kbd></dt><dd data-i18n="escapeKey">Отмена / пропустить ролик</dd></div></dl><p class="hint" data-i18n="controlsHint">Клавиатура и мышь работают внутри окна игры. Остальные команды — стандартные команды Warcraft III. Чтобы выйти из полноэкранного режима, удерживайте Esc.</p>
+    </div>
+  </section>
+</main>
+<section id="game-view" aria-label="Warcraft III" hidden><div class="game-toolbar"><strong>Warcraft III</strong><button class="btn" id="diagnostic-fullscreen" data-i18n="fullscreen">На весь экран</button><button class="btn" id="stop-diagnostic" data-i18n="stop">Закрыть игру</button></div><div id="game-stage"><canvas id="diagnostic-canvas" width="1024" height="768" tabindex="0" aria-label="Warcraft III: The Frozen Throne"></canvas><p id="game-loading" role="status" data-i18n="starting">Запуск Warcraft…</p></div></section>
+<dialog id="changelog" aria-labelledby="changelog-title"><div class="panel-head"><h2 id="changelog-title" data-i18n="changelog">Изменения</h2><button class="btn" id="changelog-close" data-i18n="close">Закрыть</button></div><p class="hint">07.11.2026</p><ul><li data-i18n="changeAutoLanguage">Язык страницы по умолчанию — по стране: русский для стран СНГ, английский для остальных.</li><li data-i18n="changeOverflowLobbies">Когда все общие лобби языка заполнены, «Играть» открывает дополнительное; оно закрывается, когда его покидает последний игрок.</li><li data-i18n="changeNetworkExit">Выход из сетевой игры через меню («Выйти из миссии», «Выйти из программы») больше не завершается ошибкой, повтор сохраняется.</li><li data-i18n="changeCompression">Первая загрузка в 3 раза меньше: WebAssembly и файлы программы передаются сжатыми (gzip), до главного меню — около 77 МБ вместо 240.</li><li data-i18n="changeResolutions">Разрешение по умолчанию — 1280 × 960; на выбор от 800 × 600 до 2048 × 1536.</li><li data-i18n="changeCyrillicChat">В английской версии можно писать по-русски: в чате, имени игрока и названии игры.</li></ul><p class="hint">06.11.2026</p><ul><li data-i18n="changeLauncher">Компактная страница запуска, параметры и полноэкранный режим.</li><li data-i18n="changeLobbies">Публичные LAN-лобби и вход по коду.</li><li data-i18n="changeSaves">Сохранения в браузере с резервным копированием и восстановлением.</li><li data-i18n="changeGraphics">Настройки графики игры на вкладке «Игра», включая работающую гамму.</li><li data-i18n="changeOnline">Счётчик «Сейчас играют».</li><li data-i18n="changeSharedLobbies">Общие лобби на 200 игроков: «Играть» сразу добавляет в первое лобби, где есть место.</li><li data-i18n="changeEnglish">Английская версия игры: язык игры совпадает с языком сайта, общие лобби разделены по языкам.</li><li data-i18n="changeFrameRate">Частота кадров: «Авто», 30, 60 или 120.</li><li data-i18n="changeGameData">Данные игры на устройстве: предзагрузка, удаление и сброс настроек.</li><li data-i18n="changeLeave">Закрытие страницы сразу освобождает место в лобби.</li><li data-i18n="changeFullscreen">Полноэкранный режим без панели: курсор захватывает игра, выход — удерживать Esc.</li></ul><p class="hint credit"><a href="https://db-ip.com" target="_blank" rel="noopener">IP Geolocation by DB-IP</a></p></dialog>
+</body>
+</html>

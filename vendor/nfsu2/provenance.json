@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/th0mk/nfsu2-web",
+  "commit": "3e61f9c37cb7ce4084dde182047c1b782bd9ac1a",
+  "files": {
+    "LICENSE": "98d02459a86b94a803f11bdda51f558d778d42aae9a3fe14f509b49d1e7ab3b2",
+    "tools/lift.py": "fd105077eddeece6d3f33ca26a9150ef10c1bde2fb1469de9ea0be58153c98b8",
+    "tools/lregs.py": "6e5abaf47491630215570c1a83dd2ea03dcd07a3176bdaf4f04c3bf632a30dd2",
+    "tools/split_reloc.py": "20d03e407b2e9d80fc27e465775223d832131f9848be48f300627fc6b2ad65f6",
+    "tools/retpast.txt": "4645fd29b2737c1aba0fccf6419b6f0a8ad78ec30a713d48f155d888ac6705fb",
+    "runtime/cpu.h": "60c66e43bc6288f1cd549e02ec632080c897ee84b897ca1559024676a588b1ab"
+  },
+  "modifications": "Files copied without edits. tools/lift_wc3.py disables NFS-specific behavior at load time."
+}

@@ -1,0 +1,36 @@
+services:
+  web:
+    build: .
+    init: true
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./var/game:/app/var/game:ro
+      - ./var/locales:/app/var/locales:ro
+      - ./var/geoip:/app/var/geoip:ro
+      - ./var/maps:/app/var/maps:ro
+      - ./resources/Maps:/app/resources/Maps:ro
+      - ./var/runtime:/app/var/runtime:ro
+      - ./var/reports:/app/var/reports:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+  https:
+    image: caddy:2
+    profiles: [https]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      WC3_DOMAIN: ${WC3_DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    restart: unless-stopped
+volumes:
+  caddy_data:
+  caddy_config:
