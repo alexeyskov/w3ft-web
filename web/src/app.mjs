@@ -1,9 +1,10 @@
 import {SaveStore} from './storage.mjs';
 import {FrameTransport} from './transport.mjs';
 import {PresenceCounter} from './presence.mjs';
-import {openGame, gameRunning, stopGame, toggleFullscreen, gameLog, appendLog} from './diagnostics.mjs';
+import {openGame, gameRunning, stopGame, toggleFullscreen, gameLog, appendLog, interruptedLaunch} from './diagnostics.mjs';
 
 const $ = id => document.getElementById(id);
+$('help-discord').href = $('discord').href;
 const store = new SaveStore();
 const english = {
   fan:'Fan project. Not affiliated with Blizzard Entertainment.', changelog:'Changelog', play:'Play', downloadLog:'Download log', creditsLicenses:'Credits & licenses',
@@ -11,7 +12,7 @@ const english = {
   aboutLead:'The original Warcraft III: The Frozen Throne in your browser. The game code is recompiled to WebAssembly, with graphics through WebGL 2 and sound through Web Audio.',
   aboutPlay:'Choose campaigns, battles and maps inside the game. Saves stay in your browser, and LAN lobbies let you play with friends.',
   aboutEditions:'The Russian and English editions of Warcraft are supported. The game follows the selected site language.',
-  aboutHelp:'Questions and bug reports:', aboutDisclaimer:'An independent fan project. Not affiliated with or endorsed by Blizzard Entertainment.', aboutSelfHosting:'Run it with your own game copy',
+  aboutHelp:'Questions and bug reports:', aboutHelpOr:'or',
   creditsSource:'Source code on', creditsAdapted:'The launcher layout, static recompilation tools and CPU helpers are adapted from', creditsBased:'which builds on', creditsAuthor:'by Talha Müderrisoğlu',
   creditsPinned:'The imported files come from the pinned', creditsMitVersion:'MIT-licensed version', creditsMpq:'MPQ format reference:', creditsGeo:'IP Geolocation by',
   creditsLicense:'MIT license', creditsNotices:'Third-party credits and notices',
@@ -29,12 +30,13 @@ const english = {
   gameData:'Game data on this device', deleteGameData:'Delete game data', resetSettings:'Reset all settings',
   playingNow:'Playing now', onlinePlaying:'in game', onlineLan:'over LAN', onlineSite:'on the site',
   startKey:'Start the game from this page', lmb:'LMB', rmb:'RMB', selectKey:'Select a unit or building', orderKey:'Move, attack or issue an order', menuKey:'Game menu and saving', escapeKey:'Cancel / skip cinematic',
+  touchHint:'On a touch screen: tap to click, long press or two-finger tap for the right mouse button, move two fingers to scroll the map, pinch to zoom. The keyboard button opens the on-screen keyboard; its Enter key opens chat in the game.', rotateHint:'Turn the device to landscape',
   controlsHint:'Keyboard and mouse work inside the game window. Other controls are the standard Warcraft III commands. To exit fullscreen, hold Escape.', stop:'Close game', starting:'Starting Warcraft…', close:'Close',
-  changeLauncher:'Compact launcher, settings and fullscreen.', changeLobbies:'Public LAN lobbies and joining by code.', changeSaves:'Browser saves with backup and restore.', changeGraphics:'Game graphics settings on the Game tab, including working gamma.', changeOnline:'"Playing now" counter.', changeSharedLobbies:'Public lobbies for 200 players: Play puts you in the first lobby with a free seat.', changeEnglish:'English version of the game: the game language follows the page language; public lobbies are grouped by language.', changeFrameRate:'Frame rate: Auto, 30, 60 or 120.', changeGameData:'Game data on this device: preload, delete and reset settings.', changeLeave:'Closing the page frees the lobby seat at once.', changeFullscreen:'Fullscreen without the toolbar: the game captures the cursor; hold Escape to exit.', changeAutoLanguage:'Default page language by country: Russian in the CIS countries, English elsewhere.', changeOverflowLobbies:'When all public lobbies of a language are full, Play opens an extra one; it closes when its last player leaves.', changeNetworkExit:'Leaving a network game from the menu (Quit Mission, Exit Program) no longer ends with an error; the replay is saved.', changeCompression:'The first download is 3 times smaller: WebAssembly and program files are sent gzip-compressed, about 77 MB to the main menu instead of 240.', changeResolutions:'Default resolution is 1280 × 960; choose from 800 × 600 to 2048 × 1536.', changeCyrillicChat:'The English version accepts Russian letters in chat, player names and game names.',
+  changeInitialRelease:'Initial public release.',
 };
 const russian = Object.fromEntries([...document.querySelectorAll('[data-i18n]')].map(node => [node.dataset.i18n, node.textContent]));
 const messages = {
-  ready:['Готово','Ready'], readyHint:['Нажмите «Играть», чтобы начать.','Press Play to start.'], loading:['Загрузка','Loading'], checking:['Проверяем файлы игры.','Checking game files.'],
+  ready:['Готово','Ready'], readyHint:['Нажмите «Играть», чтобы начать. Запуск может занять несколько минут.','Press Play to start. Startup may take a few minutes.'], loading:['Загрузка','Loading'], checking:['Проверяем файлы игры.','Checking game files.'],
   running:['Игра запущена','Playing'], runningHint:['Warcraft открыт в окне игры.','Warcraft is open in the game window.'], stopping:['Сохранение…','Saving…'], stoppingHint:['Сохраняем профиль перед выходом.','Saving your profile before closing.'],
   error:['Не удалось запустить','Unable to start'], errorHint:['Подробности доступны в журнале.','Details are available in the log.'], unavailable:['Игра недоступна','Game unavailable'],
   filesMissing:['Файлы игры ещё не подготовлены на сервере.','Game files have not been prepared on the server.'], runtimeMissing:['Файлы движка ещё не подготовлены.','The game runtime has not been prepared.'],
@@ -53,7 +55,9 @@ const messages = {
   gameDataFailed:['Загрузка прервалась: {message}','Download failed: {message}'], settingsReset:['Настройки сброшены.','Settings reset.'],
   bytesMB:['МБ','MB'], bytesGB:['ГБ','GB'],
   gameLanguageMissing:['Английские файлы игры на сервере не установлены, игра запустится на русском.','English game files are not installed on this server; the game starts in Russian.'],
-  autoLobbyFailed:['Не удалось войти в общее лобби — игра запущена без сети.','Could not join a public lobby; the game started without network.'], exitFullscreen:['Выйти из полного экрана','Exit fullscreen'],
+  appleUnsupported:['На iPhone и iPad игра пока не запускается: все браузеры там работают на движке Safari, и он перезагружает страницу, когда игре не хватает памяти. Играйте на компьютере или на Android.','Warcraft does not run on iPhone and iPad yet: every browser there uses Safari\'s engine, which reloads the page when the game runs out of memory. Play on a computer or Android.'],
+  interrupted:['Прошлый запуск прервался: браузер перезагрузил страницу во время игры. Обычно так бывает, когда устройству не хватает памяти.','The last launch was cut short: the browser reloaded the page during the game. This usually means the device ran out of memory.'],
+  autoLobbyFailed:['Не удалось войти в общее лобби — игра запущена без сети.','Could not join a public lobby; the game started without network.'], exitFullscreen:['Выйти из полного экрана','Exit fullscreen'], downloadingGame:['Загрузка файлов игры','Downloading game files'], downloadAmount:['{done} из {total} МБ · {percent}%','{done} of {total} MB · {percent}%'], touchKeyboard:['Клавиатура','Keyboard'],
 };
 // Warcraft's own Video options: [minimum, maximum, launcher default]. game.dll
 // would default to low model detail and medium textures; any current
@@ -153,6 +157,15 @@ function renderGameLanguage() {
   const missing = !!server && gameLanguage() !== language;
   $('game-language-missing').hidden = !missing; if (missing) $('game-language-missing').textContent = t('gameLanguageMissing');
 }
+// iPhone and iPad, also iPadOS asking for desktop pages: every browser there is
+// WebKit, which closes the page when the game outgrows its memory
+// (docs/port-status.md). A launch cut short elsewhere is reported after reload.
+const appleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+let interruptedNotice = false;
+function renderNotices() {
+  $('device-warning').hidden = !appleMobile; if (appleMobile) $('device-warning').textContent = t('appleUnsupported');
+  if (interruptedNotice && !startupError) notice('launch-message', t('interrupted'));
+}
 function updateFullscreen() {
   $('diagnostic-fullscreen').disabled = !document.fullscreenEnabled;
   $('diagnostic-fullscreen').textContent = t(document.fullscreenElement === $('game-view') ? 'exitFullscreen' : 'fullscreen');
@@ -161,11 +174,24 @@ function translate() {
   document.documentElement.lang = language; $('language').value = language;
   for (const node of document.querySelectorAll('[data-i18n]')) node.textContent = t(node.dataset.i18n);
   for (const node of document.querySelectorAll('[data-info-label]')) node.setAttribute('aria-label', t('about'));
+  for (const node of document.querySelectorAll('[data-i18n-label]')) node.setAttribute('aria-label', t(node.dataset.i18nLabel));
   $('lobby-name').placeholder = t('lobbyName'); $('room-code').placeholder = t('roomCode');
   $('import-saves').setAttribute('aria-label', t('restore'));
   $('language').setAttribute('aria-label', language === 'en' ? 'Page language' : 'Язык страницы');
-  renderSaves(); renderLobbies(); renderRoom(); renderPresence(); renderGameLanguage(); updateState();
+  renderSaves(); renderLobbies(); renderRoom(); renderPresence(); renderGameLanguage(); renderLoading(); renderNotices(); updateState();
 }
+// Loading screen of a launch (diagnostics.mjs): the download with progress, then the start.
+let loading = {phase:'starting'};
+function renderLoading() {
+  const download = loading.phase === 'download' && loading.total > 0, fraction = download ? Math.min(1, loading.done / loading.total) : 0;
+  const megabytes = value => (value / 1048576).toLocaleString(language === 'en' ? 'en-US' : 'ru-RU', {maximumFractionDigits:value < 10 * 1048576 ? 1 : 0});
+  $('game-loading-title').textContent = t(loading.phase === 'download' ? 'downloadingGame' : 'starting');
+  $('game-loading-bar').hidden = !download;
+  $('game-loading-bar').setAttribute('aria-valuenow', String(Math.floor(fraction * 100)));
+  $('game-loading-fill').style.width = `${(fraction * 100).toFixed(1)}%`;
+  $('game-loading-detail').textContent = download ? t('downloadAmount').replace('{done}', megabytes(loading.done)).replace('{total}', megabytes(loading.total)).replace('{percent}', String(Math.floor(fraction * 100))) : '';
+}
+window.addEventListener('warcraft-session-progress', event => { loading = event.detail; renderLoading(); });
 function showTab(name, focus = false) {
   activeTab = name;
   for (const tab of document.querySelectorAll('[data-tab]')) {
@@ -417,7 +443,7 @@ $('reset-settings').onclick = () => {
 };
 $('launch').onclick = () => {
   if ($('launch').disabled) return;
-  startupError = ''; notice('launch-message');
+  startupError = ''; interruptedNotice = false; notice('launch-message');
   const [width,height] = settings.resolution.split('x').map(Number);
   const transport = room ?? (server.transport.available ? joinSharedLobby() : null);
   void openGame({runtime:server.runtime, saves:store, transport, language:gameLanguage(), resolution:{width,height}, audioEnabled:settings.audioEnabled, fullscreen:settings.fullscreen, graphicsSettings:{...settings.graphics}, maxFps:settings.fps});
@@ -476,6 +502,7 @@ presence.start();
 language = chosenLanguage ?? await languageSuggestion;
 translate();
 document.documentElement.removeAttribute('data-pending-language');
+void interruptedLaunch.then(value => { interruptedNotice = value && !appleMobile && !gameRunning(); renderNotices(); });
 void updateSaves();
 try {
   server = await json('/api/status'); phase = 'ready'; renderGameLanguage(); updateState(); void refreshGameData();

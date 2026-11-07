@@ -62,6 +62,13 @@ class RangeTests(unittest.TestCase):
             self.assertFalse(runtime_status(root)['installed'])
             (root / 'runtime.json').write_text('null')
             self.assertFalse(runtime_status(root)['installed'])
+            # A valid runtime reports its module's uncompressed size (launcher progress).
+            (root / 'client.mjs').write_text('export {};\n')
+            (root / 'wc3.wasm').write_bytes(b'\0asm\x01\0\0\0' + bytes(100))
+            (root / 'runtime.json').write_text(json.dumps({'abi': 'wc3-browser-v1', 'module': 'client.mjs', 'wasm': 'wc3.wasm'}))
+            status = runtime_status(root)
+            self.assertTrue(status['installed'])
+            self.assertEqual((status['wasmUrl'], status['wasmSize']), ('/runtime/wc3.wasm', 108))
 
 
 class ClientDisconnectTests(unittest.IsolatedAsyncioTestCase):

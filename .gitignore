@@ -8,3 +8,7 @@ out/
 test-results/
 .env
 
+# Local deployment helper
+/sync-vps.sh
+/vps-install.sh
+

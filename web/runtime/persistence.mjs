@@ -5,6 +5,8 @@ export class FileOverlay extends Map {
   set(path,data){super.set(path,data);this.dirty.add(path);this.deleted.delete(path);return this;}
   delete(path){const existed=super.delete(path);if(existed){this.dirty.add(path);this.deleted.add(path);}return existed;}
   clear(){for(const path of this.keys())this.delete(path);}
+  // Gone without a trace: the saves never had this file.
+  forget(path){super.delete(path);this.dirty.delete(path);this.deleted.delete(path);}
   checkpoint(){this.dirty.clear();this.deleted.clear();}
   changes(ready=()=>true){
     const files=[],deleted=[];
@@ -13,14 +15,26 @@ export class FileOverlay extends Map {
   }
 }
 
+// Warcraft's screenshots (Print Screen, screenshot.mjs) belong to the player,
+// not to the saves: each finished one leaves the guest filesystem for the page.
+export const isScreenshot=path=>/^screenshots\//i.test(path);
+const openForWriting=host=>new Set([...host.handles.values()].filter(item=>item.kind==='file'&&item.writing).map(item=>item.key));
+
+export function takeScreenshots(host){
+  const writing=openForWriting(host),overlay=host.virtualFiles;
+  const taken=[...overlay].filter(([path])=>isScreenshot(path)&&!writing.has(path)).map(([path,data])=>({path,data:data.slice()}));
+  for(const {path} of taken)overlay.forget(path);
+  return taken;
+}
+
 export function saveSnapshot(host,{full=false}={}){
   // MPQ saves are written in multiple calls. A timer or runtime stop must not
   // overwrite the last good IndexedDB save with an unfinished open file.
-  const writing=new Set([...host.handles.values()].filter(item=>item.kind==='file'&&item.writing).map(item=>item.key));
-  const ready=path=>!writing.has(path),overlay=host.virtualFiles;
+  const writing=openForWriting(host),saved=path=>!isScreenshot(path);
+  const ready=path=>saved(path)&&!writing.has(path),overlay=host.virtualFiles;
   if(!full)return overlay.changes(ready);
   return {files:[...overlay].filter(([path])=>ready(path)).map(([path,data])=>({path,data:data.slice()})),
-    deleted:[...overlay.deleted].filter(ready),deferred:[...overlay.dirty].filter(path=>!ready(path))};
+    deleted:[...overlay.deleted].filter(ready),deferred:[...overlay.dirty].filter(path=>saved(path)&&!ready(path))};
 }
 
 // Message handlers run concurrently while IndexedDB awaits its transaction.

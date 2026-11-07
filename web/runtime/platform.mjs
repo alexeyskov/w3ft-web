@@ -230,14 +230,28 @@ function installOpenGL(h) {
   });
   add('glReadBuffer',1,([buffer])=>{if(![0x0405,0].includes(buffer))fail('glReadBuffer','only default back buffer is supported');gl().readBuffer(buffer?gl().COLOR_ATTACHMENT0:gl().NONE);graphics()._check('glReadBuffer');});
   add('glDrawBuffer',1,([buffer])=>{if(![0x0405,0].includes(buffer))fail('glDrawBuffer','only default back buffer is supported');gl().drawBuffers([buffer?gl().COLOR_ATTACHMENT0:gl().NONE]);graphics()._check('glDrawBuffer');});
+  // Warcraft's screenshot (Print Screen) reads the frame as BGRA, the byte
+  // order of the TGA file it writes. WebGL reads RGBA only; the rest is a
+  // channel swap. Bytes past each row up to PACK_ALIGNMENT stay untouched.
   add('glReadPixels',7,([x,y,width,height,format,type,pointer])=>{
     integer('glReadPixels width',width,0,32768);integer('glReadPixels height',height,0,32768);
-    if(type!==U8||![GL.RGB,GL.RGBA].includes(format)||width*height>64*1024*1024)fail('glReadPixels','only bounded RGB/RGBA unsigned bytes supported');
-    const rgba=new Uint8Array(width*height*4),channels=format===GL.RGB?3:4,row=width*channels,stride=Math.ceil(row/state.packAlignment)*state.packAlignment;
+    const channels=new Map([[GL.RGB,3],[GL.RGBA,4],[GL.BGR,3],[GL.BGRA,4]]).get(format);
+    if(type!==U8||!channels||width*height>64*1024*1024)fail('glReadPixels','only bounded RGB/RGBA/BGR/BGRA unsigned bytes supported');
+    const rgba=new Uint8Array(width*height*4),row=width*channels,stride=Math.ceil(row/state.packAlignment)*state.packAlignment;
+    const red=format===GL.BGR||format===GL.BGRA?2:0,blue=2-red,line=new Uint8Array(row);
     h.check(pointer,height?stride*(height-1)+row:0);gl().pixelStorei(gl().PACK_ALIGNMENT,1);gl().readPixels(x|0,y|0,width,height,gl().RGBA,gl().UNSIGNED_BYTE,rgba);graphics()._check('glReadPixels',true);
-    for(let iy=0;iy<height;iy++)for(let ix=0;ix<width;ix++)h.copyIn(pointer+iy*stride+ix*channels,rgba.subarray((iy*width+ix)*4,(iy*width+ix)*4+channels));
+    for(let iy=0;iy<height;iy++){
+      for(let source=iy*width*4,target=0;target<row;source+=4,target+=channels){
+        line[target]=rgba[source+red];line[target+1]=rgba[source+1];line[target+2]=rgba[source+blue];
+        if(channels===4)line[target+3]=rgba[source+3];
+      }
+      h.copyIn(pointer+iy*stride,line);
+    }
   });
-  const vector=(pointer,count)=>Array.from(floats(pointer,count));
+  // The guest's floats in a reused array per length: Warcraft calls glLightfv
+  // ~900 times a frame; lighting and texgen state copy the values out.
+  const vectors=[];
+  const vector=(pointer,count)=>{const at=h.check(pointer,count*4),view=h.view,values=vectors[count]??=new Array(count);for(let i=0;i<count;i++)values[i]=view.getFloat32(at+i*4,true);return values;};
   add('glLightModelfv',2,([parameter,pointer])=>graphics().lightModelfv(parameter,vector(pointer,parameter===GL.LIGHT_MODEL_AMBIENT?4:1)));
   add('glLightModelf',2,([parameter,value])=>graphics().lightModelfv(parameter,[f32(value)]));
   add('glLightModeli',2,([parameter,value])=>graphics().lightModelfv(parameter,[value|0]));

@@ -31,8 +31,9 @@ export class WorkerVideo {
 }
 
 export class VideoDispatcher {
-  constructor({canvas,onEvent=()=>{},muted=false}={}){
-    this.canvas=canvas;this.onEvent=onEvent;this.muted=!!muted;this.players=new Map();this.destroyed=false;
+  // sources: asset path → URL of a copy on this device (client.mjs prepareGame).
+  constructor({canvas,onEvent=()=>{},muted=false,sources=new Map()}={}){
+    this.canvas=canvas;this.onEvent=onEvent;this.muted=!!muted;this.sources=sources instanceof Map?sources:new Map();this.players=new Map();this.destroyed=false;
     this.relayout=()=>{for(const entry of this.players.values())this.layout(entry);};
     globalThis.addEventListener?.('resize',this.relayout);
     globalThis.document?.addEventListener('fullscreenchange',this.relayout);
@@ -55,7 +56,7 @@ export class VideoDispatcher {
         const ready=()=>finish(),failed=()=>finish(Error(video.error?.message||'Unsupported video media')),aborted=()=>finish(Error('Video load cancelled'));
         const timer=setTimeout(()=>finish(Error('Video metadata timeout')),15000);
         video.addEventListener('loadedmetadata',ready);video.addEventListener('error',failed);entry.abort.signal.addEventListener('abort',aborted);
-        video.src=url.href;video.load();
+        video.src=this.sources.get(url.pathname)||url.href;video.load();
       });
       return {width:video.videoWidth,height:video.videoHeight,duration:video.duration};
     }

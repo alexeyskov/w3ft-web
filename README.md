@@ -1,6 +1,6 @@
 # Warcraft® III: The Frozen Throne® Web
 
-The Frozen Throne Revived is a fan project that runs the classic Windows game in a browser. The original x86 code is translated to C and compiled to WebAssembly; OpenGL is implemented with WebGL 2 and audio with Web Audio. The launcher includes saves, graphics settings, fullscreen and virtual LAN lobbies.
+The Frozen Throne Reborn is a fan project that runs the classic Windows game in a browser. The original x86 code is translated to C and compiled to WebAssembly; OpenGL is implemented with WebGL 2 and audio with Web Audio. The launcher includes saves, graphics settings, fullscreen and virtual LAN lobbies.
 
 Based on [nfsu2-web](https://github.com/th0mk/nfsu2-web) by th0mk, using its MIT-licensed lifter and CPU helpers, with original work by Talha Müderrisoğlu. The game-specific runtime and multiplayer protocol are adapted for Warcraft III.
 
@@ -10,7 +10,8 @@ Based on [nfsu2-web](https://github.com/th0mk/nfsu2-web) by th0mk, using its MIT
 
 - **The game:** a complete classic 32-bit Windows installation with The Frozen Throne. The tested binaries report **1.26.0.6401**. Reforged and arbitrary other patches are not supported just by copying their data. See the [tested binary hashes and compatibility notes](docs/SELF_HOSTING.md#compatible-game-files).
 - **To build:** macOS or Linux, Python 3.11+, a recent Node.js with WebAssembly threads and tail calls, FFmpeg (`ffmpeg` and `ffprobe`), Make, and [wasi-sdk 34](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34). Use Linux/WSL for Windows development. Optional localization preparation also needs `bsdtar`.
-- **To play:** a current desktop browser with WebGL 2, OffscreenCanvas, SharedArrayBuffer and WebAssembly threads/tail calls. Chromium is the tested browser. Use localhost or HTTPS.
+- **To play:** a current desktop browser with WebGL 2, OffscreenCanvas, SharedArrayBuffer and WebAssembly threads/tail calls. Chromium and Firefox are tested. Desktop Safari runs the game and saved games too, but creating a LAN game currently stops it (a WebKit stack limit), so play online in Chrome, Edge or Firefox. Use localhost or HTTPS.
+- **On phones and tablets:** Chrome on Android, held sideways; a recent phone with 8 GB of memory or more is advisable. On iPhone and iPad every browser uses WebKit, which runs out of memory: on an iPhone 17 the browser reloads the page before the main menu appears, so the site warns iPhone and iPad visitors (see [port status](docs/port-status.md#mobile-browsers)).
 
 ## Build
 
@@ -27,6 +28,7 @@ Download the wasi-sdk 34 archive for your machine and unpack it under `var/toolc
 ```sh
 make lift-runtime
 make runtime
+make boot-set   # optional, needs Playwright: the startup download behind the progress bar
 ```
 
 This creates your own `var/game`, `var/maps`, `var/lift-v2`, `var/runtime` and `var/reports`. Generated C and WASM are derived from the supplied game and stay outside Git. The [self-hosting guide](docs/SELF_HOSTING.md) also covers using an installed directory, alternate SDK locations, languages, maps and rebuilding for different binaries. No prebuilt `var/` download is required.
@@ -37,7 +39,9 @@ This creates your own `var/game`, `var/maps`, `var/lift-v2`, `var/runtime` and `
 ./run.sh
 ```
 
-Open **http://localhost:8080/** and press **Play**. Select campaigns and maps inside Warcraft. Saves remain in the browser and can be exported from the launcher. If your base installation is English, start with `./run.sh --base-language en`.
+Open **http://localhost:8080/** and press **Play**. Select campaigns and maps inside Warcraft. Saves remain in the browser and can be exported from the launcher. Print Screen saves the game's screenshot as a PNG in the browser's downloads. If your base installation is English, start with `./run.sh --base-language en`.
+
+On a touch screen, a tap is a click, a long press or a two-finger tap is a right click, two fingers dragged scroll the map and a pinch zooms. The buttons beside the picture open the device keyboard (for chat, press its Enter), send Escape and leave fullscreen.
 
 For LAN play, join the same site lobby, launch both clients and open **Local Area Network** in Warcraft. One player hosts the match; the others join it. Battle.net is not implemented. Other devices require HTTPS; [compose.yaml](compose.yaml) and [deploy/Caddyfile](deploy/Caddyfile) provide a deployment starting point.
 
@@ -59,7 +63,7 @@ Campaign startup, save/load and short LAN matches have been exercised. Full camp
 make test
 ```
 
-Browser tests require Playwright/Chromium and, where documented, a running local server. Start with [tests/browser_smoke.py](tests/browser_smoke.py) for the launcher or [tests/runtime_lan_browser.py](tests/runtime_lan_browser.py) for two real game clients.
+Browser tests require Playwright/Chromium and, where documented, a running local server. Start with [tests/browser_smoke.py](tests/browser_smoke.py) for the launcher, [tests/runtime_lan_browser.py](tests/runtime_lan_browser.py) for two real game clients, [tests/runtime_dropout_browser.py](tests/runtime_dropout_browser.py) for a player who crashes, closes the page, freezes or loses the connection in a three-player match, or [tests/runtime_touch_browser.py](tests/runtime_touch_browser.py) for touch input on an emulated phone; [tests/runtime_site_browser.py](tests/runtime_site_browser.py) `--browser firefox` launches the real game in another engine.
 
 ## Credits
 
@@ -69,6 +73,10 @@ Browser tests require Playwright/Chromium and, where documented, a running local
 - [DB-IP](https://db-ip.com): optional IP-to-country Lite data under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 Dependencies and redistribution notes are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Acknowledgments
+
+Thanks to **OpenAI Codex** and **Claude Code** for their help with development, debugging, and testing.
 
 ## License
 

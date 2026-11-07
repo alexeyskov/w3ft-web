@@ -5,11 +5,12 @@ import {WorkerAudio} from './audio-bridge.mjs';
 import {createOfflineNetwork} from './network-local.mjs';
 import {GuestThreadScheduler} from './thread-scheduler.mjs';
 import {WorkerVideo} from './video-bridge.mjs';
-import {saveSnapshot} from './persistence.mjs';
+import {saveSnapshot,takeScreenshots,isScreenshot} from './persistence.mjs';
+import {webkitCollectorNudge} from './webkit-gc.mjs';
 import {GRAPHICS_SETTINGS} from './launch-settings.mjs';
 import {GameDataCache,cacheKey} from './game-cache.mjs';
 
-let engine = null, scheduler = null, stopped = false, monitor,saveTimer;
+let engine = null, scheduler = null, stopped = false, monitor,saveTimer,nudgeTimer;
 const log = message => postMessage({type:'status',message:String(message)});
 class WorkerTransport extends EventTarget {
   constructor(peerId) { super(); this.peerId=peerId; }
@@ -17,6 +18,10 @@ class WorkerTransport extends EventTarget {
 }
 let transport,video,network,pendingPeers=null,disconnected=false,disk=null;
 
+// The catalog's copy of a map's first bytes (base64), never longer than the map.
+function mapHeader(text,size){
+  try{const bytes=Uint8Array.from(atob(text),c=>c.charCodeAt(0));return bytes.length<=size?bytes:null;}catch{return null;}
+}
 function sourceFiles(entries,disk=null) {
   const files=new Map(entries.map(e=>[e.path.replaceAll('\\','/').toLowerCase(),e]));
   const cache=new Map(), chunkSize=256*1024;
@@ -28,6 +33,9 @@ function sourceFiles(entries,disk=null) {
   const readFile=(path,offset=0,length=undefined)=>{
     const file=canonical(path);length=length===undefined?file.size-offset:Math.min(length,file.size-offset);
     if(offset<0||length<0||length>128*1024*1024)throw Error('Invalid file range');
+    // A map's first bytes come with the catalog: the startup read of every
+    // map's HM3W header (124 bytes) needs no 256 KiB block of each map.
+    if(file.header&&offset+length<=file.header.length)return file.header.slice(offset,offset+length);
     const out=new Uint8Array(length);
     for(let done=0;done<length;){
       const start=Math.floor((offset+done)/chunkSize)*chunkSize,key=file.downloadUrl+':'+start;
@@ -48,12 +56,26 @@ function sourceFiles(entries,disk=null) {
   return {readFile,fileSize:path=>canonical(path).size,listFiles:()=>entries.map(e=>e.hidden?{path:e.path,hidden:true}:e.path)};
 }
 
+// Compiled while it downloads: the 180 MB module never sits in a JavaScript
+// buffer, which boot() kept for the whole game. That buffer plus the
+// compiler's copy was the startup peak (WebKit: 944 MB, streaming 597 MB).
+// Without application/wasm (another server) it compiles from the bytes.
+async function compileWasm(url){
+  const response=await fetch(url);
+  if(!response.ok)throw Error('WASM download failed');
+  if(typeof WebAssembly.compileStreaming==='function'&&/^application\/wasm\b/i.test(response.headers.get('Content-Type')||''))return WebAssembly.compileStreaming(response);
+  return WebAssembly.compile(await response.arrayBuffer());
+}
+
+const sendScreenshots=engine=>{for(const {path,data} of takeScreenshots(engine.host))postMessage({type:'screenshot',path,data},[data.buffer]);};
+
 async function boot(options) {
   let error=null;
   try {
     log('Загрузка WASM и проверка профиля бинарников…');
+    const compileStarted=performance.now();
     const [wasm,profile,manifest,catalog]=await Promise.all([
-      fetch(options.wasmUrl).then(r=>{if(!r.ok)throw Error('WASM download failed');return r.arrayBuffer();}),
+      compileWasm(options.wasmUrl).then(module=>{log(`WASM compiled in ${((performance.now()-compileStarted)/1000).toFixed(1)} s`);return module;}),
       fetch(new URL('./build.json',import.meta.url)).then(r=>r.json()),
       // Game language: the server puts that localization's archives and
       // cinematics in place of the base installation's (same patch).
@@ -71,7 +93,7 @@ async function boot(options) {
     // Saves made while maps lived under Maps/Web record that path; a hidden
     // alias lets them load without showing a Web folder in the map list.
     for(const map of mountedMaps.values()){
-      const folder=map.path.toLowerCase().endsWith('.w3n')?'Campaigns':'Maps',file={size:map.size,downloadUrl:map.downloadUrl,...map.sha256?{cacheKey:cacheKey('m',map.id,map.sha256)}:{}};
+      const folder=map.path.toLowerCase().endsWith('.w3n')?'Campaigns':'Maps',file={size:map.size,downloadUrl:map.downloadUrl,...map.sha256?{cacheKey:cacheKey('m',map.id,map.sha256)}:{},...typeof map.header==='string'?{header:mapHeader(map.header,map.size)}:{}};
       entries.push({path:`${folder}/${map.path}`,...file},{path:`${folder}/Web/${map.path}`,...file,hidden:true});
     }
     log(`Mounted ${mountedMaps.size} server maps`);
@@ -125,11 +147,18 @@ async function boot(options) {
       postMessage({type:'frame',frame});
     };
     engine.host.strictFinish=!!options.strictFinish;
-    for(const file of options.savedFiles||[])engine.host.virtualFiles.set(file.path.toLowerCase(),new Uint8Array(file.data));
+    // Screenshots never belong to the saves (persistence.mjs); old ones stay out.
+    for(const file of options.savedFiles||[])if(!isScreenshot(file.path))engine.host.virtualFiles.set(file.path.toLowerCase(),new Uint8Array(file.data));
     engine.host.virtualFiles.checkpoint();
     postMessage({type:'linked',modules:engine.modules});
     engine.initialize();
-    if(options.persist)saveTimer=setInterval(()=>{
+    // Safari only: keeps JavaScriptCore collecting this worker's garbage (webkit-gc.mjs).
+    const nudge=webkitCollectorNudge(engine.host.memory);
+    if(nudge)nudgeTimer=setInterval(nudge,500);
+    // Every second: finished screenshots to the page, changed saves to storage.
+    saveTimer=setInterval(()=>{
+      sendScreenshots(engine);
+      if(!options.persist)return;
       const changes=saveSnapshot(engine.host);
       if(changes.files.length||changes.deleted.length)postMessage({type:'save-changes',changes});
     },1000);
@@ -143,7 +172,7 @@ async function boot(options) {
     await scheduler.runMain('war3.exe');
   } catch(caught) { error=caught;log(`${caught.name}: ${caught.message}`); }
   finally {
-    clearInterval(monitor);clearInterval(saveTimer);
+    clearInterval(monitor);clearInterval(saveTimer);clearInterval(nudgeTimer);
     scheduler?.stop();
     network?.destroy();
     const report=engine?engine.report(error):{wasmExecuted:false,gameplayVerified:false,error:error?{type:error.name,message:error.message,details:error.details}:null};
@@ -156,6 +185,7 @@ async function boot(options) {
     if(engine?.host.hostTimings)report.hostTimings=Object.fromEntries([...engine.host.hostTimings].sort((a,b)=>b[1].totalMs-a[1].totalMs));
     if(engine)report.heap=engine.host.heapStats();
     disk?.close();disk=null;
+    if(engine)try{sendScreenshots(engine);}catch(caught){log(`Screenshot: ${caught.message}`);}
     const snapshot=engine?saveSnapshot(engine.host,{full:true}):{files:[],deleted:[],deferred:[]};
     if(snapshot.deferred.length)report.deferredSaveFiles=snapshot.deferred;
     postMessage({type:'finished',report,savedFiles:snapshot.files,deletedFiles:snapshot.deleted});

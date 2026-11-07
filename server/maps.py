@@ -8,6 +8,7 @@ does not prove that an MPQ, its scripts, or its game-version requirements work.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -146,6 +147,10 @@ class MapCatalog:
             "size": before.st_size,
             "sha256": digest.hexdigest(),
             "downloadUrl": f"/api/maps/{identifier}/download",
+            # The file's first bytes: at startup Warcraft reads the 124-byte HM3W
+            # header of every map for its lists. The runtime answers such reads
+            # from here instead of downloading a 256 KiB block per map.
+            "header": base64.b64encode(header).decode("ascii"),
         })
         self._cache[relative_path] = (signature, metadata)
         return dict(metadata)

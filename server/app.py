@@ -73,11 +73,13 @@ def runtime_status(root):
         with (root / manifest["wasm"]).open("rb") as stream:
             if stream.read(8) != b"\0asm\x01\0\0\0":
                 raise ValueError("Invalid WebAssembly module")
+            # Uncompressed size: the launcher's progress for a gzip download.
+            wasm_size = os.fstat(stream.fileno()).st_size
         capabilities = manifest.get("capabilities", {})
         if not isinstance(capabilities, dict):
             raise ValueError("Invalid runtime capabilities")
         result.update(installed=True, reason="Подключён внешний runtime; совместимость требует проверки.",
-                      moduleUrl="/runtime/" + manifest["module"], wasmUrl="/runtime/" + manifest["wasm"],
+                      moduleUrl="/runtime/" + manifest["module"], wasmUrl="/runtime/" + manifest["wasm"], wasmSize=wasm_size,
                       capabilities={key: capabilities.get(key) is True for key in result["capabilities"]})
         result["diagnostics"] = manifest.get("diagnostics") is True
         result["graphics"] = manifest.get("graphics", "webgpu")

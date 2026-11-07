@@ -2,6 +2,7 @@ import {WarcraftHost, GuestFault} from './host.mjs';
 import {GuestCallProxy, serializeGuestError} from './thread-rpc.mjs';
 import {localImportDispatcher} from './worker-fast.mjs';
 import {GraphicsCommandQueue} from './graphics-batch.mjs';
+import {webkitCollectorNudge} from './webkit-gc.mjs';
 
 const validPointer = value => Number.isInteger(value) && value > 0 && value <= 0xffffffff;
 
@@ -29,12 +30,17 @@ export async function runThread(options, postFn = message => globalThis.postMess
     // Queued GL work is handed to the broker asynchronously (callback return,
     // thread exit, swaps); the broker executes it before any graphics import.
     const flush=()=>batch?.submit();
-    imports.wc3.wc3_host_call = (id, context) => {
+    const hostCall = (id, context) => {
       id>>>=0;context>>>=0;
       if(batch?.enqueue(id,context)||local?.(id,context))return;
       rpc.call(id,context,batch?.syncPoint());
       batch?.afterSync(id,context);
     };
+    // Safari only (webkit-gc.mjs): this worker never returns to its event loop,
+    // so the nudge rides on host calls, about twice a second on a busy thread.
+    const nudge = webkitCollectorNudge(memory);
+    let hostCalls = 0;
+    imports.wc3.wc3_host_call = nudge ? (id, context) => { if (++hostCalls >= 65536) { hostCalls = 0; nudge(); } hostCall(id, context); } : hostCall;
     imports.wc3.wc3_host_resolve = (library, name, ordinal) => {
       throw new GuestFault('A child thread cannot resolve imports outside the broker', {library: host.nativeString(library), name: host.nativeString(name), ordinal});
     };

@@ -192,7 +192,9 @@ export class WarcraftHost {
     this.thunkKeys.set(key, id);
     return 0xf1000000 + id * 16;
   }
-  beginImport(id, cpuPointer) {
+  // call: an object to fill instead of a new one, for a caller that finishes
+  // the import before any other runs (invoke); invokeAsync awaits, so it does not.
+  beginImport(id, cpuPointer, call = null) {
     const handler = this.thunks[id]; cpuPointer >>>= 0;
     const esp = this.view.getUint32(cpuPointer + 16, true);
     const name = handler ? handler.key ??= `${handler.dll}!${handler.name}` : 'undefined!undefined';
@@ -216,14 +218,16 @@ export class WarcraftHost {
     if (handler.graphics) this.graphicsBatchRegistry?.drain();
     const previousCPU = this.currentCPU; this.currentCPU = cpuPointer;
     let result;const started=this.hostTimings?performance.now():0;
-    const annotate=error=>{error.details={...error.details,import:name,arguments:args,returnAddress};throw error;};
-    try { result = handler.fn(args, esp, cpuPointer);if(result&&typeof result.then==='function')result=result.catch(annotate); }
-    catch(error){annotate(error);} finally {
+    try { result = handler.fn(args, esp, cpuPointer);if(result&&typeof result.then==='function')result=result.catch(error=>{throw this._annotate(error,name,args,returnAddress);}); }
+    catch(error){throw this._annotate(error,name,args,returnAddress);} finally {
       this.currentCPU = previousCPU;
       if(this.hostTimings&&started){const elapsed=performance.now()-started,entry=this.hostTimings.get(name)||{count:0,totalMs:0,maxMs:0};entry.count++;entry.totalMs+=elapsed;entry.maxMs=Math.max(entry.maxMs,elapsed);this.hostTimings.set(name,entry);}
     }
-    return {handler,esp,result,operation,returnAddress,context:threadContext||this.defaultContext};
+    const context=threadContext||this.defaultContext;
+    if(!call)return {handler,esp,result,operation,returnAddress,context};
+    call.handler=handler;call.esp=esp;call.result=result;call.operation=operation;call.returnAddress=returnAddress;call.context=context;return call;
   }
+  _annotate(error,name,args,returnAddress){error.details={...error.details,import:name,arguments:args,returnAddress};return error;}
   finishImport(cpuPointer,{handler,esp,operation,context,returnAddress},result) {
     if(operation){operation.result=(result??0)>>>0;operation.lastError=context.lastError;}
     // Calls may grow memory: the view getter refreshes after a callback or wait.
@@ -233,7 +237,8 @@ export class WarcraftHost {
     view.setUint32(cpuPointer + 16, esp + 4 + (handler.convention === 'stdcall' ? handler.argc * 4 : 0), true);
   }
   invoke(id,cpuPointer) {
-    const call=this.beginImport(id,cpuPointer);
+    // Hundreds of thousands of calls a second: one call object for all of them.
+    const call=this.beginImport(id,cpuPointer,this._call??={});
     if(call.result&&typeof call.result.then==='function'){
       call.result.catch(()=>{});
       throw new GuestFault('Blocking import inside a synchronous guest callback is unsupported',{cpu:cpuPointer>>>0});

@@ -9,17 +9,30 @@ This short regression does not establish long-session or all-map compatibility.
 import argparse
 import asyncio
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from playwright.async_api import async_playwright
+
+# Rows of Warcraft's map list in 1024×768 page coordinates: its folders
+# (alphabetical, with the game's own download folder), then the maps in its root
+# by number of players and name. Folders of extra maps move every row, so the
+# rows come from the server's map catalog.
+async def map_list_rows(request,url):
+    maps=(await (await request.get(url+'/api/maps')).json())['maps']
+    folders=sorted({m['path'].split('/')[0].lower() for m in maps if '/' in m['path']}|{'download'})
+    players=lambda path:int(re.match(r'\((\d+)\)',path).group(1)) if re.match(r'\((\d+)\)',path) else 99
+    root=sorted((m['path'] for m in maps if '/' not in m['path']),key=lambda path:(players(path),path.lower()))
+    row=lambda index:210+round(index*25.65)
+    return {**{f'{name}/':row(i) for i,name in enumerate(folders)},**{path.lower():row(len(folders)+i) for i,path in enumerate(root)}}
 
 HOST_ACTIONS = [
     {'click':[875,332],'frames':8}, {'click':[230,138],'frames':2}, {'text':'WebHost','frames':2},
     # Initial map enumeration and native sliding panels finish first. The list
     # opens on Maps: download, frozenthrone, scenario, then the classic maps.
     {'click':[398,710],'frames':48},
-    {'click':[158,237],'frames':8}, {'key':'Enter','frames':24},
+    {'click':[158,'frozenthrone/'],'frames':8}, {'key':'Enter','frames':24},
     {'click':[144,314],'frames':15}, {'click':[876,649],'frames':24},
 ]
 
@@ -189,7 +202,8 @@ async def main(url,output,timeout,resolution):
             await guest.action({'click':[875,332],'frames':8})
             await guest.action({'click':[230,138],'frames':2})
             await guest.action({'text':'WebGuest','frames':2})
-            for action in HOST_ACTIONS:await host.action(action)
+            rows=await map_list_rows(host.page.request,url)
+            for action in HOST_ACTIONS:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
             await guest.wait('(probe.network.received["30"]||0)>0')
             await guest.action({'click':[185,235],'frames':5},'discovered')
             assert await guest.page.evaluate('probe.network.recent.some(p=>p.id==="30"&&p.text?.includes("WebHost"))'),'Original host was not advertised'

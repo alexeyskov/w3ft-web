@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {runDiagnostics} from '../web/runtime/client.mjs';
+import {peerGonePacket} from '../web/runtime/winsock.mjs';
 
 test('stopping flushes LAN packets and saves before releasing the worker, and retains lobby membership', async t => {
   class AudioContext {
@@ -41,12 +42,20 @@ test('stopping flushes LAN packets and saves before releasing the worker, and re
   const stopping = controller.stop();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(worker.terminated, false, 'Stop must wait for the final save transaction');
-  assert.equal(packets[0].destination, 2);
-  assert.deepEqual([...packets[0].data], [0xf1]);
+  // The lobby first hears that any earlier game of this page is gone, then the
+  // game's own packets.
+  assert.equal(packets[0].destination, 0);
+  assert.deepEqual([...packets[0].data], [...peerGonePacket()]);
+  assert.equal(packets[1].destination, 2);
+  assert.deepEqual([...packets[1].data], [0xf1]);
   assert.equal(persist.files[0].path, 'save/test.w3z');
   assert.equal(reports.length, 0);
   release(); await stopping;
   assert.equal(worker.terminated, true);
+  // After the game's last packets (its FINs), the others drop what is left.
+  assert.equal(packets.length, 3);
+  assert.equal(packets[2].destination, 0);
+  assert.deepEqual([...packets[2].data], [...peerGonePacket()]);
   assert.equal(reports.length, 1);
   assert.equal(transport.peerId, 1);
 });

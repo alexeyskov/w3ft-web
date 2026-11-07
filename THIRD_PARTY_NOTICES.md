@@ -14,6 +14,10 @@ The upstream license names **th0mk** and **Talha Müderrisoğlu**, the author of
 
 The complete original notice is retained in `vendor/nfsu2/LICENSE`. The root `LICENSE` also retains these copyright notices and the MIT permission/warranty text. Keep both when distributing this source tree. Retain the corresponding notices when distributing binaries built from these components.
 
+## Launcher icons
+
+The Discord glyph embedded in `web/index.html` comes from [Simple Icons](https://github.com/simple-icons/simple-icons/blob/develop/icons/discord.svg), provided under [CC0 1.0 Universal](https://github.com/simple-icons/simple-icons/blob/develop/LICENSE.md). Discord's name and logo remain trademarks of their respective owner.
+
 ## MPQ format reference
 
 `tools/mpq_reader.py` uses mpyq for MPQ headers/tables and follows sector-storage behavior documented by [StormLib](https://github.com/ladislav-zezula/StormLib/blob/master/src/SFileReadFile.cpp). StormLib is a format/behavior reference; its C/C++ library is not vendored or linked by this project. The mpyq package has its own license below.

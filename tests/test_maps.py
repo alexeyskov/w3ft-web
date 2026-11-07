@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import os
 from pathlib import Path
@@ -56,6 +57,7 @@ class MapCatalogTests(unittest.TestCase):
         item = self.catalog.manifest()["maps"][0]
         self.assertEqual(item["id"], hashlib.sha256("Download/Тест.W3X".encode()).hexdigest())
         self.assertEqual(item["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(base64.b64decode(item["header"]), path.read_bytes()[:512])
         self.assertEqual(item["size"], path.stat().st_size)
         self.assertEqual(item["kind"], "map")
         self.assertEqual(item["extension"], ".w3x")

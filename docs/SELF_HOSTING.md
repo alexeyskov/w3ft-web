@@ -125,6 +125,14 @@ For English data whose interface font lacks Cyrillic, the tool also calls `prepa
 .venv/bin/python tools/prepare_fonts.py var/locales/en
 ```
 
+## Faster first launch
+
+```sh
+make boot-set
+```
+
+Run it after `make runtime` and after preparing languages; it needs Playwright with Chromium (`.venv/bin/python -m playwright install chromium`). For every game language it starts the packaged runtime in a fresh browser profile, opens the main menu and writes `var/runtime/boot-<language>.json`: the executables, the archive blocks the game reads up to the menu and the intro cinematic. The launcher downloads that set before a launch, six requests at a time, with a progress bar; the menu then opens right after the cinematic. Without these files the game still starts, loading menu data from the server after the cinematic. Record again after replacing game files or rebuilding the runtime; an outdated set only loads slower.
+
 ## Optional country-based language default
 
 ```sh
@@ -139,7 +147,7 @@ This downloads DB-IP Lite data into `var/geoip/`, under its separate CC BY 4.0 t
 | --- | --- | --- |
 | `var/game/` | Your installation copy / ZIP preparer, media tool | Yes: game resources; review rights and contents before sharing. |
 | `var/lift-v2/` | `make lift-runtime` | Build only; game-derived generated C. |
-| `var/runtime/` | `make runtime` | Yes; game-derived WASM, browser modules, manifests and notices. |
+| `var/runtime/` | `make runtime`, `make boot-set` | Yes; game-derived WASM, browser modules, manifests, notices and the recorded startup sets (`boot-*.json`). |
 | `var/maps/` | `make maps` / your own maps | If selected as the map directory. |
 | `var/reports/` | Inspection and tests | `game.json` supplies the inspection report used by server status; other reports are development artifacts. |
 | `var/toolchains/` | Your wasi-sdk download | Build only. |

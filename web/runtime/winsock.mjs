@@ -11,11 +11,20 @@ export class WSAError extends Error {
 }
 const fail = (code,message) => { throw new WSAError(code,message); };
 const HEADER=16, MAX_PAYLOAD=65535-HEADER, MAGIC=0x31535743;
-const PACKET={UDP:1,SYN:2,SYN_ACK:3,ACK:4,DATA:5,FIN:6,RST:7};
+const PACKET={UDP:1,SYN:2,SYN_ACK:3,ACK:4,DATA:5,FIN:6,RST:7,GONE:8};
 const bytes = value => {
   if (!(value instanceof Uint8Array)) fail(WSA.EINVAL,'Socket data must be Uint8Array');
   return value;
 };
+
+// The sender's game ended: a crash, a stop, or a new game in its place. As
+// Windows resets the streams of a process that is gone, every TCP stream with
+// that peer fails at once; without it the others would wait for Warcraft's
+// own timeout (about 50 s while loading a match). client.mjs broadcasts it.
+export function peerGonePacket() {
+  const packet=new Uint8Array(HEADER),view=new DataView(packet.buffer);
+  view.setUint32(0,MAGIC,true);view.setUint8(4,PACKET.GONE);return packet;
+}
 
 // One relay room is one virtual LAN 10.77.0.0/24: peer IDs 1–254 (the server
 // decides the room size, 200 for site lobbies), .255 is the broadcast address.
@@ -252,6 +261,18 @@ export class VirtualWinsock extends EventTarget {
     const view=new DataView(data.buffer,data.byteOffset,data.byteLength);
     if(view.getUint32(0,true)!==MAGIC||view.getUint8(5)!==0||view.getUint16(10,true)!==data.length-HEADER)return;
     const type=view.getUint8(4),srcPort=view.getUint16(6,true),dstPort=view.getUint16(8,true),connection=view.getUint32(12,true);
+    if(type===PACKET.GONE){
+      if(data.length!==HEADER||source===this.transport.peerId)return;
+      for(const s of [...this.sockets.values()]){
+        if(s.type!=='tcp'||s.remotePeer!==source)continue;
+        if(s.state==='syn-received'){this.sockets.delete(s.fd);continue;}
+        // As when the peer leaves the room (onPeers): a stream stays readable,
+        // so select and pending receives wake up and report the reset.
+        if(s.state==='connected')s.error=WSA.ECONNRESET;
+        else if(s.state==='connecting'){s.error=WSA.ECONNREFUSED;s.state='failed';}
+      }
+      return;
+    }
     if(!srcPort||!dstPort)return;
     const payload=data.subarray(HEADER);
     if(type===PACKET.UDP){

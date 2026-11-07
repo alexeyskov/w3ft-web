@@ -15,12 +15,18 @@ export function spatialDescription(value={}){
     wet:number(value.wet,0,0,1),decay:number(value.decay,1.5,.05,20)};
   if(result.maxDistance<result.refDistance||result.coneOuter<result.coneInner)throw new Error('Spatial audio distance or cone limits are reversed');return result;
 }
+// AudioParams where the browser has them (positionX…, forwardX…, upX…).
+// Firefox's AudioListener has none of them, older Safari's PannerNode neither;
+// every browser keeps the older setters, setPosition and setOrientation.
+const hasParameters=(target,...prefixes)=>prefixes.every(prefix=>[...'XYZ'].every(axis=>target[prefix+axis]));
 function parameters(target,prefix,values,time){for(let i=0;i<3;i++)target[prefix+'XYZ'[i]].setValueAtTime(values[i],time);}
 export function setListener(context,value={}){
   const position=vector(value.position,[0,0,0]),forward=vector(value.forward,[0,0,-1]),up=vector(value.up,[0,1,0]);
   if(!Math.hypot(...forward)||!Math.hypot(...up))throw new Error('Listener orientation must be nonzero');
   const listener=context.listener,time=context.currentTime;
-  parameters(listener,'position',position,time);parameters(listener,'forward',forward,time);parameters(listener,'up',up,time);
+  if(hasParameters(listener,'position'))parameters(listener,'position',position,time);else listener.setPosition(...position);
+  if(hasParameters(listener,'forward','up')){parameters(listener,'forward',forward,time);parameters(listener,'up',up,time);}
+  else listener.setOrientation(...forward,...up);
 }
 function impulse(context,seconds){
   // A bounded, deterministic stereo room response. This is the software
@@ -56,7 +62,8 @@ export function spatialNodes(context,input,value,output=context.destination){
   };
   const update=description=>{
     const s=spatialDescription(description),time=context.currentTime;
-    parameters(panner,'position',s.position,time);parameters(panner,'orientation',s.orientation,time);
+    if(hasParameters(panner,'position'))parameters(panner,'position',s.position,time);else panner.setPosition(...s.position);
+    if(hasParameters(panner,'orientation'))parameters(panner,'orientation',s.orientation,time);else panner.setOrientation(...s.orientation);
     panner.refDistance=s.refDistance;panner.maxDistance=Math.max(s.refDistance+1e-6,s.maxDistance);panner.rolloffFactor=s.rolloff;
     panner.coneInnerAngle=s.coneInner;panner.coneOuterAngle=s.coneOuter;panner.coneOuterGain=s.coneGain;
     attenuation.gain.setValueAtTime((1-s.obstruction)*s.distanceGain,time);filter.frequency.setValueAtTime(Math.min(context.sampleRate*.49,22000)*Math.pow(1/22,s.occlusion),time);

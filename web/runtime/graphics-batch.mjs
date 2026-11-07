@@ -31,6 +31,7 @@ const CHANNELS=new Map([[0x1908,4],[0x80e1,4],[0x1907,3],[0x80e0,3],[0x1906,1],[
 const ORDERED_USER32=new Set(['FillRect','ChangeDisplaySettingsA','ChangeDisplaySettingsW','ChangeDisplaySettingsExA','ChangeDisplaySettingsExW']);
 const fault=(message,details={})=>Object.assign(new Error(message),{name:'GuestFault',details});
 const align4=value=>(value+3)&~3;
+const byStart=(a,b)=>a.start-b.start;
 const indexType=type=>type===U8?Uint8Array:type===U16?Uint16Array:type===U32?Uint32Array:null;
 
 const operations=[null], byKey=new Map();
@@ -220,13 +221,17 @@ export class GraphicsBatchRegistry {
     let args;
     try{
       if(op.kind===STATE||op.kind===SWAP){
-        const argc=words[w+3];args=new Array(argc);
+        // One argument array per count, a new one if a handler nests a record.
+        const argc=words[w+3];args=this.executing?new Array(argc):((this.argPool??=[])[argc]??=new Array(argc));
         for(let k=0;k<argc;k++)args[k]=words[w+4+k];
         if(op.pointer>=0){
           const size=words[w+4+argc],data=at+(5+argc)*4;
-          this.scratch??=h.alloc(64);h.copyIn(this.scratch,stream.bytes.subarray(data,data+size));args[op.pointer]=this.scratch;
+          // Vectors and matrices, up to 64 bytes: copied without a view per record.
+          this.scratch??=h.alloc(64);const target=h.check(this.scratch,size),guest=h._bytes,source=stream.bytes;
+          for(let i=0;i<size;i++)guest[target+i]=source[data+i];args[op.pointer]=this.scratch;
         }
-        const result=handler.fn(args,0,cpu);
+        const nested=this.executing;this.executing=true;let result;
+        try{result=handler.fn(args,0,cpu);}finally{this.executing=nested;}
         if(result&&typeof result.then==='function'){result.catch(()=>{});throw fault('Asynchronous graphics command cannot be batched');}
         if(op.kind===SWAP){Atomics.add(stream.control,FRAMES_COMPLETED,1);Atomics.notify(stream.control,FRAMES_COMPLETED);}
       }else if(op.kind===DRAW_ELEMENTS||op.kind===DRAW_ARRAYS)this._draw(stream,at,op.kind);
@@ -238,7 +243,7 @@ export class GraphicsBatchRegistry {
         const graphics=this._graphics();
         for(let i=0,count=words[w+3];i<count;i++)graphics.deleteTexture(words[w+4+i]);
       }
-    }catch(error){h.lastFaultCPU=cpu;error.details={...error.details,import:name,...(args?{arguments:args}:{}),returnAddress,graphicsBatch:true};throw error;}
+    }catch(error){h.lastFaultCPU=cpu;error.details={...error.details,import:name,...(args?{arguments:Array.from(args)}:{}),returnAddress,graphicsBatch:true};throw error;}
     finally{
       h.currentCPU=previous;
       if(h.hostTimings){const elapsed=performance.now()-started,timing=h.hostTimings.get(name)||{count:0,totalMs:0,maxMs:0};timing.count++;timing.totalMs+=elapsed;timing.maxMs=Math.max(timing.maxMs,elapsed);h.hostTimings.set(name,timing);}
@@ -355,7 +360,11 @@ export class GraphicsCommandQueue {
     const at=this._reserve(16+argc*4+(op.pointer>=0?4+align4(size):0));if(at<0)return false;
     const w=this._header(at,id,returnAddress),words=this.words;
     words[w+3]=argc;for(let k=0;k<argc;k++)words[w+4+k]=args[k];
-    if(op.pointer>=0){words[w+4+argc]=size;this.bytes.set(h._bytes.subarray(source,source+size),at+(5+argc)*4);}
+    if(op.pointer>=0){
+      words[w+4+argc]=size;
+      // Vectors and matrices of at most 64 bytes: a loop, not a view per call.
+      const target=at+(5+argc)*4,memory=h._bytes,bytes=this.bytes;for(let i=0;i<size;i++)bytes[target+i]=memory[source+i];
+    }
     this._mirror(op.name,args);
     return true;
   }
@@ -383,33 +392,39 @@ export class GraphicsCommandQueue {
     // draws fall back to the synchronous path, which reaches that error first.
     const width=type===F32?4:type===U8&&kind==='color'?1:0;
     const invalid=!width||size<1||size>4||stride>1024*1024||(stride&&stride<size*width);
-    this.arrays.set(kind,{size,type,stride:stride||size*width,pointer,width,invalid});
+    // Updated in place: a draw reads the entry while it builds its record.
+    let entry=this.arrays.get(kind);if(!entry)this.arrays.set(kind,entry={});
+    entry.size=size;entry.type=type;entry.stride=stride||size*width;entry.pointer=pointer;entry.width=width;entry.invalid=invalid;
   }
   // Byte spans of the enabled arrays for vertices [first, first+count),
   // merged when they overlap (interleaved layouts) and checked like the
   // broker's synchronous draw path.
+  // One plan reused by every draw: it is written to the stream at once.
   _spans(first,count){
-    const h=this.host,spans=[];
-    for(const kind of KINDS){
+    const h=this.host,spans=this.planSpans??=[],groups=this.planGroups??=[];
+    const spanPool=this.spanPool??=KINDS.map(()=>({})),groupPool=this.groupPool??=KINDS.map(()=>({}));
+    spans.length=0;groups.length=0;
+    for(let k=0;k<KINDS.length;k++){
+      const kind=KINDS[k];
       if(!this.enabled.has(kind))continue;
       const array=this.arrays.get(kind);if(!array||!array.pointer||array.invalid)return null;
       const start=array.pointer+first*array.stride,length=count?(count-1)*array.stride+array.size*array.width:0;
       if(!Number.isSafeInteger(start+length)||start+length>0x100000000)return null;
       if(count)try{h.check(start,length);}catch{return null;}
-      spans.push({kind,array,first:start,start:start-start%4,end:start+length,offset:0});
+      const span=spanPool[spans.length];span.kind=kind;span.array=array;span.first=start;span.start=start-start%4;span.end=start+length;span.offset=0;spans.push(span);
     }
-    spans.sort((a,b)=>a.start-b.start);
-    const groups=[];let bytes=0;
+    spans.sort(byStart);
+    let bytes=0;
     for(let i=0;i<spans.length;){
       // Gaps shorter than a page lie on pages that already hold span bytes.
       let j=i+1,end=spans[i].end;while(j<spans.length&&spans[j].start<=end+256){end=Math.max(end,spans[j].end);j++;}
       const start=spans[i].start;let source;
       try{source=h.check(start,end-start);}catch{return null;}
-      groups.push({source,length:end-start,offset:bytes});
+      const group=groupPool[groups.length];group.source=source;group.length=end-start;group.offset=bytes;groups.push(group);
       for(;i<j;i++)spans[i].offset=bytes+(spans[i].first-start);
       bytes+=align4(end-start);
     }
-    return {spans,groups,bytes};
+    const plan=this.plan??={spans,groups,bytes:0};plan.bytes=bytes;return plan;
   }
   _writeDraw(at,mode,count,type,vertexCount,plan){
     const w=at>>2,words=this.words,{spans,groups,bytes}=plan;

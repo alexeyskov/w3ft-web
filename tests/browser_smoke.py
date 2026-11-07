@@ -120,6 +120,211 @@ async def check_default_language(browser, base):
     print('Default page language: country, browser fallback and chosen language passed')
 
 
+async def check_loading_screen(browser, base):
+    # The launcher downloads what the game needs first (runtime prepareGame),
+    # with a progress bar, then starts it with the copies on this device.
+    context = await browser.new_context(viewport={'width': 1280, 'height': 900}, locale='ru-RU')
+    page = await context.new_page()
+    errors = []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    async def status(route):
+        response = await route.fetch()
+        value = await response.json()
+        value['runtime'].update(diagnostics=True, installed=True, moduleUrl='/runtime/loading-fixture.mjs', wasmSize=1000)
+        value['game']['prepared'] = True
+        await route.fulfill(json=value)
+    await page.route('**/api/status', status)
+    await page.route('**/runtime/loading-fixture.mjs', lambda route: route.fulfill(
+        content_type='text/javascript', body='''
+          // No Warcraft code runs: prepareGame waits for the test, runDiagnostics records its options.
+          export function prepareGame(options) {
+            window.fixturePrepare = options;
+            let finish; const done = new Promise(resolve => finish = resolve);
+            const result = cancelled => ({cancelled, media:new Map([['/api/assets/intro', 'blob:fixture']]), release(){ window.fixtureReleased = true; }});
+            window.fixturePrepareFinish = () => finish(result(false));
+            return {done, cancel(){ window.fixturePrepareCancelled = true; finish(result(true)); }};
+          }
+          export async function runDiagnostics(options) {
+            window.fixtureOptions = options;
+            options.onFrame({frames:1, width:options.resolution.width, height:options.resolution.height});
+            return {async stop(){}, async finish(){ options.onReport({fixture:true}); }, key(){}};
+          }
+        '''))
+    await page.goto(base)
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    await page.locator('#launch').click()
+    await wait_for(page, '!!window.fixturePrepare')
+    assert await page.evaluate('fixturePrepare.wasmSize === 1000 && fixturePrepare.language === "ru"')
+    assert await page.locator('#game-loading-title').inner_text() == 'Загрузка файлов игры'
+    assert await page.locator('#game-loading-bar').is_hidden(), 'No bar before the sizes are known'
+    await page.evaluate('fixturePrepare.onProgress({done: 10 * 1048576, total: 40 * 1048576})')
+    assert await page.locator('#game-loading-bar').is_visible()
+    assert await page.locator('#game-loading-detail').inner_text() == '10 из 40 МБ · 25%'
+    assert await page.locator('#game-loading-bar').get_attribute('aria-valuenow') == '25'
+    assert await page.evaluate('document.getElementById("game-loading-fill").style.width') == '25%'
+    await page.evaluate('fixturePrepareFinish()')
+    await wait_for(page, '!!window.fixtureOptions')
+    assert await page.evaluate('fixtureOptions.media.get("/api/assets/intro") === "blob:fixture"'), 'The cinematic copy was not passed'
+    assert await page.evaluate('fixtureOptions.audioContext instanceof AudioContext'), 'Sound must start from the Play click'
+    await wait_for(page, 'document.getElementById("game-loading").hidden')
+    await page.locator('#stop-diagnostic').dispatch_event('click')
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert await page.evaluate('window.fixtureReleased === true && fixtureOptions.audioContext.state === "closed"'), 'The session must release its copies and sound'
+    # Stop during the download: nothing starts.
+    await page.evaluate('window.fixturePrepare = null; window.fixtureOptions = null')
+    await page.locator('#launch').click()
+    await wait_for(page, '!!window.fixturePrepare')
+    await page.locator('#stop-diagnostic').dispatch_event('click')
+    await wait_for(page, 'window.fixturePrepareCancelled === true && !document.getElementById("launch").disabled')
+    assert await page.evaluate('window.fixtureOptions === null'), 'A cancelled download must not start the game'
+    assert not errors, errors
+    await context.close()
+    print('Loading screen: download progress, local cinematic, sound from the click, cancellation passed')
+
+
+async def check_touch_controls(browser, base):
+    # An Android phone held sideways: Chromium with touch emulation (pointer: coarse).
+    context = await browser.new_context(viewport={'width': 915, 'height': 412}, device_scale_factor=2.625, is_mobile=True, has_touch=True,
+                                        locale='ru-RU', user_agent='Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36')
+    page = await context.new_page()
+    errors = []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    async def status(route):
+        response = await route.fetch()
+        value = await response.json()
+        value['runtime'].update(diagnostics=True, installed=True, moduleUrl='/runtime/touch-fixture.mjs')
+        value['game']['prepared'] = True
+        await route.fulfill(json=value)
+    await page.route('**/api/status', status)
+    await page.route('**/runtime/touch-fixture.mjs', lambda route: route.fulfill(
+        content_type='text/javascript', body='''
+          // The site's touch controls reach the runtime through key(); no Warcraft code runs.
+          export async function runDiagnostics(options) {
+            window.fixtureKeys=[];
+            options.onFrame({frames:1,width:options.resolution.width,height:options.resolution.height});
+            return {async stop(){window.fixtureStopped=true;}, async finish(){options.onReport({fixture:true});},
+              key(type,{keyCode,text=''}){window.fixtureKeys.push([type,keyCode,text]);}};
+          }
+        '''))
+    await page.goto(base)
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert await page.evaluate('matchMedia("(pointer: coarse)").matches'), 'Touch emulation must make touch the primary input'
+    await page.locator('#launch').tap()
+    await wait_for(page, 'Array.isArray(window.fixtureKeys)')
+    assert await page.locator('#touch-controls').is_visible(), 'A touch screen shows the on-screen keys'
+    assert await page.locator('#rotate-hint').is_hidden(), 'Landscape needs no rotation hint'
+    # The device keyboard: the hidden field takes the focus; its text reaches the game.
+    await page.locator('#touch-keyboard-button').tap()
+    assert await page.evaluate('document.activeElement?.id') == 'touch-keyboard'
+    await page.keyboard.insert_text('Привет')
+    await wait_for(page, 'fixtureKeys.filter(k => k[0] === "keydown").length >= 6')
+    typed = await page.evaluate('fixtureKeys.filter(k => k[0] === "keydown").map(k => k[2]).join("")')
+    assert typed == 'Привет', typed
+    await page.keyboard.press('Backspace')
+    await page.keyboard.press('Enter')
+    downs = await page.evaluate('fixtureKeys.filter(k => k[0] === "keydown").slice(-2).map(k => k[1])')
+    assert downs == [8, 13], downs
+    await page.locator('#touch-keyboard-button').tap()
+    assert await page.evaluate('document.activeElement?.id') != 'touch-keyboard', 'The keyboard button closes the keyboard again'
+    await page.locator('#touch-escape').tap()
+    assert await page.evaluate('fixtureKeys.slice(-2)') == [['keydown', 27, '\x1b'], ['keyup', 27, '']]
+    if await page.evaluate('!!document.fullscreenElement'):
+        assert await page.locator('#touch-exit').is_visible(), 'Fullscreen hides the toolbar: the touch keys offer a way out'
+        await page.locator('#touch-exit').tap()
+        await wait_for(page, '!document.fullscreenElement')
+    assert await page.locator('#touch-exit').is_hidden() and await page.locator('#stop-diagnostic').is_visible()
+    await page.set_viewport_size({'width': 412, 'height': 915})
+    await wait_for(page, 'getComputedStyle(document.getElementById("rotate-hint")).display !== "none"')
+    await page.evaluate("document.getElementById('stop-diagnostic').click()")
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert not errors, errors
+    await context.close()
+    print('Touch controls: on-screen keys, device keyboard bridge, rotation hint passed')
+
+
+async def fixture_runtime(page, body):
+    """The site with a runtime module of the test's own: no Warcraft code runs."""
+    async def status(route):
+        response = await route.fetch()
+        value = await response.json()
+        value['runtime'].update(diagnostics=True, installed=True, moduleUrl='/runtime/notice-fixture.mjs')
+        value['game']['prepared'] = True
+        await route.fulfill(json=value)
+    await page.route('**/api/status', status)
+    await page.route('**/runtime/notice-fixture.mjs', lambda route: route.fulfill(content_type='text/javascript', body=body))
+
+
+async def check_launch_notices(browser, base):
+    # A screenshot from the game becomes a download; a running game is marked so
+    # that a page the browser reloads mid-game (out of memory) says so once.
+    context = await browser.new_context(viewport={'width': 1280, 'height': 900}, locale='ru-RU', accept_downloads=True)
+    page = await context.new_page()
+    errors = []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    await fixture_runtime(page, '''
+      export async function runDiagnostics(options) {
+        window.fixtureMark = localStorage.getItem('wc3-game-running');
+        options.onFrame({frames:1,width:options.resolution.width,height:options.resolution.height});
+        setTimeout(() => options.onScreenshot({name:'WC3ScrnShot_110726_165125_01.png', blob:new Blob([new Uint8Array([137,80,78,71])], {type:'image/png'})}), 50);
+        return {async stop(){}, async finish(){options.onReport({fixture:true});}, key(){}};
+      }''')
+    await page.goto(base)
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert await page.locator('#device-warning').is_hidden() and await page.locator('#launch-message').is_hidden()
+    async with page.expect_download() as downloaded:
+        await page.locator('#launch').click()
+    assert (await downloaded.value).suggested_filename == 'WC3ScrnShot_110726_165125_01.png'
+    await wait_for(page, 'window.fixtureMark !== undefined')
+    assert await page.evaluate('fixtureMark') is not None, 'A running game is marked'
+    await page.evaluate("document.getElementById('stop-diagnostic').click()")
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert await page.evaluate("localStorage.getItem('wc3-game-running')") is None, 'Closing the game removes the mark'
+    assert 'Screenshot: WC3ScrnShot_110726_165125_01.png' in await page.evaluate("localStorage.getItem('wc3-last-log')")
+    # The browser reloaded the page while the game ran.
+    await page.evaluate("localStorage.setItem('wc3-game-running', new Date().toISOString())")
+    await page.reload()
+    await wait_for(page, '!document.getElementById("launch-message").hidden')
+    assert 'Прошлый запуск прервался' in await page.locator('#launch-message').inner_text()
+    await page.wait_for_timeout(1500)  # the log reaches storage within a second
+    assert 'reloaded while the game ran' in await page.evaluate("localStorage.getItem('wc3-last-log') || ''")
+    await page.locator('#language').select_option('en')
+    assert 'The last launch was cut short' in await page.locator('#launch-message').inner_text()
+    await page.locator('#language').select_option('ru')
+    await page.reload()
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    await page.wait_for_timeout(300)
+    assert await page.locator('#launch-message').is_hidden(), 'The notice is shown once'
+    # A game in another tab holds the lock: its mark is not an interruption.
+    await page.evaluate("""() => { localStorage.setItem('wc3-game-running', 'other tab');
+      navigator.locks.request('wc3-game-running', () => new Promise(() => {})); }""")
+    other = await context.new_page()
+    other.on('pageerror', lambda error: errors.append(str(error)))
+    await fixture_runtime(other, 'export async function runDiagnostics() {}')
+    await other.goto(base)
+    await wait_for(other, '!document.getElementById("launch").disabled')
+    await other.wait_for_timeout(300)
+    assert await other.locator('#launch-message').is_hidden(), 'A game in another tab is no interruption'
+    assert await other.evaluate("localStorage.getItem('wc3-game-running')") == 'other tab'
+    for each in (page, other):  # no route handler may outlive the context
+        await each.unroute_all(behavior='ignoreErrors')
+    await context.close()
+    # iPhone (Chrome there is WebKit too): the page says so before Play.
+    context = await browser.new_context(viewport={'width': 844, 'height': 390}, is_mobile=True, has_touch=True, locale='ru-RU',
+        user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 26_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/157.0.8103.37 Mobile/15E148 Safari/604.1')
+    page = await context.new_page()
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    await page.goto(base)
+    await page.evaluate("localStorage.setItem('wc3-game-running', new Date().toISOString())")
+    await page.reload()
+    await wait_for(page, '!document.getElementById("device-warning").hidden')
+    assert 'iPhone' in await page.locator('#device-warning').inner_text()
+    await page.wait_for_timeout(300)
+    assert await page.locator('#launch-message').is_hidden(), 'On iPhone the device warning explains the reload'
+    await context.close()
+    assert not errors, errors
+    print('Launch notices: screenshot download, interrupted launch, other tab, iPhone warning passed')
+
+
 async def check_launch_and_lobby(browser, base):
     context = await browser.new_context(viewport={"width": 1440, "height": 1000}, locale='ru-RU')
     page = await context.new_page()
@@ -220,6 +425,7 @@ async def check_launch_and_lobby(browser, base):
     # "Playing now": this page's game runs over its LAN lobby.
     await wait_for(page, 'document.getElementById("online-playing").textContent === "1" && document.getElementById("online-lan").textContent === "1" && +document.getElementById("online-site").textContent >= 1')
     assert await page.locator('#stop-diagnostic').is_hidden(), 'The toolbar must not cover the fullscreen game'
+    assert await page.locator('#touch-controls').is_hidden() and await page.locator('#rotate-hint').is_hidden(), 'A mouse and keyboard get no touch controls'
     # A user leaves fullscreen with a held Escape first. Clicking the hidden
     # button directly keeps the cancellation race with an unsettled request.
     await page.locator('#stop-diagnostic').dispatch_event('click')
@@ -296,7 +502,7 @@ async def main(base):
             page.on('request', lambda request: map_requests.append(request.url) if '/api/maps' in request.url else None)
             await page.goto(base)
             await wait_for(page, 'document.body.dataset.phase !== "loading"')
-            assert await page.locator('h1').inner_text() == 'The Frozen Throne Revived'
+            assert await page.locator('h1').inner_text() == 'The Frozen Throne Reborn'
             assert await page.evaluate('crossOriginIsolated'), 'COOP/COEP headers missing'
             assert await page.locator('#map-list, .crest, .hero, [data-mode]').count() == 0, 'Old marketing/map selection UI remains'
             assert not map_requests, 'Launcher must not fetch the map catalog'
@@ -404,6 +610,9 @@ async def main(base):
             await context.close()
             await check_launch_and_lobby(browser, base)
             await check_default_language(browser, base)
+            await check_touch_controls(browser, base)
+            await check_loading_screen(browser, base)
+            await check_launch_notices(browser, base)
             print('Browser integration passed. Warcraft execution was not tested.')
         finally:
             await browser.close()

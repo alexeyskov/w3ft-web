@@ -1,6 +1,6 @@
 PYTHON ?= .venv/bin/python
 
-.PHONY: setup prepare inspect maps media locale-en geoip serve test lift-smoke lift-runtime runtime runtime-probe
+.PHONY: setup prepare inspect maps media locale-en geoip boot-set serve test lift-smoke lift-runtime runtime runtime-probe
 ENGLISH_ARCHIVE ?= resources/AppNee.com.Warcraft.III.RoC.TFT.Portable.FR.7z
 setup:
 	python3 -m venv .venv
@@ -38,6 +38,7 @@ test:
 	node --check web/src/transport.mjs
 	node --check web/src/diagnostics.mjs
 	node --check web/src/presence.mjs
+	node --check web/src/touch-keyboard.mjs
 	node --test tests/*_test.mjs
 
 lift-smoke:
@@ -52,6 +53,11 @@ lift-runtime:
 runtime:
 	$(PYTHON) tools/build_runtime.py
 	$(PYTHON) tools/package_runtime.py
+
+# What the game reads up to its main menu, per language (var/runtime/boot-*.json):
+# the launcher downloads it before a launch, with progress. Needs Playwright.
+boot-set:
+	$(PYTHON) tools/record_boot_set.py
 
 runtime-probe:
 	node tools/run_runtime.mjs

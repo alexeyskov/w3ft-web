@@ -79,6 +79,27 @@ test('OpenGL HLE checks guest bounds and reports actual renderer strings',()=>{
   h.invoke('opengl32.dll','glVertexPointer',3,GL,0,1024*1024-4);h.invoke('opengl32.dll','glEnableClientState',0x8074);
   assert.throws(()=>h.invoke('opengl32.dll','glDrawArrays',4,0,3),/memory bounds/);
 });
+test('glReadPixels returns RGB, RGBA and the BGRA of Warcraft screenshots, keeping row padding',()=>{
+  // A 3×2 frame; pixel i is [10+i, 20+i, 30+i, 40+i] in WebGL's RGBA.
+  const reads=[],gl={PACK_ALIGNMENT:0x0d05,RGBA:0x1908,UNSIGNED_BYTE:0x1401,pixelStorei(){},
+    readPixels:(x,y,width,height,format,type,target)=>{reads.push([x,y,width,height,format,type]);for(let i=0;i<width*height;i++)target.set([10+i,20+i,30+i,40+i],i*4);}};
+  const h=new Host({graphics:{gl,_check(){}}}),read=(format,pointer)=>h.invoke('opengl32.dll','glReadPixels',0,0,3,2,format,0x1401,pointer);
+  const pixels=(pointer,channels,stride)=>[0,1].map(row=>[...h.copyOut(pointer+row*stride,3*channels)]);
+  read(GLenum.BGRA,4096);
+  assert.deepEqual(pixels(4096,4,12),[[30,20,10,40,31,21,11,41,32,22,12,42],[33,23,13,43,34,24,14,44,35,25,15,45]]);
+  read(GLenum.RGBA,8192);assert.deepEqual(pixels(8192,4,12)[1].slice(0,4),[13,23,33,43]);
+  // Three-byte rows of 9 bytes are 12 apart at the default PACK_ALIGNMENT of 4.
+  new Uint8Array(h.memory.buffer).fill(0xee,12288,12288+24);
+  read(GLenum.BGR,12288);
+  assert.deepEqual(pixels(12288,3,12),[[30,20,10,31,21,11,32,22,12],[33,23,13,34,24,14,35,25,15]]);
+  assert.deepEqual([...h.copyOut(12288+9,3)],[0xee,0xee,0xee],'padding is not written');
+  h.invoke('opengl32.dll','glPixelStorei',0x0d05,1);read(GLenum.RGB,16384);
+  assert.deepEqual(pixels(16384,3,9)[1],[13,23,33,14,24,34,15,25,35]);
+  assert.deepEqual(reads[0],[0,0,3,2,0x1908,0x1401]);
+  assert.throws(()=>read(GLenum.LUMINANCE,20480),/BGRA unsigned bytes/);
+  assert.throws(()=>h.invoke('opengl32.dll','glReadPixels',0,0,3,2,GLenum.BGRA,GLenum.FLOAT,20480),/BGRA unsigned bytes/);
+  assert.throws(()=>read(GLenum.BGRA,1024*1024-8),/memory bounds/);
+});
 test('draw copies preserve guest base, first vertex and unaligned stride, rejecting inaccessible spans',()=>{
   let drawn;const h=new Host({graphics:{drawArrays:(...args)=>drawn=args}}),call=(name,...args)=>h.invoke('opengl32.dll',name,...args);
   const base=8192,rawCheck=h.check.bind(h);h.base=base;
