@@ -203,7 +203,7 @@ test('decorated Miles imports parse PCM WAV, drive sample state and fire EOS cal
 test('Miles rejects non-PCM WAV and unsupported codecs, never returns dummy success',async()=>{
   const h=new Host({audio:new Audio()}),call=(name,...args)=>h.invoke('mss32.dll',`_${name}@${args.length*4}`,...args);
   h.copyIn(128,wav());h.w16(148,0x55);assert.equal(call('AIL_WAV_info',128,256),0);assert.match(h.cstr(call('AIL_last_error')),/only 8\/16-bit/);
-  assert.equal(call('AIL_enumerate_3D_providers',0,0,0),0);await assert.rejects(call('AIL_open_stream',1,128,0),/invalid handle/);
+  assert.equal(call('AIL_enumerate_3D_providers',0,0,0),0);assert.throws(()=>call('AIL_open_stream',1,128,0),/invalid handle/);
   assert.equal(call('AIL_open_XMIDI_driver',1),0);assert.match(h.cstr(call('AIL_last_error')),/No XMIDI/);
   assert.equal(call('AIL_startup'),1);assert.ok(call('AIL_open_digital_driver',22050,16,2,0),'MIDI absence does not disable digital sound');
   const unavailable=new Host();assert.equal(unavailable.invoke('mss32.dll','_AIL_startup@0'),0);assert.equal(unavailable.invoke('wsock32.dll','#115',0x101,128),10091);
@@ -287,4 +287,52 @@ test('Miles stream reads through guest file callbacks, tracks playback and relea
   call('AIL_register_stream_callback',id,5);audio.voices.get(s.voice).state='ended';assert.equal(call('AIL_stream_status',id),2);call('AIL_stream_status',id);
   assert.equal(seen.filter(c=>c.address===5).length,1);
   call('AIL_close_digital_driver',driver);assert.equal(audio.buffers.size,0);assert.equal(audio.voices.size,0);assert.equal(h.handles.has(id),false);
+});
+
+test('Miles music and ambience load on their own host thread; speech still loads in the call',async()=>{
+  const audio=new Audio(),data=wav(),seen=[],decodes=[],gates=[],threads=[],tick=()=>new Promise(resolve=>setTimeout(resolve,0));
+  const make=()=>{const id=audio.next++;audio.buffers.set(id,{duration:2,sampleRate:8000,numberOfChannels:1});return id;};
+  audio.createEncodedBuffer=()=>{decodes.push('sync');return make();};
+  audio.createEncodedBufferAsync=()=>new Promise(resolve=>decodes.push(()=>resolve(make())));
+  audio.bufferInfo=(id,field)=>audio.buffers.get(id)[field];
+  const logged=[],h=new Host({audio,log:line=>logged.push(line)}),call=(name,...args)=>h.invoke('mss32.dll',`_${name}@${args.length*4}`,...args);
+  const missing='Sound\\Ambient\\Missing.wav';
+  h.scheduler={stopped:false,
+    create(){const item={cpu:0x7000+threads.length*0x100};threads.push(item);
+      // The new thread waits in its host import: the loader first, then the service thread.
+      const name=threads.length===1?'MilesStreamThread':'MilesServiceThread';setTimeout(()=>h.handlers.get('wc3host.dll!'+name).fn([0]),0);return item;},
+    async call(cpu,address,args){
+      seen.push({cpu,address,name:address===1?h.cstr(args[0]):null});
+      if(address===1){if(h.cstr(args[0])===missing)return 0;h.w32(args[1],99);return 1;}
+      if(address===3)return args[2]===2?data.length:0;
+      if(address===4){await new Promise(resolve=>gates.push(resolve));h.copyIn(args[1],data);return data.length;}
+      return 0;}};
+  h.callAsync=(address,args,cpu)=>h.scheduler.call(cpu,address,args);
+  const release=async()=>{while(!gates.length)await tick();gates.shift()();};
+  call('AIL_startup');const driver=call('AIL_open_digital_driver',8000,16,1,0);call('AIL_set_file_callbacks',1,2,3,4);
+  // Music: the game thread gets its stream at once and starts it while it loads.
+  const name=h.string('Sound\\Music\\mp3Music\\Orc1.mp3'),id=call('AIL_open_stream',driver,name,0),s=h.handles.get(id);
+  assert.equal(typeof id,'number');assert.equal(call('AIL_stream_status',id),2);
+  h.copyIn(name,new TextEncoder().encode('Sound\\Overwritten.mp3\0'));
+  call('AIL_set_stream_volume',id,63);call('AIL_pause_stream',id,0);assert.equal(call('AIL_stream_status',id),4);assert.equal(s.voice,null);
+  call('AIL_pause_stream',id,1);assert.equal(call('AIL_stream_status',id),8);call('AIL_pause_stream',id,0);assert.equal(call('AIL_stream_status',id),4);
+  await release();
+  assert.equal(seen[0].name,'Sound\\Music\\mp3Music\\Orc1.mp3','the copy of the caller\'s string');assert.ok(seen.every(c=>c.cpu===threads[0].cpu),'on the loader thread');
+  while(typeof decodes[0]!=='function')await tick();decodes.shift()();
+  while(s.voice===null)await tick();
+  assert.equal(call('AIL_stream_status',id),4);assert.equal(audio.voices.get(s.voice).volume,63/127);assert.equal(s.duration,2);
+  // Closed while loading: nothing is kept.
+  const buffers=audio.buffers.size,closed=call('AIL_open_stream',driver,h.string('Sound\\Music\\mp3Music\\Orc2.mp3'),0);
+  call('AIL_close_stream',closed);
+  // A track that cannot be opened ends, so the game moves on to the next one.
+  const gone=call('AIL_open_stream',driver,h.string(missing),0);call('AIL_register_stream_callback',gone,5);call('AIL_start_stream',gone);
+  while(!seen.some(c=>c.address===5))await tick();
+  assert.equal(call('AIL_stream_status',gone),2);assert.equal(seen.find(c=>c.address===5).cpu,threads[1].cpu,'delivered by the service thread');
+  assert.deepEqual(logged,['Audio stream Sound\\Ambient\\Missing.wav: Unable to open audio file: Sound\\Ambient\\Missing.wav']);
+  assert.equal(audio.buffers.size,buffers);assert.equal(h.handles.has(closed),false);assert.equal(decodes.length,0);
+  // Speech stays with the calling thread and is decoded in the call.
+  h.currentCPU=0x1000;
+  const speech=call('AIL_open_stream',driver,h.string('Sound\\Dialogue\\Orc01.mp3'),0);assert.equal(typeof speech.then,'function');
+  await release();const speechId=await speech;
+  assert.equal(seen.filter(c=>c.cpu===0x1000).length,5);assert.deepEqual(decodes,['sync']);assert.equal(h.handles.get(speechId).duration,2);
 });

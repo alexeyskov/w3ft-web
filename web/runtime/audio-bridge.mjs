@@ -33,14 +33,34 @@ export class WorkerAudio {
         error.details={operation:method,sequence,guestTrace};throw error;
       }
     }
+    return this._result(this.control,method,sequence,guestTrace);
+  }
+  _result(control,method,sequence,guestTrace){
+    const status=new Int32Array(control,0,1),view=new DataView(control);
     if(Atomics.load(status,0)!==1){
       const length=Math.min(ERROR_BYTES,view.getUint32(4,true));
       // Browser TextDecoder rejects a view backed by SharedArrayBuffer.
-      const message=new TextDecoder().decode(new Uint8Array(this.control,HEADER,length).slice());
+      const message=new TextDecoder().decode(new Uint8Array(control,HEADER,length).slice());
       const error=new AudioHostError(`${method}: ${message||'main-thread request failed'}`);
       error.details={operation:method,sequence,guestTrace};throw error;
     }
     return view.getFloat64(8,true);
+  }
+  // The same request without stopping the worker: its own control words,
+  // watched with Atomics.waitAsync (older Firefox: looked at every 20 ms).
+  async _requestAsync(method,fields={},transfer=[],timeout=60000){
+    if(this.failed)fail('audio bridge is unavailable after a timeout');
+    const control=new SharedArrayBuffer(CONTROL_BYTES),status=new Int32Array(control,0,1),sequence=++this.sequence,guestTrace=this.trace();
+    this.post({type:'audio',method,sequence,control,guestTrace,...fields},transfer);
+    const deadline=performance.now()+timeout;
+    while(Atomics.load(status,0)===0){
+      if(performance.now()>deadline&&Atomics.compareExchange(status,0,0,-2)===0){
+        const error=new AudioHostError(`main-thread ${method} timed out`);error.details={operation:method,sequence,guestTrace};throw error;
+      }
+      const wait=Atomics.waitAsync?Atomics.waitAsync(status,0,0,1000):{async:true,value:new Promise(resolve=>setTimeout(resolve,20))};
+      if(wait.async)await wait.value;
+    }
+    return this._result(control,method,sequence,guestTrace);
   }
   createBuffer(description){
     if(!(description?.data instanceof Uint8Array))fail('PCM data must be Uint8Array');
@@ -51,6 +71,11 @@ export class WorkerAudio {
   createEncodedBuffer(bytes){
     if(!(bytes instanceof Uint8Array))fail('encoded data must be Uint8Array');
     const id=this.nextBuffer++,data=bytes.slice();this._request('createEncodedBuffer',{id,data},[data.buffer]);this.buffers.add(id);return id;
+  }
+  // Decoding a music track takes the page a while: other guest threads go on.
+  async createEncodedBufferAsync(bytes){
+    if(!(bytes instanceof Uint8Array))fail('encoded data must be Uint8Array');
+    const id=this.nextBuffer++,data=bytes.slice();await this._requestAsync('createEncodedBuffer',{id,data},[data.buffer]);this.buffers.add(id);return id;
   }
   bufferInfo(id,field){return this._request('bufferInfo',{id,field});}
   play(bufferId,options={}){const id=this.nextVoice++;this._request('play',{id,bufferId,options:{...options}});this.voices.add(id);return id;}

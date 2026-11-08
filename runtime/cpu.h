@@ -69,10 +69,32 @@ void dispatch_indirect(struct CPU *c, uint32_t address);
 void dispatch_tail(struct CPU *c);
 typedef void (*guest_fn_t)(struct CPU *);
 #define DISPATCH_CALL(c_, address_) dispatch_indirect((c_), (uint32_t)(address_))
-#ifdef __wasm__
+/* A jump to an address in a register or memory (x86 "jmp eax", including
+ * switch tables) leaves the lifted function for its target. With WebAssembly
+ * tail calls that is a return_call and the stack does not grow; a loop over a
+ * switch makes such a jump on every pass. Engines without them (Safari before
+ * 18.2, Chrome before 112, Firefox before 121) get a build with
+ * WC3_TAIL_TRAMPOLINE (tools/build_runtime.py --variant compat): the jump
+ * records its target and returns, and the caller makes it. That build adds
+ * TAIL_RESUME after every direct call in lifted code; dispatch_indirect and
+ * the runtime's own calls do the same. */
+#if defined(__wasm__) && defined(WC3_TAIL_TRAMPOLINE)
+#ifdef __wasm_tail_call__
+#error "WC3_TAIL_TRAMPOLINE is the build without WebAssembly tail calls (-mno-tail-call)"
+#endif
+extern _Thread_local uint32_t wc3_tail_pending;
+void wc3_tail_resume(struct CPU *c);
+#define DISPATCH_TAIL(c_, address_) { (c_)->eip = (uint32_t)(address_); wc3_tail_pending = 1; return; }
+#define TAIL_RESUME(c_) do { if (__builtin_expect(wc3_tail_pending, 0)) wc3_tail_resume(c_); } while (0)
+#elif defined(__wasm__)
+#ifndef __wasm_tail_call__
+#error "Lifted code needs WebAssembly tail calls (-mtail-call) or the trampoline build (--variant compat)"
+#endif
 #define DISPATCH_TAIL(c_, address_) { (c_)->eip = (uint32_t)(address_); __attribute__((musttail)) return dispatch_tail(c_); }
+#define TAIL_RESUME(c_) ((void)0)
 #else
 #define DISPATCH_TAIL(c_, address_) { (c_)->eip = (uint32_t)(address_); dispatch_tail(c_); return; }
+#define TAIL_RESUME(c_) ((void)0)
 #endif
 
 typedef struct CPU {

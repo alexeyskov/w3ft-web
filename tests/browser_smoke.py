@@ -242,12 +242,18 @@ async def check_touch_controls(browser, base):
     print('Touch controls: on-screen keys, device keyboard bridge, rotation hint passed')
 
 
-async def fixture_runtime(page, body):
-    """The site with a runtime module of the test's own: no Warcraft code runs."""
+async def fixture_runtime(page, body, compat=False):
+    """The site with a runtime module of the test's own: no Warcraft code runs.
+    compat: whether the server has the build for browsers without tail calls."""
     async def status(route):
         response = await route.fetch()
         value = await response.json()
-        value['runtime'].update(diagnostics=True, installed=True, moduleUrl='/runtime/notice-fixture.mjs')
+        value['runtime'].update(diagnostics=True, installed=True, moduleUrl='/runtime/notice-fixture.mjs',
+                                wasmUrl='/runtime/wc3.wasm', wasmSize=1000)
+        for key in ('compatWasmUrl', 'compatWasmSize'):
+            value['runtime'].pop(key, None)
+        if compat:
+            value['runtime'].update(compatWasmUrl='/runtime/wc3-compat.wasm', compatWasmSize=2000)
         value['game']['prepared'] = True
         await route.fulfill(json=value)
     await page.route('**/api/status', status)
@@ -323,6 +329,54 @@ async def check_launch_notices(browser, base):
     await context.close()
     assert not errors, errors
     print('Launch notices: screenshot download, interrupted launch, other tab, iPhone warning passed')
+
+
+async def check_outdated_browser(browser, base):
+    # A browser without WebAssembly tail calls starts the compatible build
+    # (wc3-compat.wasm) and is told it may run slower; a current browser keeps
+    # wc3.wasm. Without that build on the server, the page says so and keeps
+    # Play disabled instead of failing with a compile error.
+    recorder = '''
+      export function prepareGame(options) {
+        window.prepared = [options.wasmUrl, options.wasmSize];
+        return {done:Promise.resolve({cancelled:false, media:new Map(), release(){}}), cancel(){}};
+      }
+      export async function runDiagnostics(options) {
+        window.started = options.wasmUrl;
+        options.onFrame({frames:1, width:options.resolution.width, height:options.resolution.height});
+        return {async stop(){}, async finish(){options.onReport({fixture:true});}, key(){}};
+      }'''
+    for old, compat in ((False, True), (True, True), (True, False)):
+        context = await browser.new_context(locale='ru-RU')
+        if old:
+            await context.add_init_script('WebAssembly.validate = () => false;')
+        page = await context.new_page()
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        await fixture_runtime(page, recorder, compat=compat)
+        await page.goto(base)
+        if old and not compat:
+            await wait_for(page, 'document.getElementById("status-sub").textContent.includes("хвостовые вызовы")')
+            assert await page.locator('#launch').is_disabled(), 'Play must stay disabled'
+            assert await page.locator('#status').inner_text() == 'Игра недоступна'
+        else:
+            await wait_for(page, '!document.getElementById("launch").disabled')
+            warning = page.locator('#device-warning')
+            if old:
+                assert await warning.is_visible() and 'режиме совместимости' in await warning.inner_text()
+            else:
+                assert await warning.is_hidden(), 'A current browser gets no notice'
+            await page.locator('#launch').click()
+            await wait_for(page, 'window.started !== undefined')
+            expected = ['/runtime/wc3-compat.wasm', 2000] if old else ['/runtime/wc3.wasm', 1000]
+            assert await page.evaluate('[window.started, ...window.prepared]') == [expected[0], *expected], expected
+            await page.evaluate("document.getElementById('stop-diagnostic').click()")
+            await wait_for(page, '!document.getElementById("launch").disabled')
+        await page.unroute_all(behavior='ignoreErrors')
+        await context.close()
+        assert not errors, errors
+    print('Browsers without tail calls: compatible build with a notice, current browsers unchanged, '
+          'notice and Play disabled without that build passed')
 
 
 async def check_launch_and_lobby(browser, base):
@@ -613,6 +667,7 @@ async def main(base):
             await check_touch_controls(browser, base)
             await check_loading_screen(browser, base)
             await check_launch_notices(browser, base)
+            await check_outdated_browser(browser, base)
             print('Browser integration passed. Warcraft execution was not tested.')
         finally:
             await browser.close()

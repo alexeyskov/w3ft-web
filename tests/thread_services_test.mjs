@@ -102,6 +102,17 @@ test('IO completion waits retain output context and can be fulfilled by another 
   assert.deepEqual([h.u32(bytes),h.u32(key),h.u32(overlapped)],[99,0x1234,0x5566]);
 });
 
+test('critical-section contention works without Atomics.waitAsync (older Firefox)',async()=>{
+  const waitAsync=Atomics.waitAsync;Atomics.waitAsync=undefined;
+  try{
+    const{h,call}=fixture(),section=h.alloc(24);call(1,'InitializeCriticalSection',[section]);call(1,'EnterCriticalSection',[section]);
+    let entered=false;const pending=call(2,'EnterCriticalSection',[section]).then(()=>{entered=true;});
+    await new Promise(resolve=>setTimeout(resolve,20));assert.equal(entered,false);
+    call(1,'LeaveCriticalSection',[section]);await pending;assert.equal(h.u32(section+12),2);
+    call(2,'LeaveCriticalSection',[section]);call(1,'DeleteCriticalSection',[section]);
+  }finally{Atomics.waitAsync=waitAsync;}
+});
+
 test('scheduler shutdown cancels waits, sleeps and contended critical sections',async()=>{
   const{h,call}=fixture(),event=call(1,'CreateEventA',[0,0,0,0]),section=h.alloc(24);
   call(1,'InitializeCriticalSection',[section]);call(1,'EnterCriticalSection',[section]);

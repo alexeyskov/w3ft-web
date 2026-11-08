@@ -6,6 +6,9 @@ the menu must give a PNG download of the frame, which stays out of the saves.
 This checks site integration, not completion of a campaign or a multiplayer
 acceptance test.
 --browser firefox or webkit runs the same check in another engine.
+--no-tail-calls makes the page see a browser without WebAssembly tail calls
+(Safari before 18.2, Chrome before 112, Firefox before 121): the game must
+run its compatible build, wc3-compat.wasm.
 """
 import argparse
 import json
@@ -14,8 +17,17 @@ import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
+# The page's tail-call probe fails, as in a browser without them; every other
+# module validates as usual.
+NO_TAIL_CALLS = """{
+  const validate = WebAssembly.validate, probe = '0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,3,2,0,0,10,11,2,4,0,65,0,11,4,0,18,0,11';
+  WebAssembly.validate = function (bytes, ...rest) {
+    return ArrayBuffer.isView(bytes) && String(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)) === probe ? false : validate.call(this, bytes, ...rest);
+  };
+}"""
 
-def main(url,output,resolution='1024x768',mute=False,engine='chromium'):
+
+def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_calls=True):
     output.mkdir(parents=True,exist_ok=True)
     with sync_playwright() as p:
         # Each engine's way to allow sound and video without a user gesture.
@@ -23,6 +35,7 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium'):
         elif engine=='firefox':browser=p.firefox.launch(firefox_user_prefs={'media.autoplay.default':0,'media.autoplay.blocking_policy':0})
         else:browser=p.webkit.launch()
         page=browser.new_page(viewport={'width':1440,'height':1100},accept_downloads=True)
+        if not tail_calls:page.add_init_script(NO_TAIL_CALLS)
         errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
         page.set_default_timeout(120000)
         def wait(expression):
@@ -40,6 +53,8 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium'):
             page.locator('#launch').click()
             wait("siteReport||[...document.querySelectorAll('video')].some(v=>v.currentTime>3)")
             assert not page.evaluate('siteReport'),'Runtime stopped during startup'
+            module='wc3.wasm' if tail_calls else 'wc3-compat.wasm'
+            assert f'WASM {module} compiled' in page.evaluate("localStorage.getItem('wc3-last-log')||''"),f'{module} was not the module compiled'
             assert page.evaluate("document.fullscreenElement?.id === 'game-view'"),'Play did not enter fullscreen'
             assert page.evaluate("[...document.querySelectorAll('video')].filter(v=>v.currentTime>3).every(v=>document.fullscreenElement.contains(v))"),'Cinematic is outside the fullscreen game'
             assert page.evaluate("[...document.querySelectorAll('video')].filter(v=>v.currentTime>3).every(v=>v.muted)") == mute,'Cinematic audio ignored the launch setting'
@@ -98,7 +113,7 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium'):
             saved=page.evaluate("async()=>{const {SaveStore}=await import('/src/storage.mjs');return (await new SaveStore().list()).map(file=>file.path)}")
             assert not [path for path in saved if path.lower().startswith('screenshots/')],saved
             assert not errors,errors
-            print(json.dumps({'wasmExecuted':report['wasmExecuted'],'frames':report['graphics']['frames'],'calls':sum(report['calls'].values()),'resolution':resolution,'mute':mute,
+            print(json.dumps({'wasm':module,'wasmExecuted':report['wasmExecuted'],'frames':report['graphics']['frames'],'calls':sum(report['calls'].values()),'resolution':resolution,'mute':mute,
                               'screenshot':shot.suggested_filename,'errors':errors}))
         finally:browser.close()
 
@@ -110,4 +125,5 @@ if __name__=='__main__':
     parser.add_argument('--resolution',choices=['800x600','1024x768','1152x864','1280x960','1400x1050','1600x1200','1920x1440','2048x1536'],default='1024x768')
     parser.add_argument('--mute',action='store_true')
     parser.add_argument('--browser',choices=['chromium','firefox','webkit'],default='chromium')
-    args=parser.parse_args();main(args.url,args.output,args.resolution,args.mute,args.browser)
+    parser.add_argument('--no-tail-calls',action='store_true',help='a browser without WebAssembly tail calls: the compatible build')
+    args=parser.parse_args();main(args.url,args.output,args.resolution,args.mute,args.browser,not args.no_tail_calls)

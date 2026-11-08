@@ -69,6 +69,30 @@ class RangeTests(unittest.TestCase):
             status = runtime_status(root)
             self.assertTrue(status['installed'])
             self.assertEqual((status['wasmUrl'], status['wasmSize']), ('/runtime/wc3.wasm', 108))
+            self.assertNotIn('compatWasmUrl', status)
+
+    def test_runtime_compat_build_is_optional(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'client.mjs').write_text('export {};\n')
+            (root / 'wc3.wasm').write_bytes(b'\0asm\x01\0\0\0' + bytes(100))
+            manifest = {'abi': 'wc3-browser-v1', 'module': 'client.mjs', 'wasm': 'wc3.wasm', 'wasmCompat': 'wc3-compat.wasm'}
+            (root / 'runtime.json').write_text(json.dumps(manifest))
+            # Not uploaded, or not a module: the main build still serves current browsers.
+            for content in (None, b'not a module'):
+                if content:
+                    (root / 'wc3-compat.wasm').write_bytes(content)
+                status = runtime_status(root)
+                self.assertTrue(status['installed'])
+                self.assertNotIn('compatWasmUrl', status)
+            (root / 'wc3-compat.wasm').write_bytes(b'\0asm\x01\0\0\0' + bytes(200))
+            status = runtime_status(root)
+            self.assertEqual((status['wasmUrl'], status['compatWasmUrl'], status['compatWasmSize']),
+                             ('/runtime/wc3.wasm', '/runtime/wc3-compat.wasm', 208))
+            (root / 'runtime.json').write_text(json.dumps({**manifest, 'wasmCompat': '../wc3-compat.wasm'}))
+            status = runtime_status(root)
+            self.assertTrue(status['installed'])
+            self.assertNotIn('compatWasmUrl', status)
 
 
 class ClientDisconnectTests(unittest.IsolatedAsyncioTestCase):

@@ -423,6 +423,22 @@ function installMiles(h) {
     if(!service.item)service.item=h.scheduler.create(h.resolve('wc3host.dll','MilesServiceThread'),0,0,256*1024);
     service.queue.push([address,args]);setTimeout(pump,0);
   };
+  // Streams are read whole through Warcraft's file callbacks (miles-streams.mjs)
+  // on a host thread of their own, one at a time: a track still coming from
+  // the server delays neither the game thread nor the callbacks above.
+  const loader={item:null,waiting:false,queue:[],busy:false};
+  h.add('wc3host.dll','MilesStreamThread',1,()=>new Promise(()=>{loader.waiting=true;setTimeout(pumpLoads,0);}));
+  function pumpLoads(){
+    if(loader.busy||!loader.waiting||!loader.queue.length||h.scheduler?.stopped)return;
+    const job=loader.queue.shift();loader.busy=true;
+    job(loader.item.cpu).then(()=>{loader.busy=false;pumpLoads();},error=>{loader.busy=false;h.scheduler.fail?.(error,loader.item);});
+  }
+  // job(cpu) runs guest callbacks on that thread; false: no guest threads here.
+  state.loadInBackground=job=>{
+    if(!h.scheduler)return false;
+    if(!loader.item)loader.item=h.scheduler.create(h.resolve('wc3host.dll','MilesStreamThread'),0,0,256*1024);
+    loader.queue.push(job);setTimeout(pumpLoads,0);return true;
+  };
   // Playback ends are detected from the expected end time and confirmed with
   // the AudioContext clock, so the callback follows the audible end closely.
   const watch=()=>{

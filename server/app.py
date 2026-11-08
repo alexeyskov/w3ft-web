@@ -63,24 +63,42 @@ def runtime_status(root):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict) or manifest.get("abi") != "wc3-browser-v1":
             raise ValueError("Unsupported runtime ABI")
-        for key, suffix in (("module", ".mjs"), ("wasm", ".wasm")):
+
+        def runtime_file(key, suffix):
             name = manifest[key]
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not name.endswith(suffix):
                 raise ValueError("Invalid runtime file name")
             path = root / name
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Runtime file missing")
-        with (root / manifest["wasm"]).open("rb") as stream:
-            if stream.read(8) != b"\0asm\x01\0\0\0":
-                raise ValueError("Invalid WebAssembly module")
-            # Uncompressed size: the launcher's progress for a gzip download.
-            wasm_size = os.fstat(stream.fileno()).st_size
+            return name
+
+        def wasm_size(name):
+            with (root / name).open("rb") as stream:
+                if stream.read(8) != b"\0asm\x01\0\0\0":
+                    raise ValueError("Invalid WebAssembly module")
+                # Uncompressed size: the launcher's progress for a gzip download.
+                return os.fstat(stream.fileno()).st_size
+        module, wasm = runtime_file("module", ".mjs"), runtime_file("wasm", ".wasm")
+        size = wasm_size(wasm)
+        # The build for engines without WebAssembly tail calls, which the page
+        # picks (tools/build_runtime.py --variant compat). Optional: without a
+        # valid one only those browsers are told to update.
+        compat = None
+        if "wasmCompat" in manifest:
+            try:
+                name = runtime_file("wasmCompat", ".wasm")
+                compat = (name, wasm_size(name))
+            except (OSError, TypeError, ValueError):
+                pass
         capabilities = manifest.get("capabilities", {})
         if not isinstance(capabilities, dict):
             raise ValueError("Invalid runtime capabilities")
         result.update(installed=True, reason="Подключён внешний runtime; совместимость требует проверки.",
-                      moduleUrl="/runtime/" + manifest["module"], wasmUrl="/runtime/" + manifest["wasm"], wasmSize=wasm_size,
+                      moduleUrl="/runtime/" + module, wasmUrl="/runtime/" + wasm, wasmSize=size,
                       capabilities={key: capabilities.get(key) is True for key in result["capabilities"]})
+        if compat:
+            result.update(compatWasmUrl="/runtime/" + compat[0], compatWasmSize=compat[1])
         result["diagnostics"] = manifest.get("diagnostics") is True
         result["graphics"] = manifest.get("graphics", "webgpu")
         if result["diagnostics"]:
@@ -324,7 +342,8 @@ async def static_file(request):
 
 async def compress_runtime(app):
     """Compress the WebAssembly runtime (about 10 s in a thread) when the
-    server starts, so the first player already gets the 19 MB download."""
+    server starts, so the first player already gets the 19 MB download; then
+    the build for browsers without tail calls, if there is one."""
     state = app[STATE]
     status = runtime_status(state["runtime"])
 
@@ -340,7 +359,12 @@ async def compress_runtime(app):
         finally:
             stream.close()
 
-    task = asyncio.create_task(warm(status["wasmUrl"].removeprefix("/runtime/"))) if status["installed"] else None
+    async def warm_all():
+        for key in ("wasmUrl", "compatWasmUrl"):
+            if key in status:
+                await warm(status[key].removeprefix("/runtime/"))
+
+    task = asyncio.create_task(warm_all()) if status["installed"] else None
     yield
     if task:
         task.cancel()

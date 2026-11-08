@@ -46,18 +46,29 @@ export class VideoDispatcher {
       this.remove(id);
       const url=new URL(message.url,location.href);if(url.origin!==location.origin||!url.pathname.startsWith('/api/assets/'))throw Error('video must be a game asset');
       const video=document.createElement('video');video.preload='auto';video.playsInline=true;video.controls=false;video.muted=this.muted;
-      const entry={video,abort:new AbortController(),visible:false,rect:null,viewport:null};this.players.set(id,entry);
+      const entry={video,abort:new AbortController(),visible:false,rect:null,viewport:null,loading:true};this.players.set(id,entry);
       Object.assign(video.style,{position:'fixed',objectFit:'contain',pointerEvents:'none',background:'black',zIndex:'20',display:'none'});
       (this.canvas?.parentElement||document.body).append(video);this.layout(entry);
       video.addEventListener('ended',()=>this.onEvent({type:'video-event',id,event:'ended'}));
-      video.addEventListener('error',()=>this.onEvent({type:'video-event',id,event:'error',error:video.error?.message||'Media decode error'}));
-      await new Promise((resolve,reject)=>{
-        const finish=error=>{clearTimeout(timer);video.removeEventListener('loadedmetadata',ready);video.removeEventListener('error',failed);entry.abort.signal.removeEventListener('abort',aborted);error?reject(error):resolve();};
-        const ready=()=>finish(),failed=()=>finish(Error(video.error?.message||'Unsupported video media')),aborted=()=>finish(Error('Video load cancelled'));
-        const timer=setTimeout(()=>finish(Error('Video metadata timeout')),15000);
-        video.addEventListener('loadedmetadata',ready);video.addEventListener('error',failed);entry.abort.signal.addEventListener('abort',aborted);
-        video.src=this.sources.get(url.pathname)||url.href;video.load();
-      });
+      // Failures while loading are retried below; the game hears of playback errors only.
+      video.addEventListener('error',()=>{if(!entry.loading)this.onEvent({type:'video-event',id,event:'error',error:video.error?.message||'Media decode error'});});
+      // A dropped connection fails the media element like a broken file: up to
+      // three tries, the last from the server, before the game is told.
+      for(let attempt=1;;attempt++){
+        try{
+          await new Promise((resolve,reject)=>{
+            const finish=error=>{clearTimeout(timer);video.removeEventListener('loadedmetadata',ready);video.removeEventListener('error',failed);entry.abort.signal.removeEventListener('abort',aborted);error?reject(error):resolve();};
+            const ready=()=>finish(),failed=()=>finish(Error(video.error?.message||'Unsupported video media')),aborted=()=>finish(Object.assign(Error('Video load cancelled'),{cancelled:true}));
+            const timer=setTimeout(()=>finish(Error('Video metadata timeout')),15000);
+            video.addEventListener('loadedmetadata',ready);video.addEventListener('error',failed);entry.abort.signal.addEventListener('abort',aborted);
+            video.src=attempt<3&&this.sources.get(url.pathname)||url.href;video.load();
+          });
+          entry.loading=false;break;
+        }catch(error){
+          if(error.cancelled||attempt>=3||this.players.get(id)!==entry)throw error;
+          await new Promise(resolve=>setTimeout(resolve,500*attempt));
+        }
+      }
       return {width:video.videoWidth,height:video.videoHeight,duration:video.duration};
     }
     if(method==='destroy'){this.remove(id);return {};}

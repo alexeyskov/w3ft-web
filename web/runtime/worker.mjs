@@ -7,6 +7,7 @@ import {GuestThreadScheduler} from './thread-scheduler.mjs';
 import {WorkerVideo} from './video-bridge.mjs';
 import {saveSnapshot,takeScreenshots,isScreenshot} from './persistence.mjs';
 import {webkitCollectorNudge} from './webkit-gc.mjs';
+import {sourceFiles,describeNetwork} from './game-files.mjs';
 import {GRAPHICS_SETTINGS} from './launch-settings.mjs';
 import {GameDataCache,cacheKey} from './game-cache.mjs';
 
@@ -16,46 +17,12 @@ class WorkerTransport extends EventTarget {
   constructor(peerId) { super(); this.peerId=peerId; }
   send(destination,data) { const copy=data.slice();postMessage({type:'packet',destination,data:copy},[copy.buffer]); }
 }
-let transport,video,network,pendingPeers=null,disconnected=false,disk=null;
+let transport,video,network,pendingPeers=null,disconnected=false,disk=null,gameFiles=null;
 
 // The catalog's copy of a map's first bytes (base64), never longer than the map.
 function mapHeader(text,size){
   try{const bytes=Uint8Array.from(atob(text),c=>c.charCodeAt(0));return bytes.length<=size?bytes:null;}catch{return null;}
 }
-function sourceFiles(entries,disk=null) {
-  const files=new Map(entries.map(e=>[e.path.replaceAll('\\','/').toLowerCase(),e]));
-  const cache=new Map(), chunkSize=256*1024;
-  const canonical=path=>{
-    path=path.replaceAll('\\','/').replace(/^C:\/Warcraft III\/?/i,'').replace(/^\.\//,'').toLowerCase();
-    if(path.split('/').includes('..'))throw Error('Unsafe file path');
-    const file=files.get(path);if(!file)throw Error(`File not found: ${path}`);return file;
-  };
-  const readFile=(path,offset=0,length=undefined)=>{
-    const file=canonical(path);length=length===undefined?file.size-offset:Math.min(length,file.size-offset);
-    if(offset<0||length<0||length>128*1024*1024)throw Error('Invalid file range');
-    // A map's first bytes come with the catalog: the startup read of every
-    // map's HM3W header (124 bytes) needs no 256 KiB block of each map.
-    if(file.header&&offset+length<=file.header.length)return file.header.slice(offset,offset+length);
-    const out=new Uint8Array(length);
-    for(let done=0;done<length;){
-      const start=Math.floor((offset+done)/chunkSize)*chunkSize,key=file.downloadUrl+':'+start;
-      let block=cache.get(key);
-      // Game data on this device first, then the server (stored for next time).
-      if(!block&&file.cacheKey)block=disk?.read(file.cacheKey,start/chunkSize);
-      if(!block){
-        const xhr=new XMLHttpRequest();xhr.open('GET',file.downloadUrl,false);xhr.responseType='arraybuffer';
-        xhr.setRequestHeader('Range',`bytes=${start}-${Math.min(start+chunkSize,file.size)-1}`);xhr.send();
-        if(xhr.status!==206)throw Error(`Range load failed: ${xhr.status} ${file.path}`);
-        block=new Uint8Array(xhr.response);if(file.cacheKey)disk?.write(file.cacheKey,start/chunkSize,block);
-      }
-      cache.set(key,block);if(cache.size>64)cache.delete(cache.keys().next().value);
-      const begin=offset+done-start,n=Math.min(block.length-begin,length-done);if(n<=0)throw Error('Truncated resource range');out.set(block.subarray(begin,begin+n),done);done+=n;
-    }
-    return out;
-  };
-  return {readFile,fileSize:path=>canonical(path).size,listFiles:()=>entries.map(e=>e.hidden?{path:e.path,hidden:true}:e.path)};
-}
-
 // Compiled while it downloads: the 180 MB module never sits in a JavaScript
 // buffer, which boot() kept for the whole game. That buffer plus the
 // compiler's copy was the startup peak (WebKit: 944 MB, streaming 597 MB).
@@ -75,7 +42,7 @@ async function boot(options) {
     log('Загрузка WASM и проверка профиля бинарников…');
     const compileStarted=performance.now();
     const [wasm,profile,manifest,catalog]=await Promise.all([
-      compileWasm(options.wasmUrl).then(module=>{log(`WASM compiled in ${((performance.now()-compileStarted)/1000).toFixed(1)} s`);return module;}),
+      compileWasm(options.wasmUrl).then(module=>{log(`WASM ${String(options.wasmUrl).split('/').pop()} compiled in ${((performance.now()-compileStarted)/1000).toFixed(1)} s`);return module;}),
       fetch(new URL('./build.json',import.meta.url)).then(r=>r.json()),
       // Game language: the server puts that localization's archives and
       // cinematics in place of the base installation's (same patch).
@@ -127,7 +94,8 @@ async function boot(options) {
     }
     if(options.canvas&&options.resolution){options.canvas.width=options.resolution.width;options.canvas.height=options.resolution.height;}
     const graphics=options.canvas?new FixedFunctionGL(options.canvas,{debugChecks:!!options.graphicsDebugChecks,legacyClampToEdge:options.legacyClampToEdge!==false,nativeTextureShader:options.nativeTextureShader!==false}):null;
-    engine=await createRuntime({wasm,profile,images,...sourceFiles(entries,disk),log,graphics,video,
+    gameFiles=sourceFiles(entries,disk,{log});
+    engine=await createRuntime({wasm,profile,images,...gameFiles,log,graphics,video,
       audio:new WorkerAudio({trace:()=>engine?.host.history.slice(-16)||[]}),network,resolution:options.resolution,graphicsSettings:options.graphicsSettings,
       allowLocalFiles:entries.some(e=>/^fonts\//i.test(e.path)),commandLine:options.commandLine||'war3.exe -opengl -window'});
     if(stopped)return;
@@ -185,6 +153,9 @@ async function boot(options) {
     if(engine?.host.hostTimings)report.hostTimings=Object.fromEntries([...engine.host.hostTimings].sort((a,b)=>b[1].totalMs-a[1].totalMs));
     if(engine)report.heap=engine.host.heapStats();
     disk?.close();disk=null;
+    // What the game had to wait for: the first thing to look at when it stuttered.
+    const fromServer=gameFiles?.networkReport();
+    if(fromServer?.blocks){report.gameData=fromServer;log(describeNetwork(fromServer));}
     if(engine)try{sendScreenshots(engine);}catch(caught){log(`Screenshot: ${caught.message}`);}
     const snapshot=engine?saveSnapshot(engine.host,{full:true}):{files:[],deleted:[],deferred:[]};
     if(snapshot.deferred.length)report.deferredSaveFiles=snapshot.deferred;

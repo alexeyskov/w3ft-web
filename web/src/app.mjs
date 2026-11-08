@@ -12,7 +12,7 @@ const english = {
   aboutLead:'The original Warcraft III: The Frozen Throne in your browser. The game code is recompiled to WebAssembly, with graphics through WebGL 2 and sound through Web Audio.',
   aboutPlay:'Choose campaigns, battles and maps inside the game. Saves stay in your browser, and LAN lobbies let you play with friends.',
   aboutEditions:'The Russian and English editions of Warcraft are supported. The game follows the selected site language.',
-  aboutHelp:'Questions and bug reports:', aboutHelpOr:'or',
+  aboutHelp:'Questions and bug reports:', aboutHelpOr:'or', aboutRightsHolders:'Rights holders:',
   creditsSource:'Source code on', creditsAdapted:'The launcher layout, static recompilation tools and CPU helpers are adapted from', creditsBased:'which builds on', creditsAuthor:'by Talha Müderrisoğlu',
   creditsPinned:'The imported files come from the pinned', creditsMitVersion:'MIT-licensed version', creditsMpq:'MPQ format reference:', creditsGeo:'IP Geolocation by',
   creditsLicense:'MIT license', creditsNotices:'Third-party credits and notices',
@@ -41,6 +41,8 @@ const messages = {
   error:['Не удалось запустить','Unable to start'], errorHint:['Подробности доступны в журнале.','Details are available in the log.'], unavailable:['Игра недоступна','Game unavailable'],
   filesMissing:['Файлы игры ещё не подготовлены на сервере.','Game files have not been prepared on the server.'], runtimeMissing:['Файлы движка ещё не подготовлены.','The game runtime has not been prepared.'],
   browserUnsupported:['Нужен браузер с WebGL 2 и общей памятью, открытый через HTTPS или localhost.','Use a browser with WebGL 2 and shared memory over HTTPS or localhost.'],
+  browserOutdated:['Этот браузер устарел: игре нужны хвостовые вызовы WebAssembly. Обновите браузер; Safari обновляется вместе с macOS.','This browser is too old: the game needs WebAssembly tail calls. Update the browser; Safari updates with macOS.'],
+  compatBuild:['Браузер устарел: игра запустится в режиме совместимости. Лучше обновить браузер; Safari обновляется вместе с macOS.','This browser is outdated: the game starts in compatibility mode. Updating the browser is recommended; Safari updates with macOS.'],
   emptySaves:['Сохранений пока нет. Создайте профиль в игре.','No saves yet. Create a profile in the game.'], emptyLobbies:['Открытых лобби пока нет. Создайте первое.','No open lobbies yet. Create the first one.'],
   loadingLobbies:['Загружаем лобби…','Loading lobbies…'], players:['игроков','players'], joined:['Вы в лобби','Joined'], full:['Заполнено','Full'],
   disconnected:['Соединение с лобби потеряно. Войдите заново перед сетевой игрой.','Lobby connection lost. Rejoin before playing online.'],
@@ -100,6 +102,12 @@ const presence = new PresenceCounter();
 // "By LAN" counts a running game that uses a site lobby.
 const reportPresence = () => presence.update({playing:gameRunning(), lan:!!room});
 const shared = isSecureContext && crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+// The game module uses WebAssembly tail calls (return_call). A browser without
+// them (Safari before 18.2, Chrome before 112, Firefox before 121) gets the
+// compatible build (wc3-compat.wasm, see tools/build_runtime.py), or is told
+// up front when the server has none.
+// (module (func (result i32) i32.const 0) (func (result i32) return_call 0))
+const tailCalls = (() => { try { return WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,3,2,0,0,10,11,2,4,0,65,0,11,4,0,18,0,11])); } catch { return false; } })();
 try {
   const canvas = document.createElement('canvas'), context = canvas.getContext('webgl2');
   webgl = !!context; context?.getExtension('WEBGL_lose_context')?.loseContext();
@@ -121,7 +129,12 @@ function download(data, name, type) {
   const link = document.createElement('a'); link.href = url; link.download = name; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-function available() { return !!(server?.game.prepared && server?.runtime.installed && server?.runtime.diagnostics && shared && webgl); }
+const compatBuild = () => !tailCalls && !!server?.runtime.compatWasmUrl;
+function gameRuntime() {
+  const runtime = server.runtime;
+  return compatBuild() ? {...runtime, wasmUrl:runtime.compatWasmUrl, wasmSize:runtime.compatWasmSize} : runtime;
+}
+function available() { return !!(server?.game.prepared && server?.runtime.installed && server?.runtime.diagnostics && shared && webgl && (tailCalls || compatBuild())); }
 function updateState() {
   const active = gameRunning();
   document.body.dataset.phase = phase;
@@ -130,7 +143,7 @@ function updateState() {
   $('status-sub').textContent = t(phase === 'ready' ? 'readyHint' : phase === 'loading' ? active ? 'starting' : 'checking' : `${phase}Hint`);
   if (!active && server && !available()) {
     $('status').textContent = t('unavailable');
-    $('status-sub').textContent = t(!server.game.prepared ? 'filesMissing' : !server.runtime.installed || !server.runtime.diagnostics ? 'runtimeMissing' : 'browserUnsupported');
+    $('status-sub').textContent = t(!server.game.prepared ? 'filesMissing' : !server.runtime.installed || !server.runtime.diagnostics ? 'runtimeMissing' : !shared || !webgl ? 'browserUnsupported' : 'browserOutdated');
   }
   if (startupError) notice('launch-message', startupError);
   for (const id of ['resolution','audio-enabled','fullscreen-enabled']) $(id).disabled = active;
@@ -163,7 +176,8 @@ function renderGameLanguage() {
 const appleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 let interruptedNotice = false;
 function renderNotices() {
-  $('device-warning').hidden = !appleMobile; if (appleMobile) $('device-warning').textContent = t('appleUnsupported');
+  const warning = appleMobile ? 'appleUnsupported' : compatBuild() ? 'compatBuild' : '';
+  $('device-warning').hidden = !warning; if (warning) $('device-warning').textContent = t(warning);
   if (interruptedNotice && !startupError) notice('launch-message', t('interrupted'));
 }
 function updateFullscreen() {
@@ -446,7 +460,7 @@ $('launch').onclick = () => {
   startupError = ''; interruptedNotice = false; notice('launch-message');
   const [width,height] = settings.resolution.split('x').map(Number);
   const transport = room ?? (server.transport.available ? joinSharedLobby() : null);
-  void openGame({runtime:server.runtime, saves:store, transport, language:gameLanguage(), resolution:{width,height}, audioEnabled:settings.audioEnabled, fullscreen:settings.fullscreen, graphicsSettings:{...settings.graphics}, maxFps:settings.fps});
+  void openGame({runtime:gameRuntime(), saves:store, transport, language:gameLanguage(), resolution:{width,height}, audioEnabled:settings.audioEnabled, fullscreen:settings.fullscreen, graphicsSettings:{...settings.graphics}, maxFps:settings.fps});
 };
 $('stop-diagnostic').onclick = stopGame;
 $('diagnostic-fullscreen').onclick = () => toggleFullscreen().catch(error => appendLog(`Fullscreen: ${error.message}`));
@@ -505,7 +519,7 @@ document.documentElement.removeAttribute('data-pending-language');
 void interruptedLaunch.then(value => { interruptedNotice = value && !appleMobile && !gameRunning(); renderNotices(); });
 void updateSaves();
 try {
-  server = await json('/api/status'); phase = 'ready'; renderGameLanguage(); updateState(); void refreshGameData();
+  server = await json('/api/status'); phase = 'ready'; renderGameLanguage(); renderNotices(); updateState(); void refreshGameData();
   if (activeTab === 'online') void refreshLobbies();
 } catch (error) {
   phase = 'error'; startupError = error.message; appendLog(error.message); updateState();

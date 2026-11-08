@@ -22,32 +22,45 @@ export function createFilterGraph(h,classId,outer,iid,output){
   if(!h.video)return 0x80040154;
   const graph={refs:0,interfaces:new Map(),events:[],loaded:false,state:0,owner:0,drain:0,visible:false,autoShow:true,style:0,styleEx:0,
     rect:[0,0,0,0],notifyWindow:0,notifyMessage:0,notifyData:0,notifyFlags:0,volume:0,balance:0,rate:1,stopTime:0,preroll:0};
-  graph.id=h.video.create((event,error)=>{
+  const onVideoEvent=(event,error)=>{
     if(event==='ended')graph.events.push([1,0,0]);
     else if(event==='error'){graph.events.push([3,0x80004005,0]);h.log(`Video playback: ${error}`);}
     else return;
     graph.state=0;if(graph.eventHandle)h.handles.get(graph.eventHandle).signal=true;
     if(graph.notifyWindow&&graph.notifyMessage&&!graph.notifyFlags)h.postWindowMessage?.(graph.notifyWindow,graph.notifyMessage,0,graph.notifyData);
     h.threadServices.notify();
-  });
+  };
+  graph.id=h.video.create(onVideoEvent);
+  // Calls into the page's player, none for a cinematic that could not load.
+  const request=(method,fields)=>graph.failed?{position:0}:h.video.request(graph.id,method,fields);
   const output32=(p,value)=>{if(!p)return E_POINTER;h.w32(p,value);return 0;};
   const output64=(p,value)=>{if(!p)return E_POINTER;h.view.setBigInt64(h.check(p,8),BigInt(Math.round(value*1e7)),true);return 0;};
   const outputDouble=(p,value)=>{if(!p)return E_POINTER;h.view.setFloat64(h.check(p,8),value,true);return 0;};
   const double=(low,high)=>{const value=new DataView(new ArrayBuffer(8));value.setUint32(0,low,true);value.setUint32(4,high,true);return value.getFloat64(0,true);};
-  const position=()=>graph.loaded?h.video.request(graph.id,'status').position:0;
+  const position=()=>graph.loaded?request('status').position:0;
   const configure=()=>{
     if(!graph.loaded)return;
     const owner=h.handles.get(graph.owner),viewport=[owner?.width||h.graphics?.canvas?.width||640,owner?.height||h.graphics?.canvas?.height||480];
     const rect=graph.rect[2]&&graph.rect[3]?graph.rect:[0,0,...viewport];
-    h.video.request(graph.id,'configure',{visible:graph.visible,rect,viewport});
+    request('configure',{visible:graph.visible,rect,viewport});
   };
+  // A cinematic the network lost (the page tried three times) plays for no
+  // time and ends, as if the player skipped it: Warcraft does not survive a
+  // failed RenderFile. A movie never prepared on the server stays a fault.
   const load=path=>{
-    graph.metadata=h.video.load(graph.id,path);graph.loaded=true;graph.stopTime=graph.metadata.duration;
+    try{graph.metadata=h.video.load(graph.id,path);}
+    catch(error){
+      if(!/^Video load:/.test(error.message))throw error;
+      h.log(`Cinematic skipped: ${error.message}`);
+      graph.failed=true;graph.metadata={width:640,height:480,duration:0,frameRate:25};
+    }
+    graph.loaded=true;graph.stopTime=graph.metadata.duration;
     graph.source=[0,0,graph.metadata.width,graph.metadata.height];configure();return 0;
   };
   const media=(method,state)=>{
     if(!graph.loaded)return 0x80040227;
-    h.video.request(graph.id,method,{autoShow:graph.autoShow});graph.state=state;
+    if(graph.failed){graph.state=state;if(method==='play')setTimeout(()=>onVideoEvent('ended'),0);return 0;}
+    request(method,{autoShow:graph.autoShow});graph.state=state;
     if(method==='play'&&graph.autoShow)graph.visible=true;return 0;
   };
   const query=(guid,output)=>{
@@ -88,13 +101,13 @@ export function createFilterGraph(h,classId,outer,iid,output){
       ['SetNotifyFlags',2,([self,flags])=>{if(flags&~1)return E_INVALIDARG;graph.notifyFlags=flags;return 0;}],['GetNotifyFlags',2,([self,out])=>output32(out,graph.notifyFlags)]];
     if(name==='IMediaPosition')return [...dispatch,
       ['get_Duration',2,([self,out])=>outputDouble(out,graph.metadata?.duration||0)],
-      ['put_CurrentPosition',3,([self,lo,hi])=>{h.video.request(graph.id,'seek',{position:double(lo,hi)});return 0;}],
+      ['put_CurrentPosition',3,([self,lo,hi])=>{request('seek',{position:double(lo,hi)});return 0;}],
       ['get_CurrentPosition',2,([self,out])=>outputDouble(out,position())],['get_StopTime',2,([self,out])=>outputDouble(out,graph.stopTime)],unimplemented('put_StopTime',3),
       ['get_PrerollTime',2,([self,out])=>outputDouble(out,0)],unimplemented('put_PrerollTime',3),
-      ['put_Rate',3,([self,lo,hi])=>{const rate=double(lo,hi);if(rate<=0)return E_INVALIDARG;h.video.request(graph.id,'rate',{rate});graph.rate=rate;return 0;}],
+      ['put_Rate',3,([self,lo,hi])=>{const rate=double(lo,hi);if(rate<=0)return E_INVALIDARG;request('rate',{rate});graph.rate=rate;return 0;}],
       ['get_Rate',2,([self,out])=>outputDouble(out,graph.rate)],['CanSeekForward',2,([self,out])=>output32(out,0xffffffff)],['CanSeekBackward',2,([self,out])=>output32(out,0xffffffff)]];
     if(name==='IBasicAudio')return [...dispatch,
-      ['put_Volume',2,([self,value])=>{value|=0;if(value>0||value< -10000)return E_INVALIDARG;h.video.request(graph.id,'volume',{volume:value===-10000?0:Math.pow(10,value/2000)});graph.volume=value;return 0;}],
+      ['put_Volume',2,([self,value])=>{value|=0;if(value>0||value< -10000)return E_INVALIDARG;request('volume',{volume:value===-10000?0:Math.pow(10,value/2000)});graph.volume=value;return 0;}],
       ['get_Volume',2,([self,out])=>output32(out,graph.volume)],['put_Balance',2,([self,value])=>{if(value)return 0x80004001;graph.balance=0;return 0;}],['get_Balance',2,([self,out])=>output32(out,graph.balance)]];
     if(name==='IVideoWindow'){
       const table=[...dispatch];
@@ -132,7 +145,7 @@ export function createFilterGraph(h,classId,outer,iid,output){
       ['GetDuration',2,([self,out])=>output64(out,graph.metadata?.duration||0)],['GetStopPosition',2,([self,out])=>output64(out,graph.stopTime)],['GetCurrentPosition',2,([self,out])=>output64(out,position())],
       unimplemented('ConvertTimeFormat',6),unimplemented('SetPositions',5),['GetPositions',3,([self,current,stop])=>output64(current,position())||output64(stop,graph.stopTime)],
       ['GetAvailable',3,([self,start,end])=>output64(start,0)||output64(end,graph.metadata?.duration||0)],
-      ['SetRate',3,([self,lo,hi])=>{const rate=double(lo,hi);if(rate<=0)return E_INVALIDARG;h.video.request(graph.id,'rate',{rate});graph.rate=rate;return 0;}],
+      ['SetRate',3,([self,lo,hi])=>{const rate=double(lo,hi);if(rate<=0)return E_INVALIDARG;request('rate',{rate});graph.rate=rate;return 0;}],
       ['GetRate',2,([self,out])=>outputDouble(out,graph.rate)],['GetPreroll',2,([self,out])=>output64(out,0)]];
     throw new GuestFault('Unknown DirectShow interface',{name});
   }

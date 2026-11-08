@@ -50,8 +50,10 @@ lift-runtime:
 	$(PYTHON) tools/lift_wc3.py --image var/game/Storm.dll --output var/lift-v2/storm --max-functions 0
 	$(PYTHON) tools/lift_wc3.py --image var/game/ijl15.dll --output var/lift-v2/ijl15 --max-functions 0
 
+# wc3.wasm, and wc3-compat.wasm for browsers without WebAssembly tail calls.
 runtime:
 	$(PYTHON) tools/build_runtime.py
+	$(PYTHON) tools/build_runtime.py --variant compat
 	$(PYTHON) tools/package_runtime.py
 
 # What the game reads up to its main menu, per language (var/runtime/boot-*.json):

@@ -166,7 +166,8 @@ export class ThreadServices {
         [words,base]=this.criticalWords(pointer);
         const current=Atomics.load(words,base+CS_OWNER);
         if(current===0&&Atomics.compareExchange(words,base+CS_OWNER,0,id)===0)break;
-        const wait=Atomics.waitAsync(words,base+CS_OWNER,current,1000);
+        // An engine without Atomics.waitAsync (older Firefox) looks again after a moment.
+        const wait=Atomics.waitAsync?Atomics.waitAsync(words,base+CS_OWNER,current,1000):{async:true,value:new Promise(resolve=>setTimeout(resolve,1))};
         if(wait.async)await Promise.race([wait.value,cancelled]);
       }
     }finally{this.criticalWaiters.delete(waiter);Atomics.sub(words,base+CS_WAITERS,1);}

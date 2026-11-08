@@ -5,6 +5,9 @@ The public lobby API/transport are real; game actions use the native Warcraft UI
 W3GS IDs are checked against GHost++'s original protocol implementation:
 https://github.com/dcramer/ghostplusplus/blob/master/ghost/gameprotocol.h
 This short regression does not establish long-session or all-map compatibility.
+--compat host|guest|both runs that client on wc3-compat.wasm, the build for
+browsers without WebAssembly tail calls: the lockstep match must stay in step.
+--host-browser / --guest-browser webkit or firefox run a client in another engine.
 """
 import argparse
 import asyncio
@@ -36,7 +39,7 @@ HOST_ACTIONS = [
     {'click':[144,314],'frames':15}, {'click':[876,649],'frames':24},
 ]
 
-BOOT = r'''async ({room,resolution}) => {
+BOOT = r'''async ({room,resolution,compat}) => {
   if (!crossOriginIsolated) throw Error('Missing cross-origin isolation');
   const status=await (await fetch('/api/status')).json();
   const module=await import(status.runtime.moduleUrl);
@@ -78,7 +81,9 @@ BOOT = r'''async ({room,resolution}) => {
   const canvas=document.createElement('canvas');canvas.id='game-probe';canvas.width=resolution.width;canvas.height=resolution.height;
   canvas.style='position:fixed;inset:0;width:1024px;height:768px;z-index:10;background:black';
   document.body.append(canvas);
-  window.session=await module.runDiagnostics({canvas,wasmUrl:status.runtime.wasmUrl,saves:probeSaves,transport,resolution,
+  const wasmUrl=compat?status.runtime.compatWasmUrl:status.runtime.wasmUrl;
+  if(!wasmUrl)throw Error('The server has no compatible build');
+  window.session=await module.runDiagnostics({canvas,wasmUrl,saves:probeSaves,transport,resolution,
     audioEnabled:false,timeout:0,dispatchBudget:0,
     onStatus:message=>{probe.log.push(message);if(probe.log.length>100)probe.log.shift();},
     onReport:report=>probe.report=report,
@@ -124,8 +129,8 @@ class Peer:
         live=await self.page.evaluate('probe');live.update(runId=self.run_id,stage=label)
         (self.output/'live.json').write_text(json.dumps(live,ensure_ascii=False,indent=2)+'\n')
 
-    async def start(self, room, resolution):
-        await self.page.evaluate(BOOT, {'room':room,'resolution':resolution})
+    async def start(self, room, resolution, compat=False):
+        await self.page.evaluate(BOOT, {'room':room,'resolution':resolution,'compat':compat})
         await self.wait('[...document.querySelectorAll("video")].some(v=>v.currentTime>3)')
         await self.page.locator('#game-probe').press('Escape')
         await self.wait('!document.querySelector("video") && probe.frame?.frames>=10')
@@ -172,7 +177,7 @@ class Peer:
         return result
 
 
-async def main(url,output,timeout,resolution):
+async def main(url,output,timeout,resolution,compat='none',host_browser='chromium',guest_browser='chromium'):
     output.mkdir(parents=True,exist_ok=True)
     width,height=map(int,resolution.split('x'))
     run_id=datetime.now(timezone.utc).isoformat()
@@ -186,8 +191,10 @@ async def main(url,output,timeout,resolution):
             # Separate browser processes: each owns its actual WASM workers and
             # original game state. No synthetic Warcraft/network responses.
             for name in ['host','guest']:
-                browser=await playwright.chromium.launch(args=['--use-angle=swiftshader','--enable-unsafe-swiftshader',
+                engine=host_browser if name=='host' else guest_browser
+                browser=await (playwright.chromium.launch(args=['--use-angle=swiftshader','--enable-unsafe-swiftshader',
                     '--autoplay-policy=no-user-gesture-required','--disable-background-timer-throttling','--disable-renderer-backgrounding'])
+                    if engine=='chromium' else getattr(playwright,engine).launch())
                 page=await browser.new_page(viewport={'width':1024,'height':768})
                 page.set_default_timeout(timeout*1000)
                 peer=Peer(name,browser,page,output,timeout,run_id);peers.append(peer)
@@ -196,7 +203,7 @@ async def main(url,output,timeout,resolution):
             response=await host.page.request.post(url+'/api/lobbies',data={'name':'Original Warcraft LAN regression'})
             assert response.status==201,await response.text()
             lobby=await response.json();evidence['lobby']=lobby
-            await asyncio.gather(*(peer.start(lobby['id'],{'width':width,'height':height}) for peer in peers))
+            await asyncio.gather(*(peer.start(lobby['id'],{'width':width,'height':height},compat in (peer.name,'both')) for peer in peers))
             listing=await (await host.page.request.get(url+'/api/lobbies')).json()
             assert next(item for item in listing['lobbies'] if item['id']==lobby['id'])['players']==2
             await guest.action({'click':[875,332],'frames':8})
@@ -276,4 +283,7 @@ if __name__=='__main__':
     parser.add_argument('--output',type=Path,default=Path('var/reports/public-lan-final'))
     parser.add_argument('--timeout',type=int,default=240,help='Maximum seconds for each progress condition')
     parser.add_argument('--resolution',choices=['800x600','1024x768','1280x960'],default='800x600')
-    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution))
+    parser.add_argument('--compat',choices=['none','host','guest','both'],default='none',help='clients on wc3-compat.wasm')
+    parser.add_argument('--host-browser',choices=['chromium','webkit','firefox'],default='chromium')
+    parser.add_argument('--guest-browser',choices=['chromium','webkit','firefox'],default='chromium')
+    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution,args.compat,args.host_browser,args.guest_browser))

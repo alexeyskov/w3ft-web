@@ -10,7 +10,7 @@ Based on [nfsu2-web](https://github.com/th0mk/nfsu2-web) by th0mk, using its MIT
 
 - **The game:** a complete classic 32-bit Windows installation with The Frozen Throne. The tested binaries report **1.26.0.6401**. Reforged and arbitrary other patches are not supported just by copying their data. See the [tested binary hashes and compatibility notes](docs/SELF_HOSTING.md#compatible-game-files).
 - **To build:** macOS or Linux, Python 3.11+, a recent Node.js with WebAssembly threads and tail calls, FFmpeg (`ffmpeg` and `ffprobe`), Make, and [wasi-sdk 34](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34). Use Linux/WSL for Windows development. Optional localization preparation also needs `bsdtar`.
-- **To play:** a current desktop browser with WebGL 2, OffscreenCanvas, SharedArrayBuffer and WebAssembly threads/tail calls. Chromium and Firefox are tested. Desktop Safari runs the game and saved games too, but creating a LAN game currently stops it (a WebKit stack limit), so play online in Chrome, Edge or Firefox. Use localhost or HTTPS.
+- **To play:** a desktop browser with WebGL 2, OffscreenCanvas, SharedArrayBuffer and WebAssembly threads. Chromium and Firefox are tested. A browser without WebAssembly tail calls (Safari before 18.2, Chrome before 112, Firefox before 121) gets a compatible build of the same code; by the features it uses, that means Safari 17 or newer, Chrome 96 or Firefox 114. Desktop Safari runs the game and saved games too, but creating or joining a LAN game currently stops it (a WebKit stack limit), so play online in Chrome, Edge or Firefox. Use localhost or HTTPS.
 - **On phones and tablets:** Chrome on Android, held sideways; a recent phone with 8 GB of memory or more is advisable. On iPhone and iPad every browser uses WebKit, which runs out of memory: on an iPhone 17 the browser reloads the page before the main menu appears, so the site warns iPhone and iPad visitors (see [port status](docs/port-status.md#mobile-browsers)).
 
 ## Build
@@ -63,7 +63,7 @@ Campaign startup, save/load and short LAN matches have been exercised. Full camp
 make test
 ```
 
-Browser tests require Playwright/Chromium and, where documented, a running local server. Start with [tests/browser_smoke.py](tests/browser_smoke.py) for the launcher, [tests/runtime_lan_browser.py](tests/runtime_lan_browser.py) for two real game clients, [tests/runtime_dropout_browser.py](tests/runtime_dropout_browser.py) for a player who crashes, closes the page, freezes or loses the connection in a three-player match, or [tests/runtime_touch_browser.py](tests/runtime_touch_browser.py) for touch input on an emulated phone; [tests/runtime_site_browser.py](tests/runtime_site_browser.py) `--browser firefox` launches the real game in another engine.
+Browser tests require Playwright/Chromium and, where documented, a running local server. Start with [tests/browser_smoke.py](tests/browser_smoke.py) for the launcher, [tests/runtime_lan_browser.py](tests/runtime_lan_browser.py) for two real game clients, [tests/runtime_dropout_browser.py](tests/runtime_dropout_browser.py) for a player who crashes, closes the page, freezes or loses the connection in a three-player match, or [tests/runtime_touch_browser.py](tests/runtime_touch_browser.py) for touch input on an emulated phone; [tests/runtime_site_browser.py](tests/runtime_site_browser.py) `--browser firefox` launches the real game in another engine, and `--no-tail-calls` on the compatible build.
 
 ## Credits
 

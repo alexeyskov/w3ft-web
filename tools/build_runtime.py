@@ -3,6 +3,12 @@
 
 Incremental objects are keyed by source, headers, compiler and flags. This
 build produces a real WASM artifact, not evidence of playable Warcraft.
+
+--variant compat builds the same code for engines without WebAssembly tail
+calls (Safari before 18.2, Chrome before 112, Firefox before 121) as
+wc3-compat.wasm: a lifted tail jump returns and its caller makes it
+(runtime/cpu.h), so every direct call in lifted code is followed by
+TAIL_RESUME in the copy of the shard that this build compiles.
 """
 from __future__ import annotations
 
@@ -22,6 +28,64 @@ DEFAULT_MODULES = [ROOT / "var/lift-v2" / name for name in ("war3", "game", "sto
 FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", "-matomics", "-mbulk-memory", "-mtail-call",
          "-O1", "-fno-delete-null-pointer-checks", "-std=c11",
          "-Wno-parentheses-equality"]
+VARIANTS = {
+    "standard": {"artifact": "wc3.wasm", "metadata": "build.json", "objects": "objects", "link_log": "link.log"},
+    "compat": {"artifact": "wc3-compat.wasm", "metadata": "build-compat.json", "objects": "objects-compat",
+               "link_log": "link-compat.log"},
+}
+TRAMPOLINE_VERSION = 1
+# A call statement of its own: at the start of a line or after ; { }.
+DIRECT_CALL = re.compile(r"(?:^|(?<=[;{}]))[ \t]*sub_[0-9a-f]{8}\(c\);", re.M)
+CALL_LIKE = re.compile(r"\bsub_[0-9a-f]{8}\(")
+DEFINITION = re.compile(r"^void sub_[0-9a-f]{8}\(CPU \*restrict c\) \{$", re.M)
+
+
+def variant_flags(variant):
+    if variant == "standard":
+        return list(FLAGS)
+    return ["-mno-tail-call" if flag == "-mtail-call" else flag for flag in FLAGS] + ["-DWC3_TAIL_TRAMPOLINE=1"]
+
+
+def trampoline_source(text, name="source"):
+    """The compat build's copy of lifted C: TAIL_RESUME after each direct call.
+
+    The lifter writes a direct call only as `sub_XXXXXXXX(c);`. Any other
+    reference to a lifted function followed by a parenthesis is refused: a
+    call left without TAIL_RESUME would run a pending tail jump at the wrong
+    level of the guest stack.
+    """
+    result, calls = DIRECT_CALL.subn(lambda match: match.group(0) + " TAIL_RESUME(c);", text)
+    if len(CALL_LIKE.findall(text)) != calls + len(DEFINITION.findall(text)):
+        raise ValueError(f"Unrecognized call to a lifted function in {name}; cannot build without tail calls")
+    return result, calls
+
+
+def wasm_features(path):
+    """Feature names from a linked module's target_features section."""
+    def leb(stream):
+        value = shift = 0
+        while True:
+            byte = stream.read(1)
+            if not byte:
+                raise ValueError(f"Truncated WebAssembly module: {path}")
+            value |= (byte[0] & 0x7f) << shift; shift += 7
+            if byte[0] < 0x80:
+                return value
+    with path.open("rb") as stream:
+        if stream.read(8) != b"\0asm\x01\0\0\0":
+            raise ValueError(f"Not a WebAssembly module: {path}")
+        while header := stream.read(1):
+            size = leb(stream); end = stream.tell() + size
+            if header[0] == 0:
+                name = stream.read(leb(stream)).decode()
+                if name == "target_features":
+                    features = []
+                    for _ in range(leb(stream)):
+                        prefix = stream.read(1).decode()
+                        features.append(prefix + stream.read(leb(stream)).decode())
+                    return features
+            stream.seek(end)
+    return []
 
 
 def digest(path):
@@ -84,19 +148,23 @@ def registry_source(modules):
 
 def build(args):
     started = time.monotonic()
+    variant = getattr(args, "variant", "standard")
+    names = VARIANTS[variant]
     sdk = sdk_path(args.sdk)
     compiler = sdk / "bin/clang"
     version = subprocess.run([str(compiler), "--version"], check=True, capture_output=True, text=True).stdout
     modules = module_inputs(args.module_dirs)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    cache = output / "objects"
+    cache = output / names["objects"]
     cache.mkdir(exist_ok=True)
     headers = sorted((ROOT / "runtime").glob("*.h"))
     original_header_hashes = {str(path): digest(path) for path in headers}
     header_key = json.dumps(original_header_hashes, sort_keys=True)
-    flags = FLAGS + (["-DWC3_STRICT_MEMORY=1"] if getattr(args, "strict_memory", False) else [])
+    flags = variant_flags(variant) + (["-DWC3_STRICT_MEMORY=1"] if getattr(args, "strict_memory", False) else [])
     configuration = {"compiler": str(compiler), "version": version, "flags": flags}
+    if variant != "standard":
+        configuration.update(variant=variant, trampoline=TRAMPOLINE_VERSION)
     configuration_key = json.dumps(configuration, sort_keys=True)
 
     def compile_source(source, module, include=None):
@@ -112,8 +180,14 @@ def build(args):
         command = [str(compiler), *flags, "-I" + str(ROOT / "runtime")]
         if include:
             command += ["-I" + str(include)]
-        command += ["-c", str(source), "-o", str(temporary)]
-        process = subprocess.run(command, capture_output=True, text=True)
+        text = None
+        if include and variant == "compat":
+            # Lifted C goes to the compiler from memory; the shards stay as generated.
+            text, _ = trampoline_source(source.read_text(), str(source))
+            command += ["-x", "c", "-c", "-", "-o", str(temporary)]
+        else:
+            command += ["-c", str(source), "-o", str(temporary)]
+        process = subprocess.run(command, input=text, capture_output=True, text=True)
         object_path.with_suffix(".log").write_text(process.stdout + process.stderr)
         if process.returncode:
             temporary.unlink(missing_ok=True)
@@ -146,8 +220,8 @@ def build(args):
         objects.append(compile_source(source, "runtime"))
     if {str(path): digest(path) for path in headers} != original_header_hashes:
         raise RuntimeError("Runtime headers changed during final compilation; rerun")
-    wasm = output / "wc3.wasm"
-    temporary = output / "wc3.tmp.wasm"
+    wasm = output / names["artifact"]
+    temporary = wasm.with_suffix(".tmp.wasm")
     link_flags = ["-Wl,--import-memory,--export-memory,--shared-memory,--max-memory=4294967296",
                   "-Wl,--initial-memory=67108864", "-Wl,-z,stack-size=16777216",
                   "-Wl,--export=malloc,--export=free,--export=_initialize,--no-entry",
@@ -163,13 +237,18 @@ def build(args):
                *(str(item["path"]) for item in sorted(objects, key=lambda item: str(item["path"]))),
                "-lm", "-o", str(temporary)]
     process = subprocess.run(command, capture_output=True, text=True)
-    (output / "link.log").write_text(process.stdout + process.stderr)
+    (output / names["link_log"]).write_text(process.stdout + process.stderr)
     if process.returncode:
         temporary.unlink(missing_ok=True)
-        raise RuntimeError(f"WASM link failed; see {output / 'link.log'}\n{process.stderr[-8000:]}")
+        raise RuntimeError(f"WASM link failed; see {output / names['link_log']}\n{process.stderr[-8000:]}")
+    features = wasm_features(temporary)
+    if variant == "compat" and "+tail-call" in features:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("The compat module still uses WebAssembly tail calls")
     temporary.replace(wasm)
     result = {
-        "schema": 1, "artifact": "wc3.wasm", "sha256": digest(wasm), "bytes": wasm.stat().st_size,
+        "schema": 1, "artifact": names["artifact"], "variant": variant, "features": features,
+        "sha256": digest(wasm), "bytes": wasm.stat().st_size,
         "configuration": configuration, "link_flags": link_flags, "runtime_headers": original_header_hashes,
         "memory": {"import": "env.memory", "shared": True, "initial_pages": 1024,
                    "maximum_pages": 65536, "stack_bytes": 16777216,
@@ -193,7 +272,7 @@ def build(args):
         "wasm_built": True, "playable": False, "campaign_verified": False, "multiplayer_verified": False,
         "elapsed_seconds": round(time.monotonic() - started, 2),
     }
-    (output / "build.json").write_text(json.dumps(result, indent=2) + "\n")
+    (output / names["metadata"]).write_text(json.dumps(result, indent=2) + "\n")
     return {key: result[key] for key in ("artifact", "sha256", "bytes", "wasm_built", "playable", "elapsed_seconds")}
 
 
@@ -204,6 +283,8 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "var/runtime")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
     parser.add_argument("--objects-only", action="store_true")
+    parser.add_argument("--variant", choices=sorted(VARIANTS), default="standard",
+                        help="compat: wc3-compat.wasm for engines without WebAssembly tail calls")
     parser.add_argument("--strict-memory", action="store_true",
                         help="Diagnostic build: guest accesses also check page permissions (slower)")
     args = parser.parse_args()

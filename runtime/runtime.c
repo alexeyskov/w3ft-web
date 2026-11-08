@@ -122,9 +122,18 @@ void dispatch_indirect(CPU *c, uint32_t address) {
         return;
     }
     guest_fn_t function = find_function(address);
-    if (function) { function(c); return; }
+    if (function) { function(c); TAIL_RESUME(c); return; }
     wc3_cpu_fault(c, address, "No lifted function for guest target");
 }
+#ifdef WC3_TAIL_TRAMPOLINE
+/* Set by DISPATCH_TAIL just before its function returns, cleared by the
+ * caller at once (cpu.h): nothing runs in between, so a host exception never
+ * leaves it set. Per WASM instance, that is per guest thread. */
+_Thread_local uint32_t wc3_tail_pending;
+void wc3_tail_resume(CPU *c) {
+    do { wc3_tail_pending = 0; dispatch_tail(c); } while (wc3_tail_pending);
+}
+#endif
 void dispatch_tail(CPU *c) {
     uint32_t address = c->eip;
     record_dispatch(c, address);
@@ -135,7 +144,7 @@ void dispatch_tail(CPU *c) {
     }
     guest_fn_t function = find_function(address);
     if (!function) wc3_cpu_fault(c, address, "No lifted function for guest tail target");
-#ifdef __wasm__
+#if defined(__wasm__) && !defined(WC3_TAIL_TRAMPOLINE)
     __attribute__((musttail)) return function(c);
 #else
     function(c);

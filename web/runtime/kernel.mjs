@@ -799,9 +799,17 @@ export function installKernel(h) {
     const operation=ioPosition(item,overlapped);if(!operation)return 0;
     h.check(output, count); const length = Math.min(count, Math.max(0, fileSize(item) - operation.offset));
     if(count&&!length&&overlapped)return completeIO(item,operation,0,0xc0000011,38);
-    const data = length ? fileData(item, operation.offset, length) : new Uint8Array();
-    if (!(data instanceof Uint8Array) || data.length !== length) throw new GuestFault('File provider returned a truncated range', {path: item.path, offset: operation.offset, length});
-    h.copyIn(output, data);if(read)h.w32(read,data.length);return completeIO(item,operation,data.length);
+    const finish=data=>{
+      if (!(data instanceof Uint8Array) || data.length !== length) throw new GuestFault('File provider returned a truncated range', {path: item.path, offset: operation.offset, length});
+      h.copyIn(output, data);if(read)h.w32(read,data.length);return completeIO(item,operation,data.length);
+    };
+    // Bytes the server has to send: only this guest thread waits for them,
+    // as for a slow disk, while the broker serves the others (rendering too).
+    if(length&&h.importMayWait&&h.readFileLater&&!h.virtualFiles.has(item.key)&&!item.data){
+      const later=h.readFileLater(item.path,operation.offset,length,{stood:(h.threadContext?.id??1)===1});
+      if(later){const cpu=h.currentCPU;return later.then(data=>h.onCPU(cpu,()=>finish(data)));}
+    }
+    return finish(length ? fileData(item, operation.offset, length) : new Uint8Array());
   });
   add('WriteFile', 5, ([id, input, count, written, overlapped]) => {
     if (written) h.w32(written, 0);

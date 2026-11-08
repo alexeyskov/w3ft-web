@@ -16,9 +16,10 @@ export class GuestThreadExit extends Error {
 }
 
 export class WarcraftHost {
-  constructor({memory, readFile, fileSize, listFiles = () => [], log = () => {}, graphics = null, audio = null, video = null, network = null, clock = () => performance.now(), commandLine = 'war3.exe -opengl -window',tlsSlots,resolution,graphicsSettings,allowLocalFiles=false} = {}) {
+  constructor({memory, readFile, readFileLater = null, fileSize, listFiles = () => [], log = () => {}, graphics = null, audio = null, video = null, network = null, clock = () => performance.now(), commandLine = 'war3.exe -opengl -window',tlsSlots,resolution,graphicsSettings,allowLocalFiles=false} = {}) {
     this.memory = memory;
     this.readFile = readFile;
+    this.readFileLater = readFileLater; this.importMayWait = false;
     this.fileSize = fileSize;
     this.listFiles = listFiles;
     this.log = log; this.graphics = graphics; this.audio = audio; this.video=video;this.network = network; this.clock = clock;
@@ -245,9 +246,21 @@ export class WarcraftHost {
     }
     this.finishImport(cpuPointer,call,call.result);
   }
+  // importMayWait: the import being run may return a Promise and leave its
+  // guest thread waiting (a guest worker's call), unlike one from guest code
+  // that this worker runs itself (invoke, call).
   async invokeAsync(id,cpuPointer) {
-    try{const call=this.beginImport(id,cpuPointer);this.finishImport(cpuPointer,call,await call.result);}
+    try{
+      let call;this.importMayWait=true;
+      try{call=this.beginImport(id,cpuPointer);}finally{this.importMayWait=false;}
+      this.finishImport(cpuPointer,call,await call.result);
+    }
     catch(error){this.lastFaultCPU=cpuPointer>>>0;throw error;}
+  }
+  // Finishes an import after a wait on the guest thread that made it.
+  onCPU(cpuPointer,operation){
+    const previous=this.currentCPU;this.currentCPU=cpuPointer;
+    try{return operation();}finally{this.currentCPU=previous;}
   }
   guestOperation(operation) {
     const cpu=this.currentCPU||(this.exports.wc3_cpu_pointer?.()>>>0),depth=this.exports.wc3_context_depth?.(cpu);
@@ -264,10 +277,11 @@ export class WarcraftHost {
     const p = this.exports.malloc(Math.max(4, args.length * 4)) >>> 0;
     if(!p)throw new GuestFault('Host callback allocation failed');
     for (let i = 0; i < args.length; i++) this.view.setUint32(p + i * 4, args[i] >>> 0, true);
+    const mayWait=this.importMayWait;this.importMayWait=false;
     try { return this.guestOperation(cpu=>cpu&&this.exports.wc3_call_context?
       this.exports.wc3_call_context(cpu,address,args.length,p)>>>0:
       this.exports.wc3_call(address,args.length,p)>>>0); }
-    finally { this.exports.free(p); }
+    finally { this.importMayWait=mayWait; this.exports.free(p); }
   }
   callAsync(address,args=[],cpu=this.currentCPU){
     return this.scheduler?this.scheduler.call(cpu,address,args):Promise.resolve(this.call(address,args));

@@ -70,3 +70,20 @@ test('main-thread WebAudio failure is acknowledged before a voice is returned',(
   assert.throws(()=>proxy.play(buffer),error=>{assert.match(error.message,/unlocked/);assert.equal(error.details.operation,'play');return true;});
   assert.equal(proxy.voices.size,0);assert.equal(dispatcher.voices.size,0);proxy.deleteBuffer(buffer);
 });
+
+test('a long decode does not stop the worker: other audio requests are answered meanwhile',async()=>{
+  const context=new AudioContext();let finish;
+  context.decodeAudioData=()=>new Promise(resolve=>{finish=()=>resolve({length:44100,duration:1,numberOfChannels:2,sampleRate:44100});});
+  const player=new PCMPlayer({context}),dispatcher=new AudioDispatcher(player);
+  const audio=new WorkerAudio({post:message=>dispatcher.handle(message)});
+  const decoding=audio.createEncodedBufferAsync(new Uint8Array([1,2,3]));
+  const effect=audio.createBuffer({data:new Uint8Array(8000).fill(128),format:'u8',channels:1,sampleRate:8000});
+  assert.ok(effect>0,'a sound effect while the track decodes');
+  finish();
+  const track=await decoding;
+  assert.equal(audio.bufferInfo(track,'duration'),1);assert.equal(audio.bufferInfo(track,'numberOfChannels'),2);
+  context.decodeAudioData=()=>Promise.reject(new Error('Unable to decode audio data'));
+  await assert.rejects(audio.createEncodedBufferAsync(new Uint8Array([9])),/createEncodedBuffer: Unable to decode audio data$/);
+  assert.equal(audio.failed,false,'one failed decode leaves the bridge working');
+  await dispatcher.destroy();
+});

@@ -78,7 +78,7 @@ make lift-runtime
 make runtime
 ```
 
-The first command translates these four images into `var/lift-v2/{war3,game,storm,ijl15}`. The second compiles and packages `var/runtime/wc3.wasm`, `build.json`, `runtime.json`, browser modules and project license notices.
+The first command translates these four images into `var/lift-v2/{war3,game,storm,ijl15}`. The second compiles and packages `var/runtime/wc3.wasm`, `build.json`, `runtime.json`, browser modules and project license notices. It also builds `wc3-compat.wasm` and `build-compat.json`: the same code for browsers without WebAssembly tail calls (Safari before 18.2, Chrome before 112, Firefox before 121), which the page picks by itself. Upload it with `wc3.wasm`; without it those browsers are asked to update.
 
 To see or customize the commands explicitly:
 
@@ -88,6 +88,7 @@ To see or customize the commands explicitly:
 .venv/bin/python tools/lift_wc3.py --image var/game/Storm.dll --output var/lift-v2/storm --max-functions 0
 .venv/bin/python tools/lift_wc3.py --image var/game/ijl15.dll --output var/lift-v2/ijl15 --max-functions 0
 .venv/bin/python tools/build_runtime.py --sdk /absolute/path/to/wasi-sdk --jobs 8
+.venv/bin/python tools/build_runtime.py --sdk /absolute/path/to/wasi-sdk --jobs 8 --variant compat
 .venv/bin/python tools/package_runtime.py
 ```
 
