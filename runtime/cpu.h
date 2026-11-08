@@ -38,8 +38,42 @@ __attribute__((noinline, cold)) _Noreturn void wc3_mem_fault(uint32_t address);
 #ifndef WC3_STRICT_MEMORY
 #define WC3_STRICT_MEMORY 0
 #endif
+/* In WebAssembly the guest address space starts at a fixed address,
+ * WC3_GUEST_BASE (where the runtime's initial memory ends), inside a
+ * power-of-two window that belongs to the guest alone: wc3_init grows the
+ * memory over [WC3_GUEST_BASE, WC3_GUEST_BASE + WC3_GUEST_WINDOW + 16) and the
+ * runtime's own allocations live below it or after it. Native test fixtures
+ * keep a malloc'd g_mem (WC3_FIXED_GUEST 0). */
+#if defined(__wasm__) && !defined(WC3_DYNAMIC_GUEST)
+#define WC3_FIXED_GUEST 1
+#else
+#define WC3_FIXED_GUEST 0
+#endif
+#ifndef WC3_GUEST_BASE
+#define WC3_GUEST_BASE 0x04000000u
+#endif
+#ifndef WC3_GUEST_WINDOW
+#define WC3_GUEST_WINDOW 0x80000000u
+#endif
+_Static_assert((WC3_GUEST_WINDOW & (WC3_GUEST_WINDOW - 1u)) == 0 && WC3_GUEST_WINDOW <= 0x80000000u,
+               "The guest window is a power of two of at most 2 GiB");
 #if WC3_STRICT_MEMORY
 static inline uint8_t *wc3_mem_ptr(uint32_t address, size_t bytes) { return wc3_mem_check(address, bytes); }
+#elif WC3_FIXED_GUEST
+/* The mask keeps every access inside the guest window, so the runtime's own
+ * memory is unreachable without a compare and a branch at each of the
+ * millions of lifted access sites, and with a constant base the engine folds
+ * the base into the load's offset. Lifted code is about 40% smaller than with
+ * the bounds check below, and the engines need correspondingly less memory and
+ * time to compile it. An address at or past the capacity reaches the unused
+ * zero tail of the window or, from 2 GiB on, aliases guest memory: a valid
+ * program makes no such access (Win32 user space of a program that is not
+ * large-address aware ends below 2 GiB), and WC3_STRICT_MEMORY=1 builds still
+ * report them. */
+static inline __attribute__((always_inline)) uint8_t *wc3_mem_ptr(uint32_t address, size_t bytes) {
+    (void)bytes;
+    return (uint8_t *)(uintptr_t)WC3_GUEST_BASE + (address & (WC3_GUEST_WINDOW - 1u));
+}
 #else
 /* Guest operands are at most 16 bytes and wc3_init allocates 16 bytes of
  * slack, so one 32-bit compare of the start address suffices (capacity is at

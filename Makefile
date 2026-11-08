@@ -1,7 +1,8 @@
 PYTHON ?= .venv/bin/python
 
 .PHONY: setup prepare inspect maps media locale-en geoip boot-set serve test lift-smoke lift-runtime runtime runtime-probe
-ENGLISH_ARCHIVE ?= resources/AppNee.com.Warcraft.III.RoC.TFT.Portable.FR.7z
+# Archive created from your own licensed English installation; never downloaded.
+ENGLISH_ARCHIVE ?= resources/Warcraft_III_en.zip
 setup:
 	python3 -m venv .venv
 	$(PYTHON) -m pip install -r requirements.txt
@@ -22,7 +23,7 @@ media:
 
 # English game data of the same patch (1.26a) into var/locales/en.
 locale-en:
-	$(PYTHON) tools/prepare_locale.py $(ENGLISH_ARCHIVE) --language en
+	$(PYTHON) tools/prepare_locale.py "$(ENGLISH_ARCHIVE)" --language en
 
 # Country database for the default page language (monthly, DB-IP CC BY 4.0).
 geoip:

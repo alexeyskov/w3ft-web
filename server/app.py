@@ -380,7 +380,9 @@ def create_app(*, game_dir=None, maps_dir=None, runtime_dir=None, report_path=No
     app = web.Application(client_max_size=1024 * 1024)
     game = Path(game_dir or ROOT / "var/game").absolute()
     runtime = Path(runtime_dir or ROOT / "var/runtime").absolute()
-    relay, presence = Relay(), Presence()
+    relay = Relay()
+    presence = Presence(relay=relay)
+    relay.on_change = presence.changed
     geo = GeoLanguage(geoip_path or ROOT / "var/geoip/dbip-country-lite.csv.gz")
     app[STATE] = {"game": game, "maps": MapCatalog(maps_dir or default_maps_dir()),
                   "runtime": runtime, "report": Path(report_path or ROOT / "var/reports/game.json"),

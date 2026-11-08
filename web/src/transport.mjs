@@ -12,6 +12,7 @@ export class FrameTransport extends EventTarget {
     this.peerId = 0;
     this.peerIds = [];
     this.lobby = null;
+    this.presenceToken = null;
   }
 
   async connect() {
@@ -33,6 +34,7 @@ export class FrameTransport extends EventTarget {
           this.peerId = 0;
           this.peerIds = [];
           this.lobby = null;
+          this.presenceToken = null;
           this.dispatchEvent(new Event('disconnect'));
         }
       });
@@ -45,6 +47,7 @@ export class FrameTransport extends EventTarget {
             this.peerId = message.peerId;
             this.peerIds = message.peers || [message.peerId];
             this.lobby = message.lobby || null;
+            this.presenceToken = message.presenceToken || null;
             clearTimeout(timeout);
             resolve(this);
           } else if (message.type === 'peers') {
@@ -77,6 +80,7 @@ export class FrameTransport extends EventTarget {
     this.peerId = 0;
     this.peerIds = [];
     this.lobby = null;
+    this.presenceToken = null;
     socket?.close();
     if (socket) this.dispatchEvent(new Event('disconnect'));
   }

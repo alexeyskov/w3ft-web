@@ -1,8 +1,8 @@
 """Anonymous live counts for the launcher page ("Playing now").
 
-Every open launcher page keeps one WebSocket and reports two flags: its game is
-running, and that game uses a site LAN lobby. Nothing identifies a visitor; the
-server only counts connections and broadcasts the totals to all pages.
+Every open launcher page reports its game state. A LAN game also needs the
+opaque token of a live relay connection. Counts and public lobby occupancy are
+broadcast together, so a departed connection cannot leave a ghost LAN player.
 """
 from __future__ import annotations
 
@@ -16,11 +16,13 @@ from .relay import Relay
 
 
 class Presence:
-    def __init__(self, max_connections: int = 4096, broadcast_interval: float = 1.0, heartbeat: float = 15):
+    def __init__(self, max_connections: int = 4096, broadcast_interval: float = 1.0, heartbeat: float = 15,
+                 relay: Relay | None = None):
         # Behind the reverse proxy every visitor shares the proxy's address, so
         # only the total number of connections is capped. The counts are
         # informational: an inflated number cannot affect games or lobbies.
-        self.states: dict[web.WebSocketResponse, tuple[bool, bool]] = {}
+        self.states: dict[web.WebSocketResponse, tuple[bool, str | None]] = {}
+        self.relay = relay
         self.max_connections = max_connections
         self.broadcast_interval = broadcast_interval
         self.heartbeat = heartbeat  # a vanished page stops counting within 1.5×
@@ -30,7 +32,12 @@ class Presence:
     def counts(self):
         return {"online": len(self.states),
                 "playing": sum(1 for playing, _ in self.states.values() if playing),
-                "lan": sum(1 for playing, lan in self.states.values() if playing and lan)}
+                "lan": len({token for playing, token in self.states.values()
+                            if playing and token and self.relay is not None and self.relay.has_presence_token(token)})}
+
+    def snapshot(self):
+        return {"type": "presence", **self.counts(),
+                **(self.relay.lobby_snapshot() if self.relay is not None else {})}
 
     def changed(self):
         self.dirty = True
@@ -43,7 +50,7 @@ class Presence:
         while self.dirty:
             await asyncio.sleep(self.broadcast_interval)
             self.dirty = False
-            message = json.dumps({"type": "presence", **self.counts()})
+            message = json.dumps(self.snapshot())
             await asyncio.gather(*(self.send(socket, message) for socket in list(self.states)))
 
     @staticmethod
@@ -61,11 +68,11 @@ class Presence:
             raise web.HTTPServiceUnavailable(text="Too many open launcher pages")
         socket = web.WebSocketResponse(max_msg_size=256, heartbeat=self.heartbeat)
         # Reserve before the first await, so concurrent upgrades respect the cap.
-        self.states[socket] = (False, False)
+        self.states[socket] = (False, None)
         try:
             await socket.prepare(request)
             self.changed()
-            await self.send(socket, json.dumps({"type": "presence", **self.counts()}))
+            await self.send(socket, json.dumps(self.snapshot()))
             window, count = time.monotonic(), 0
             async for message in socket:
                 if message.type == WSMsgType.ERROR:
@@ -85,10 +92,12 @@ class Presence:
                 except ValueError:
                     data = None
                 if (not isinstance(data, dict) or not isinstance(data.get("playing"), bool)
-                        or not isinstance(data.get("lan", False), bool)):
+                        or not isinstance(data.get("lan", False), bool)
+                        or (data.get("presenceToken") is not None
+                            and (not isinstance(data["presenceToken"], str) or len(data["presenceToken"]) > 64))):
                     await socket.close(code=1008, message=b"Expected {playing, lan} booleans")
                     break
-                state = (data["playing"], data["playing"] and data.get("lan", False))
+                state = (data["playing"], data.get("presenceToken") if data["playing"] and data.get("lan", False) else None)
                 if self.states.get(socket) != state:
                     self.states[socket] = state
                     self.changed()
@@ -98,6 +107,9 @@ class Presence:
         return socket
 
     async def shutdown(self, app):
+        if self.relay is not None:
+            self.relay.on_change = None
         await asyncio.gather(*(socket.close(code=1001, message=b"Server stopping") for socket in list(self.states)))
         if self.broadcast_task is not None:
             self.broadcast_task.cancel()
+            await asyncio.gather(self.broadcast_task, return_exceptions=True)

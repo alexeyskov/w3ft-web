@@ -3,14 +3,17 @@
 import {attachTouchKeyboard} from './touch-keyboard.mjs';
 
 const $ = id => document.getElementById(id);
-let session = null, logTimer = null, logWritten = 0;
+let session = null, logTimer = null, logWritten = 0, eagerLog = false;
 let currentLog = '';
 try { currentLog = localStorage.getItem('wc3-last-log') || ''; } catch {}
 const persistLog = () => { clearTimeout(logTimer); logTimer = null; logWritten = Date.now(); try { localStorage.setItem('wc3-last-log', currentLog); } catch {} };
 // Written at once, at most every 250 ms: when the browser kills the page (out
 // of memory) the saved log still ends with the stage the launch reached.
+// Until the game's first frame every line is written at once: a phone may
+// close the page within those 250 ms of a startup step.
 export function appendLog(message) {
   currentLog = `${currentLog}${new Date().toISOString()} ${String(message)}\n`.slice(-200000);
+  if (eagerLog) { persistLog(); return; }
   if (logTimer) return;
   const wait = logWritten + 250 - Date.now();
   if (wait <= 0) persistLog(); else logTimer = setTimeout(persistLog, wait);
@@ -70,7 +73,7 @@ export async function toggleFullscreen() {
 async function release(item, error = '') {
   item.resize?.disconnect();
   if (session !== item) return;
-  item.ending = true;
+  item.ending = true; eagerLog = false;
   // A report arrives after the saves, just before worker/audio cleanup finishes.
   // Wait for that cleanup before making Play available again.
   if (item.controller) {
@@ -101,7 +104,7 @@ async function release(item, error = '') {
 export async function openGame({runtime, saves, transport = null, resolution = {width:1024, height:768}, audioEnabled = true, fullscreen = true, graphicsSettings = undefined, language = undefined, maxFps = 0}) {
   if (session) return;
   const item = {cancelled:false, controller:null, resize:null, preparing:null, prepared:null, audioContext:null};
-  session = item;
+  session = item; eagerLog = true;
   currentLog = '';
   running(item, true);
   appendLog(`Warcraft III; ${navigator.userAgent}`);
@@ -169,6 +172,7 @@ export async function openGame({runtime, saves, transport = null, resolution = {
       onScreenshot:file => { if (session !== item) return; offer(file); appendLog(`Screenshot: ${file.name}`); },
       onFrame:frame => {
         if (session !== item) return;
+        eagerLog = false;
         canvas.dataset.frames = String(frame.frames);
         if (frame.width > 0 && frame.height > 0 && (width !== frame.width || height !== frame.height)) {
           width = frame.width; height = frame.height; fit();

@@ -30,7 +30,8 @@ class SharedWasmRuntimeTests(unittest.TestCase):
                 (out / name).write_bytes(image)
             command = [str(compiler), "--target=wasm32-wasip1-threads", "-pthread", "-matomics", "-mbulk-memory",
                        "-mtail-call", "-O1", "-std=c11", "-nostartfiles", "-I" + str(ROOT / "runtime"),
-                       "-Wl,--no-entry,--import-memory,--export-memory,--shared-memory,--max-memory=536870912,--initial-memory=8388608",
+                       "-DWC3_GUEST_BASE=0x00800000u", "-DWC3_GUEST_WINDOW=0x20000000u",
+                       "-Wl,--no-entry,--import-memory,--export-memory,--shared-memory,--max-memory=1073741824,--initial-memory=8388608",
                        "-Wl,-z,stack-size=1048576", "-Wl,--export=malloc,--export=free,--export=_initialize",
                        "-Wl,--export=__stack_pointer,--export=__wasm_init_tls,--export=__tls_size,--export=__tls_align",
                        str(sdk / "share/wasi-sysroot/lib/wasm32-wasip1-threads/crt1-reactor.o"),

@@ -48,6 +48,7 @@ const messages = {
   disconnected:['Соединение с лобби потеряно. Войдите заново перед сетевой игрой.','Lobby connection lost. Rejoin before playing online.'],
   networkUnavailable:['Сетевые лобби сейчас недоступны.','Online lobbies are currently unavailable.'], saved:['Копия сохранений скачана.','Save backup downloaded.'], restored:['Сохранения восстановлены.','Saves restored.'],
   archiveTooLarge:['Архив превышает 180 МБ.','The backup exceeds 180 MB.'], sharedLobby:['Общее лобби','Public lobby'], customLobbies:['Свои лобби','Custom lobbies'],
+  privateLobbyPlayers:['В лобби по коду: {players}.','Players in private lobbies: {players}.'],
   gameDataSummary:['На этом устройстве {cached} из {total} (без роликов). Загрузите остальное заранее, чтобы запуск не ждал сеть.','{cached} of {total} is on this device (movies not included). Preload the rest so loading never waits on the network.'],
   gameDataComplete:['Все данные игры ({total}) уже на этом устройстве (без роликов).','All game data ({total}) is on this device (movies not included).'],
   gameDataUnsupported:['Этот браузер не может хранить данные игры: они загружаются при каждом запуске.','This browser cannot keep game data; it is downloaded on each launch.'],
@@ -95,12 +96,12 @@ try {
 const languageSuggestion = chosenLanguage ? null : suggestedLanguage();
 const t = key => messages[key]?.[language === 'en' ? 1 : 0] ?? (language === 'en' ? english[key] : russian[key]) ?? key;
 let server = null, phase = 'loading', startupError = '', activeTab = 'saves';
-let room = null, pendingRoom = null, lobbyBusy = false, lobbies = [], lobbiesLoaded = false, lobbyRequest = 0;
+let room = null, pendingRoom = null, lobbyBusy = false, lobbies = [], privatePlayers = 0, lobbiesLoaded = false, lobbyRequest = 0;
 let lobbyCreation = null;
 let saving = false, saveFiles = [], webgl = false;
 const presence = new PresenceCounter();
 // "By LAN" counts a running game that uses a site lobby.
-const reportPresence = () => presence.update({playing:gameRunning(), lan:!!room});
+const reportPresence = () => presence.update({playing:gameRunning(), lan:!!room, presenceToken:room?.presenceToken});
 const shared = isSecureContext && crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
 // The game module uses WebAssembly tail calls (return_call). A browser without
 // them (Safari before 18.2, Chrome before 112, Firefox before 121) gets the
@@ -255,6 +256,7 @@ function renderRoom() {
 }
 function renderLobbies() {
   const list = $('lobby-list'); list.replaceChildren();
+  if (privatePlayers > 0) list.append(element('p', t('privateLobbyPlayers').replace('{players}', privatePlayers), 'hint private-lobby-count'));
   if (!lobbies.length) { list.append(element('p', t(lobbiesLoaded ? 'emptyLobbies' : 'loadingLobbies'), 'empty')); return; }
   // Shared lobbies grouped by game language, then lobbies created by players,
   // which have no language. Groups: Latin-script names A–Z, then Cyrillic А–Я.
@@ -280,14 +282,20 @@ function lobbyRow(lobby) {
   button.onclick = () => void joinLobby(lobby.id, true);
   row.append(info, button); return row;
 }
+function updateLobbies(result) {
+  lobbies = result.lobbies; privatePlayers = result.privatePlayers ?? 0;
+  lobbiesLoaded = true; renderLobbies();
+}
 async function refreshLobbies() {
   if (!server?.transport.available) return;
   const request = ++lobbyRequest;
   $('refresh-lobbies').disabled = true;
   try {
     const result = await json('/api/lobbies');
-    if (request !== lobbyRequest) return;
-    lobbies = result.lobbies; lobbiesLoaded = true; renderLobbies();
+    // Keep occupancy and counts from the same snapshot while the live channel
+    // is available; HTTP remains the fallback and triggers expired-room pruning.
+    if (request !== lobbyRequest || presence.lobbies) return;
+    updateLobbies(result);
   } catch (error) { if (request === lobbyRequest) notice('lobby-status', `${t('networkUnavailable')} (${error.message})`); }
   finally { if (request === lobbyRequest) $('refresh-lobbies').disabled = false; }
 }
@@ -297,7 +305,7 @@ function setRoom(transport) {
     transport.addEventListener('peers', () => { if (room === transport) renderRoom(); });
     transport.addEventListener('disconnect', () => {
       if (room !== transport) return;
-      room = null; renderRoom(); renderLobbies();
+      room = null; renderRoom(); renderLobbies(); reportPresence(); void refreshLobbies();
       notice('lobby-status', t('disconnected')); appendLog('LAN lobby disconnected.');
     });
   }
@@ -511,7 +519,14 @@ setInterval(() => { if (activeTab === 'online' && !document.hidden && !gameRunni
 window.addEventListener('pagehide', () => { lobbyCreation?.abort(); pendingRoom?.close(); room?.close(); presence.stop(); });
 window.addEventListener('pageshow', event => { if (event.persisted) { presence.start(); void refreshLobbies(); } });
 
-presence.addEventListener('change', renderPresence);
+presence.addEventListener('change', () => {
+  renderPresence();
+  if (presence.lobbies) {
+    // A live snapshot supersedes older HTTP requests that may still be in flight.
+    ++lobbyRequest; $('refresh-lobbies').disabled = false;
+    updateLobbies(presence.lobbies);
+  }
+});
 presence.start();
 language = chosenLanguage ?? await languageSuggestion;
 translate();

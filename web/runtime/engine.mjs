@@ -15,7 +15,9 @@ export async function createRuntime({wasm, images, profile, log = () => {}, ...o
   const instance = result.instance || result;
   host.instance = instance; host.exports = instance.exports;
   instance.exports._initialize?.();
+  log('WebAssembly instance ready');
   if (!instance.exports.wc3_init(0x78000000)) throw new GuestFault(host.nativeString(instance.exports.wc3_error_pointer()));
+  log(`Guest address space ready: ${(memory.buffer.byteLength / 1048576).toFixed(0)} MB`);
   host.attach(instance);
   const modules = [];
   for (const image of images) {

@@ -58,36 +58,89 @@ test('data on this device, or guest code the broker runs itself: read in the cal
   assert.deepEqual(sync.reads, [0]);
 });
 
-// The broker's file source: shared downloads, the device cache, the log.
-function source(disk = null) {
-  const file = {path: 'War3x.mpq', size: CHUNK * 3 + 100, downloadUrl: '/api/assets/x', cacheKey: 'a-x-1'};
-  const requests = [], logged = [];
-  let time = 0, resolve = [];
-  const files = sourceFiles([file], disk, {log: line => logged.push(line), now: () => time,
-    request: (url, start, end) => { requests.push(['sync', start]); time += 1500; return new Uint8Array(end - start).fill(start / CHUNK + 1); },
-    requestAsync: (url, start, end) => { requests.push(['async', start]); return new Promise(done => resolve.push(() => { time += 2000; done(new Uint8Array(end - start).fill(start / CHUNK + 1)); })); }});
-  return {files, requests, logged, release: () => { const list = resolve; resolve = []; list.forEach(done => done()); }};
+// The broker's file source over a scripted server: block i holds bytes i + 1.
+function source({latency = 400, blockBody = 60, blocks = 12, hold = null, cut = null, status = 206, disk = null} = {}) {
+  const file = {path: 'War3x.mpq', size: CHUNK * blocks, downloadUrl: '/api/assets/x', cacheKey: 'a-x-1'};
+  const data = new Uint8Array(file.size);
+  for (let i = 0; i < blocks; i++) data.fill(i + 1, i * CHUNK, (i + 1) * CHUNK);
+  const requests = [], singles = [], logged = [];
+  let time = 0;
+  const fetch = (url, init) => {
+    const [, a, b] = init.headers.Range.match(/bytes=(\d+)-(\d+)/), start = +a, end = +b + 1;
+    requests.push([start / CHUNK, (end - start) / CHUNK]);
+    time += latency;
+    let sent = 0;
+    const body = new ReadableStream({async pull(controller) {
+      if (sent >= end - start) return controller.close();
+      if (cut !== null && sent >= cut * CHUNK) return controller.error(new TypeError('network error'));
+      if (hold && sent >= CHUNK) await hold.promise;
+      time += blockBody;
+      controller.enqueue(data.slice(start + sent, start + sent + CHUNK)); sent += CHUNK;
+    }}, {highWaterMark: 0}); // bytes come when read, as from a network
+    return Promise.resolve({status, body});
+  };
+  const requestAsync = (url, start, end) => { singles.push(start / CHUNK); time += latency; return Promise.resolve(data.slice(start, end)); };
+  const files = sourceFiles([file], disk, {log: line => logged.push(line), now: () => time, fetch, requestAsync,
+    request: () => assert.fail('no synchronous request')});
+  // A block in memory reads at once (null); one still coming is waited for.
+  const read = async index => { const value = files.readFileLater('War3x.mpq', index * CHUNK + 8, 16); return value === null ? null : (await value)[0]; };
+  const value = async index => (await read(index)) ?? files.readFile('War3x.mpq', index * CHUNK + 8, 16)[0];
+  return {files, requests, singles, logged, read, value, advance: ms => { time += ms; }};
 }
 
-test('the broker fetches a missing block once for every thread waiting on it', async () => {
+test('read-ahead: a reader going on in order gets 2, then 4 blocks per request on a distant connection', async () => {
+  const {files, requests, value} = source();
+  for (let index = 0; index < 11; index++) assert.equal(await value(index), index + 1);
+  assert.deepEqual(requests, [[0, 1], [1, 2], [3, 4], [7, 4]], 'the window stops growing at 4 blocks');
+  assert.equal(files.networkReport().requests, 4);
+});
+
+test('read-ahead stays off for random reads and for a connection limited by its speed', async () => {
+  const random = source();
+  for (const index of [5, 1, 9, 3]) assert.equal(await random.value(index), index + 1);
+  assert.deepEqual(random.requests, [[5, 1], [1, 1], [9, 1], [3, 1]]);
+  const slow = source({latency: 50, blockBody: 2000});
+  for (const index of [0, 1, 2, 3]) assert.equal(await slow.value(index), index + 1);
+  assert.deepEqual(slow.requests, [[0, 1], [1, 1], [2, 1], [3, 1]], 'as before: single blocks');
+});
+
+test('the needed block is handed over before the rest of its request arrives', async () => {
+  let release; const hold = {promise: new Promise(resolve => { release = resolve; })};
+  const {requests, read} = source({hold});
+  await read(0); hold.promise.then(() => {});
+  const first = await read(1);
+  assert.equal(first, 2, 'block 1 without waiting for block 2');
+  const second = read(2);
+  release();
+  assert.equal(await second, 3, 'block 2 from the same request');
+  assert.deepEqual(requests, [[0, 1], [1, 2]]);
+});
+
+test('a broken or refused request: the rest comes block by block, with retries', async () => {
+  const broken = source({cut: 0});
+  assert.equal(await broken.value(0), 1);
+  assert.equal(await broken.value(1), 2);
+  assert.deepEqual(broken.singles, [0, 1], 'each cut request asks for its blocks alone');
+  const late = source({cut: 1});
+  assert.equal(await late.value(0), 1); assert.equal(await late.value(1), 2); assert.equal(await late.value(2), 3);
+  assert.deepEqual(late.requests, [[0, 1], [1, 2]]); assert.deepEqual(late.singles, [2], 'only the block the cut request lost');
+  const refused = source({status: 200});
+  assert.equal(await refused.read(0), 1);
+  assert.deepEqual(refused.singles, [0]);
+});
+
+test('waits and requests in the session line; data on this device needs no request', async () => {
   const stored = new Map();
   const disk = {has: (key, block) => stored.has(block), read: (key, block) => stored.get(block) ?? null, write: (key, block, data) => stored.set(block, data)};
-  const {files, requests, logged, release} = source(disk);
-  const first = files.readFileLater('War3x.mpq', CHUNK - 4, 8), second = files.readFileLater('war3x.mpq', CHUNK + 10, 4, {stood: true});
-  assert.deepEqual(requests, [['async', 0], ['async', CHUNK]], 'the second read shares the first one\'s download of block 1');
-  release();
-  assert.deepEqual([...await first], [1, 1, 1, 1, 2, 2, 2, 2]);
-  assert.deepEqual([...await second], [2, 2, 2, 2]);
-  assert.equal(files.readFileLater('War3x.mpq', 0, 16), null, 'now on this device');
-  assert.ok(stored.has(0) && stored.has(1));
-  assert.deepEqual([...files.readFile('War3x.mpq', CHUNK * 2, 2)], [3, 3], 'a synchronous read of a new block');
-  assert.equal(requests.at(-1)[0], 'sync');
-  // Both downloads ended at 4 s; the shared one counts for its first reader,
-  // a background thread. The synchronous one stopped the broker: the game stood.
+  const {files, requests, logged, read, value, advance} = source({latency: 1200, disk});
+  await read(0); await read(1); await value(2); advance(20000); await read(6);
+  assert.equal(files.readFileLater('War3x.mpq', 0, 16), null, 'stored on this device');
+  assert.ok(stored.has(0) && stored.has(2), 'the read-ahead block is stored too');
+  assert.deepEqual(requests, [[0, 1], [1, 2], [6, 1]]);
   const report = files.networkReport();
-  assert.deepEqual({blocks: report.blocks, stoodMs: report.stoodMs, backgroundMs: report.backgroundMs},
-    {blocks: 3, stoodMs: 1500, backgroundMs: 8000});
-  assert.match(logged[0], /^Slow game data from the server: 1 block over 1 s, up to 4\.0 s \(War3x\.mpq\)$/);
-  assert.equal(logged.length, 1, 'at most one line in ten seconds');
-  assert.match(describeNetwork(report), /^Game data from the server this session: 3 blocks, 0\.8 MB; the game waited 1\.5 s, background loading 8\.0 s; the longest block 4\.0 s \(War3x\.mpq\)$/);
+  // 1.26 + 1.32 + 1.26 s: the scripted clock moves on with the next block before the waiting read resumes.
+  assert.deepEqual({blocks: report.blocks, requests: report.requests, backgroundMs: report.backgroundMs}, {blocks: 4, requests: 3, backgroundMs: 3840});
+  assert.equal(logged.length, 2, 'at most one line in ten seconds');
+  assert.match(logged[0], /^Slow game data from the server: 1 read waited over 1 s, up to 1\.3 s \(War3x\.mpq\)$/);
+  assert.match(describeNetwork(report), /^Game data from the server this session: 4 blocks, 1\.0 MB in 3 requests; waits: the game thread 0\.0 s, loading threads 3\.8 s \(the game often waits for them too\); the longest 1\.3 s \(War3x\.mpq\); lately the server answered in 1\.2 s, 256 KiB took 0\.1 s$/);
 });

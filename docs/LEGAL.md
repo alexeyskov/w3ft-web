@@ -2,6 +2,8 @@
 
 This file explains the repository's licensing boundaries. It does not grant rights in Warcraft or provide legal clearance for a deployment. A source-code license and a fan-project disclaimer cannot guarantee that a port, a derivative binary or a hosted service is authorized. The applicable game license, third-party permissions and law must be assessed separately.
 
+To build or deploy this project, you must own a valid license for Warcraft III: The Frozen Throne and supply files from your own lawfully obtained installation. The repository does not supply a game license, installation or prebuilt game-derived module. This requirement does not itself authorize redistribution or public hosting of game content.
+
 ## What is licensed here
 
 The root [LICENSE](../LICENSE) is the MIT license for project source, with the upstream copyright notices retained. It permits redistribution of that source under its terms. [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) identifies the borrowed code and separately licensed dependencies/data.

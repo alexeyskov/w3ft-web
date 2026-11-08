@@ -14,8 +14,9 @@ EXPORT(fixture_tls) uint32_t fixture_tls(uint32_t value) { if (value) local_mark
 EXPORT(fixture_events) uintptr_t fixture_events(void) { return (uintptr_t)events; }
 EXPORT(fixture_event_count) uint32_t fixture_event_count(void) { return atomic_load(&event_count); }
 EXPORT(fixture_reserved) uint32_t fixture_reserved(uint32_t index) { return reserved_arguments[index]; }
-/* Out of range in every build mode; the null page faults only in strict builds. */
-EXPORT(fixture_no_context_fault) void fixture_no_context_fault(void) { (void)wc3_mem_ptr(0xfffffff0u, 1); }
+/* A checked access out of range faults in every build mode (lifted code's
+ * masked fast path does not check); the null page faults only in strict builds. */
+EXPORT(fixture_no_context_fault) void fixture_no_context_fault(void) { (void)wc3_mem_check(0xfffffff0u, 1); }
 
 static void guest_return(CPU *c, uint32_t arguments) {
     c->eip = MR32(c->esp); c->esp += 4 + arguments * 4;

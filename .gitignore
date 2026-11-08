@@ -8,6 +8,28 @@ out/
 test-results/
 .env
 
+# Game files and generated game code, even outside resources/ and var/.
+*.[eE][xX][eE]
+*.[dD][lL][lL]
+*.[mM][pP][qQ]
+*.[wW]3[mMxXnNgGzZvVpP]
+*.[bB][lL][pP]
+*.[mM][dD][xX]
+*.[tT][tT][fF]
+*.[oO][tT][fF]
+*.wasm
+*.wasm.gz
+*.wasm.br
+shard_*.c
+fntab.c
+
+# Local installation archives and converted cinematics.
+*.[zZ][iI][pP]
+*.7[zZ]
+*.[rR][aA][rR]
+*.[aA][vV][iI]
+*.[wW][eE][bB][mM]
+
 # Local deployment helper
 /sync-vps.sh
 /vps-install.sh

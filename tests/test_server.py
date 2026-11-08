@@ -300,15 +300,15 @@ class ServerTests(AioHTTPTestCase):
         self.assertEqual(socket.close_code, 1008)
         await socket.close()
 
-    async def presence(self, socket, expected):
+    async def presence(self, socket, expected, predicate=None):
         # Broadcasts coalesce; read until the settled counts arrive.
         for _ in range(50):
             message = await socket.receive(timeout=3)
             self.assertEqual(message.type, WSMsgType.TEXT)
             data = json.loads(message.data)
             self.assertEqual(data.pop('type'), 'presence')
-            if data == expected:
-                return
+            if {key: data[key] for key in expected} == expected and (predicate is None or predicate(data)):
+                return data
         self.fail(f'presence never reached {expected}')
 
     async def test_presence_counts_pages_running_games_and_lan_games(self):
@@ -316,7 +316,9 @@ class ServerTests(AioHTTPTestCase):
         first = await self.client.ws_connect('/api/presence')
         await self.presence(first, {'online': 1, 'playing': 0, 'lan': 0})
         second = await self.client.ws_connect('/api/presence')
-        await second.send_json({'playing': True, 'lan': True})
+        seat = await self.client.ws_connect('/api/relay/auto')
+        welcome = await seat.receive_json()
+        await second.send_json({'playing': True, 'lan': True, 'presenceToken': welcome['presenceToken']})
         await first.send_json({'playing': True})
         await self.presence(first, {'online': 2, 'playing': 2, 'lan': 1})
         status = await (await self.client.get('/api/status')).json()
@@ -334,9 +336,71 @@ class ServerTests(AioHTTPTestCase):
                 break
             await asyncio.sleep(0.01)
         self.assertEqual(self.app[STATE]['presence'].counts(), {'online': 0, 'playing': 0, 'lan': 0})
+        await seat.close()
         with self.assertRaises(WSServerHandshakeError) as error:
             await self.client.ws_connect('/api/presence', headers={'Origin': 'https://other.example'})
         self.assertEqual(error.exception.status, 403)
+
+    async def test_presence_lan_requires_a_live_relay_connection(self):
+        presence = self.app[STATE]['presence']
+        presence.broadcast_interval = 0.01
+        page = await self.client.ws_connect('/api/presence')
+        await self.presence(page, {'online': 1, 'playing': 0, 'lan': 0})
+        # A stale client flag must not create a LAN player in empty lobbies.
+        await page.send_json({'playing': True, 'lan': True})
+        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 0})
+
+        seat = await self.client.ws_connect('/api/relay/auto?language=en')
+        welcome = await seat.receive_json()
+        token = welcome['presenceToken']
+        await page.send_json({'playing': True, 'lan': True, 'presenceToken': token})
+        message = await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1})
+        self.assertEqual(next(l['players'] for l in message['lobbies'] if l['id'] == welcome['room']), 1)
+
+        # The page stays alive and never clears its flag: only the relay closes.
+        await seat.close()
+        message = await self.presence(page, {'online': 1, 'playing': 1, 'lan': 0})
+        self.assertTrue(all(l['players'] == 0 for l in message['lobbies']))
+        replacement = await self.client.ws_connect('/api/relay/auto?language=en')
+        new_welcome = await replacement.receive_json()
+        self.assertEqual(new_welcome['peerId'], welcome['peerId'])
+        self.assertNotEqual(new_welcome['presenceToken'], token)
+        self.assertEqual((await (await self.client.get('/api/status')).json())['presence']['lan'], 0,
+                         'Reusing a peer slot must not revive the old page LAN flag')
+        await page.send_json({'playing': True, 'lan': True, 'presenceToken': new_welcome['presenceToken']})
+        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1})
+        await asyncio.gather(replacement.close(), page.close())
+
+    async def test_live_lobby_snapshots_include_private_totals_without_codes(self):
+        self.app[STATE]['presence'].broadcast_interval = 0.01
+        page = await self.client.ws_connect('/api/presence')
+        idle = {'online': 1, 'playing': 0, 'lan': 0}
+        await self.presence(page, idle)
+        lobby = await (await self.client.post('/api/lobbies', json={'name': 'Live lobby'})).json()
+        await self.presence(page, idle, lambda m: any(l['id'] == lobby['id'] for l in m['lobbies']))
+        seat = await self.client.ws_connect(f"/api/relay/{lobby['id']}?lobby=1")
+        await seat.receive_json()
+        await self.presence(page, idle, lambda m: any(l['id'] == lobby['id'] and l['players'] == 1 for l in m['lobbies']))
+        await seat.close()
+        await self.presence(page, idle, lambda m: all(l['id'] != lobby['id'] for l in m['lobbies']))
+
+        private = await self.client.ws_connect('/api/relay/secret-room-code')
+        welcome = await private.receive_json()
+        message = await self.presence(page, idle, lambda m: m['privatePlayers'] == 1)
+        self.assertNotIn('secret-room-code', json.dumps(message))
+        self.assertNotIn(welcome['presenceToken'], json.dumps(message))
+        listing = await (await self.client.get('/api/lobbies')).json()
+        self.assertEqual(listing['privatePlayers'], 1)
+        self.assertTrue(all(l['players'] == 0 for l in listing['lobbies']))
+        state = {'playing': True, 'lan': True, 'presenceToken': welcome['presenceToken']}
+        await page.send_json(state)
+        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1})
+        duplicate = await self.client.ws_connect('/api/presence')
+        await duplicate.send_json(state)
+        await self.presence(page, {'online': 2, 'playing': 2, 'lan': 1})
+        await private.close()
+        await self.presence(page, {'online': 2, 'playing': 2, 'lan': 0}, lambda m: m['privatePlayers'] == 0)
+        await asyncio.gather(duplicate.close(), page.close())
 
     async def test_vanished_pages_free_lobby_seats_and_counts(self):
         # A page that disappears without closing its connections (crash, sleep,
@@ -345,8 +409,9 @@ class ServerTests(AioHTTPTestCase):
         relay.heartbeat = presence.heartbeat = 0.2
         presence.broadcast_interval = 0.01
         seat = await self.client.ws_connect('/api/relay/auto?language=en', autoping=False)
+        welcome = await seat.receive_json()
         page = await self.client.ws_connect('/api/presence', autoping=False)
-        await page.send_json({'playing': True, 'lan': True})
+        await page.send_json({'playing': True, 'lan': True, 'presenceToken': welcome['presenceToken']})
         for _ in range(100):
             if relay.rooms['shared-en-1'].peers and presence.counts() == {'online': 1, 'playing': 1, 'lan': 1}:
                 break

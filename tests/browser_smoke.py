@@ -379,6 +379,113 @@ async def check_outdated_browser(browser, base):
           'notice and Play disabled without that build passed')
 
 
+async def check_memory_test_page(browser, base):
+    # /memory-test.html (iPhone and iPad): a test the browser cut short is
+    # reported after the reload with the step and the memory filled.
+    context = await browser.new_context(locale='ru-RU')
+    page = await context.new_page()
+    errors = []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    await page.goto(base + '/memory-test.html')
+    await page.evaluate("""localStorage.setItem('wc3-memory-test', JSON.stringify({mode:'full', step:'fill', filledMB:1216, compileSeconds:9.5, grownMB:1984, ua:'iPhone'}))""")
+    await page.reload()
+    notice = await page.locator('#previous').inner_text()
+    assert 'заполнено 1216 МБ' in notice and 'заполнение памяти' in notice, notice
+    assert 'filled=1216 MB' in await page.locator('#details').inner_text()
+    assert await page.locator('#full').is_enabled()
+    await context.close()
+    assert not errors, errors
+    print('Memory test page: an interrupted test is reported after reload passed')
+
+
+async def check_live_lobby_counts(browser, base):
+    context = await browser.new_context(locale='en-US')
+    await context.add_init_script("""localStorage.setItem('wc3-language','en');
+      localStorage.setItem('wc3-launch-settings',JSON.stringify({version:2,fullscreen:false,audioEnabled:false}));""")
+    errors = []
+    async def status(route):
+        response = await route.fetch()
+        value = await response.json()
+        value['runtime'].update(diagnostics=True, installed=True, moduleUrl='/runtime/presence-fixture.mjs')
+        value['game']['prepared'] = True
+        await route.fulfill(json=value)
+    await context.route('**/api/status', status)
+    await context.route('**/runtime/presence-fixture.mjs', lambda route: route.fulfill(
+        content_type='text/javascript', body='''
+          export async function runDiagnostics(options) {
+            window.fixtureOptions=options;
+            return {async stop(){},async finish(){options.onReport({fixture:true});}};
+          }
+        '''))
+    release = asyncio.Event()
+    try:
+        observer, player = await context.new_page(), await context.new_page()
+        for page in (observer, player):
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            await page.goto(base)
+            await wait_for(page, '!document.getElementById("launch").disabled')
+        await observer.locator('#tab-online').click()
+        await wait_for(observer, 'document.querySelectorAll(".lobby-row").length >= 4')
+        # Hold a real HTTP response with the empty roster. A newer WebSocket
+        # snapshot must arrive without waiting for the 15-second polling timer,
+        # and the delayed HTTP response must not overwrite it afterwards.
+        captured, fulfilled = asyncio.Event(), asyncio.Event()
+        async def stale_listing(route):
+            response = await route.fetch()
+            captured.set()
+            await release.wait()
+            await route.fulfill(response=response)
+            fulfilled.set()
+        await observer.route('**/api/lobbies', stale_listing)
+        await observer.locator('#refresh-lobbies').click()
+        async with asyncio.timeout(10):
+            await captured.wait()
+        await player.locator('#launch').click()
+        await wait_for(player, 'document.body.dataset.phase === "running"')
+        public_lan = '''document.getElementById("online-lan").textContent === "1" &&
+          document.querySelector(".lobby-row small")?.textContent.startsWith("1 / 200")'''
+        await wait_for(observer, public_lan)
+        release.set()
+        async with asyncio.timeout(10):
+            await fulfilled.wait()
+        await observer.unroute('**/api/lobbies', stale_listing)
+        await observer.wait_for_timeout(100)
+        assert await observer.evaluate(public_lan), 'A delayed HTTP roster overwrote live occupancy'
+
+        # Keep the game and presence socket alive while only its relay drops.
+        await player.evaluate('fixtureOptions.transport.socket.close()')
+        await wait_for(observer, '''document.getElementById("online-lan").textContent === "0" &&
+          document.getElementById("online-playing").textContent === "1" &&
+          [...document.querySelectorAll(".lobby-row small")].every(n=>n.textContent.startsWith("0 /"))''')
+        assert await player.evaluate('document.body.dataset.phase === "running"')
+        await player.locator('#stop-diagnostic').click()
+        await wait_for(player, '!document.getElementById("launch").disabled')
+
+        # Private codes remain hidden; their aggregate explains LAN players
+        # when every public lobby is empty, in either page language.
+        await player.locator('#tab-online').click()
+        await player.locator('[data-i18n="privateRoom"]').click()
+        await player.locator('#room-code').fill('browser-private-code')
+        await player.locator('#join-code').click()
+        await wait_for(player, '!document.getElementById("joined-lobby").hidden')
+        await player.locator('#launch').click()
+        await wait_for(observer, '''document.getElementById("online-lan").textContent === "1" &&
+          document.querySelector(".private-lobby-count")?.textContent === "Players in private lobbies: 1."''')
+        assert await observer.evaluate('[...document.querySelectorAll(".lobby-row small")].every(n=>n.textContent.startsWith("0 /"))')
+        assert 'browser-private-code' not in await observer.locator('#lobby-list').inner_text()
+        await observer.locator('#language').select_option('ru')
+        assert await observer.locator('.private-lobby-count').inner_text() == 'В лобби по коду: 1.'
+        await player.close()
+        await wait_for(observer, '''document.getElementById("online-lan").textContent === "0" &&
+          document.getElementById("online-playing").textContent === "0" &&
+          !document.querySelector(".private-lobby-count")''')
+        assert not errors, errors
+    finally:
+        release.set()
+        await context.close()
+    print('Live lobby counts: synchronized roster, stale HTTP, dropped relay and private lobby privacy passed')
+
+
 async def check_launch_and_lobby(browser, base):
     context = await browser.new_context(viewport={"width": 1440, "height": 1000}, locale='ru-RU')
     page = await context.new_page()
@@ -662,12 +769,14 @@ async def main(base):
             }""") == '4,5,6'
             assert not errors, errors
             await context.close()
+            await check_live_lobby_counts(browser, base)
             await check_launch_and_lobby(browser, base)
             await check_default_language(browser, base)
             await check_touch_controls(browser, base)
             await check_loading_screen(browser, base)
             await check_launch_notices(browser, base)
             await check_outdated_browser(browser, base)
+            await check_memory_test_page(browser, base)
             print('Browser integration passed. Warcraft execution was not tested.')
         finally:
             await browser.close()

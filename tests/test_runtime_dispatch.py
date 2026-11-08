@@ -35,6 +35,7 @@ class DispatchCacheTests(unittest.TestCase):
             (out / 'targets.json').write_text(json.dumps({'first': first, 'second': second, 'missing': missing}))
             flags = ['--target=wasm32-wasip1-threads', '-pthread', '-matomics', '-mbulk-memory', '-mtail-call',
                      '-O1', '-std=c11', '-nostartfiles', '-I' + str(ROOT / 'runtime'), '-I' + str(out),
+                     '-DWC3_GUEST_BASE=0x00800000u', '-DWC3_GUEST_WINDOW=0x08000000u',
                      '-Wl,--no-entry,--import-memory,--export-memory,--shared-memory,--max-memory=268435456,--initial-memory=8388608',
                      '-Wl,-z,stack-size=1048576', '-Wl,--export=malloc,--export=free,--export=_initialize',
                      '-Wl,--export=__stack_pointer,--export=__wasm_init_tls,--export=__tls_size,--export=__tls_align']

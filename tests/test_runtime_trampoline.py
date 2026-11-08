@@ -53,7 +53,7 @@ class TrampolineWasmTests(unittest.TestCase):
         fixture = (ROOT / "tests/runtime_trampoline_fixture.c").read_text()
         with tempfile.TemporaryDirectory(prefix="wc3-trampoline-") as directory:
             out = Path(directory)
-            link = ["-nostartfiles", "-I" + str(ROOT / "runtime"),
+            link = ["-nostartfiles", "-I" + str(ROOT / "runtime"), "-DWC3_GUEST_BASE=0x00800000u", "-DWC3_GUEST_WINDOW=0x08000000u",
                     "-Wl,--no-entry,--import-memory,--export-memory,--shared-memory,--max-memory=268435456,--initial-memory=8388608",
                     "-Wl,-z,stack-size=1048576", "-Wl,--export=malloc,--export=free,--export=_initialize",
                     "-Wl,--export=__stack_pointer,--export=__wasm_init_tls,--export=__tls_size,--export=__tls_align"]

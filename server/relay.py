@@ -52,6 +52,8 @@ class Relay:
         # sleep, lost network) misses a ping and frees the seat within 1.5×.
         self.heartbeat = heartbeat
         self.pending_announcements: set[asyncio.Task] = set()
+        self.presence_tokens: dict[str, web.WebSocketResponse] = {}
+        self.on_change = None
         # Listing order of language groups, as on the site: Latin-script names
         # A–Z (English), then Cyrillic А–Я (Русский). Players without a
         # language join the base installation's language.
@@ -95,9 +97,21 @@ class Relay:
 
     def prune_empty_lobbies(self):
         now = time.monotonic()
+        changed = False
         for key, room in list(self.rooms.items()):
             if not room.peers and not room.permanent and now - room.created_at >= self.empty_lobby_ttl:
                 self.rooms.pop(key)
+                changed = True
+        if changed:
+            self.changed()
+
+    def changed(self):
+        if self.on_change is not None:
+            self.on_change()
+
+    def has_presence_token(self, token):
+        socket = self.presence_tokens.get(token)
+        return socket is not None and socket.prepared and not socket.closed
 
     def lobby_info(self, key, room):
         info = {"id": key, "name": room.name, "players": len(room.peers), "maxPlayers": room.capacity}
@@ -106,8 +120,7 @@ class Relay:
             info["language"] = room.language
         return info
 
-    async def list_lobbies(self, request):
-        self.prune_empty_lobbies()
+    def lobby_snapshot(self):
         # Ad-hoc room codes remain private and are never published here.
         # Shared lobbies first, by language and number; then created ones.
         order = {language: index for index, language in enumerate(self.languages)}
@@ -115,7 +128,12 @@ class Relay:
                        key=lambda item: (0, order.get(item[1].language, 0), item[1].shared, 0.0) if item[1].shared
                        else (1, 0, 0, item[1].created_at))
         lobbies = [self.lobby_info(key, room) for key, room in rooms]
-        return web.json_response({"lobbies": lobbies, "maxPlayers": self.capacity},
+        private_players = sum(len(room.peers) for room in self.rooms.values() if room.name is None)
+        return {"lobbies": lobbies, "maxPlayers": self.capacity, "privatePlayers": private_players}
+
+    async def list_lobbies(self, request):
+        self.prune_empty_lobbies()
+        return web.json_response(self.lobby_snapshot(),
                                  headers={"Cache-Control": "no-store"})
 
     async def create_lobby(self, request):
@@ -137,6 +155,7 @@ class Relay:
         while key in self.rooms:
             key = secrets.token_urlsafe(12)
         room = self.rooms[key] = Room(name=name.strip(), capacity=self.capacity)
+        self.changed()
         return web.json_response(self.lobby_info(key, room), status=201,
                                  headers={"Cache-Control": "no-store"})
 
@@ -174,10 +193,16 @@ class Relay:
         socket = web.WebSocketResponse(max_msg_size=65536, heartbeat=self.heartbeat, receive_timeout=90)
         # Reserve before the first await, so concurrent upgrades cannot share an ID.
         room.peers[peer_id] = socket
+        token = secrets.token_urlsafe(18)
+        while token in self.presence_tokens:
+            token = secrets.token_urlsafe(18)
+        self.presence_tokens[token] = socket
         try:
             await socket.prepare(request)
+            self.changed()
             await self.send(socket, control={"type": "welcome", "peerId": peer_id,
                                             "room": key, "protocol": "wc3-frame-relay-v1",
+                                            "presenceToken": token,
                                             "peers": sorted(room.peers),
                                             "lobby": self.lobby_info(key, room)})
             await self.announce(room)
@@ -206,7 +231,11 @@ class Relay:
                 elif message.type == WSMsgType.ERROR:
                     break
         finally:
+            self.presence_tokens.pop(token, None)
             room.peers.pop(peer_id, None)
+            if not room.peers and not room.permanent:
+                self.rooms.pop(key, None)
+            self.changed()
             if room.peers:
                 # A disconnected HTTP request may be cancelled while this
                 # broadcast yields. Other peers still need the leave event to
@@ -215,8 +244,6 @@ class Relay:
                 self.pending_announcements.add(announcement)
                 announcement.add_done_callback(self.pending_announcements.discard)
                 await asyncio.shield(announcement)
-            elif not room.permanent:
-                self.rooms.pop(key, None)
         return socket
 
     async def shutdown(self, app):

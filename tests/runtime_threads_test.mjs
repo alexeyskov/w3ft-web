@@ -49,7 +49,7 @@ if(!isMainThread&&workerData?.scheduler){
   }catch(error){parentPort.postMessage({error:error.stack});}
 }else if(process.argv[2]){
   const directory=process.argv[2],module=await WebAssembly.compile(readFileSync(join(directory,'threads.wasm')));
-  const memory=new WebAssembly.Memory({initial:128,maximum:8192,shared:true});
+  const memory=new WebAssembly.Memory({initial:128,maximum:16384,shared:true});
   const {exports:x}=await WebAssembly.instantiate(module,imports(memory,(id,cpu)=>hostCall(id,cpu,x,memory)));
   x._initialize();assert.equal(x.wc3_init(0x10000000),1);x.fixture_marker(0xbeefcafe);x.fixture_tls(99);
   const nativeString=s=>{const bytes=new TextEncoder().encode(s+'\0'),p=x.malloc(bytes.length)>>>0;new Uint8Array(memory.buffer).set(bytes,p);return p;};

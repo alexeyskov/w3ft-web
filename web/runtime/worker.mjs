@@ -27,11 +27,20 @@ function mapHeader(text,size){
 // buffer, which boot() kept for the whole game. That buffer plus the
 // compiler's copy was the startup peak (WebKit: 944 MB, streaming 597 MB).
 // Without application/wasm (another server) it compiles from the bytes.
+// JavaScriptCore (Safari, every browser on iPhone and iPad) keeps no compiled
+// module between visits, so counting the stream costs nothing there; the log
+// then shows how far a phone got when it closed the page for memory.
+const javaScriptCore=/AppleWebKit\//.test(navigator.userAgent)&&!/Chrome\/|Chromium\/|Edg\//.test(navigator.userAgent);
 async function compileWasm(url){
   const response=await fetch(url);
   if(!response.ok)throw Error('WASM download failed');
-  if(typeof WebAssembly.compileStreaming==='function'&&/^application\/wasm\b/i.test(response.headers.get('Content-Type')||''))return WebAssembly.compileStreaming(response);
-  return WebAssembly.compile(await response.arrayBuffer());
+  if(typeof WebAssembly.compileStreaming!=='function'||!/^application\/wasm\b/i.test(response.headers.get('Content-Type')||''))return WebAssembly.compile(await response.arrayBuffer());
+  if(!javaScriptCore||!response.body||typeof TransformStream!=='function')return WebAssembly.compileStreaming(response);
+  let received=0,next=32;
+  const counted=response.body.pipeThrough(new TransformStream({transform(chunk,controller){
+    received+=chunk.byteLength;if(received>=next*1048576){log(`WASM: ${next} MB received and compiled`);next+=32;}controller.enqueue(chunk);
+  }}));
+  return WebAssembly.compileStreaming(new Response(counted,{headers:{'Content-Type':'application/wasm'}}));
 }
 
 const sendScreenshots=engine=>{for(const {path,data} of takeScreenshots(engine.host))postMessage({type:'screenshot',path,data},[data.buffer]);};

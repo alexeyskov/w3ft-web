@@ -8,7 +8,8 @@ player chooses that language. The data must be the same patch: the scripts and
 gameplay tables are compared with the base installation, which also keeps LAN
 games between localizations compatible (map checksums use these scripts).
 
-Example: tools/prepare_locale.py resources/AppNee.com.Warcraft.III.RoC.TFT.Portable.FR.7z --language en
+Supply an archive created from your own licensed localized installation.
+Example: tools/prepare_locale.py "/path/to/your-localized-installation.zip" --language en
 """
 from __future__ import annotations
 

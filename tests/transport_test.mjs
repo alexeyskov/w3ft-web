@@ -24,9 +24,10 @@ test('a lobby joined before launch retains its peer roster and binary LAN transp
   const connecting = transport.connect(), socket = transport.socket;
   assert.equal(socket.url.protocol, 'wss:');
   assert.equal(socket.url.searchParams.get('lobby'), '1');
-  socket.message({type: 'welcome', peerId: 2, peers: [1, 2], lobby: {id: transport.room, name: 'Friends', players: 2, maxPlayers: 12}});
+  socket.message({type: 'welcome', peerId: 2, peers: [1, 2], presenceToken: 'first-connection', lobby: {id: transport.room, name: 'Friends', players: 2, maxPlayers: 12}});
   await connecting;
   assert.deepEqual(transport.peerIds, [1, 2]);
+  assert.equal(transport.presenceToken, 'first-connection');
   let roster, packet;
   transport.addEventListener('peers', event => { roster = event.detail; });
   transport.addEventListener('packet', event => { packet = event.detail; });
@@ -42,6 +43,7 @@ test('a lobby joined before launch retains its peer roster and binary LAN transp
   await Promise.resolve();
   assert.equal(transport.peerId, 0);
   assert.deepEqual(transport.peerIds, []);
+  assert.equal(transport.presenceToken, null);
 });
 
 test('leaving and immediately reconnecting ignores the old socket close event', async t => {
@@ -56,14 +58,16 @@ test('leaving and immediately reconnecting ignores the old socket close event', 
   transport.close();
   connecting = transport.connect();
   const replacement = transport.socket;
-  replacement.message({type: 'welcome', peerId: 3});
+  replacement.message({type: 'welcome', peerId: 3, presenceToken: 'replacement-connection'});
   await connecting;
   assert.equal(disconnects, 1);
   assert.equal(transport.socket, replacement);
   assert.equal(transport.peerId, 3);
+  assert.equal(transport.presenceToken, 'replacement-connection');
   replacement.close();
   await Promise.resolve();
   assert.equal(disconnects, 2);
   assert.equal(transport.socket, null);
   assert.equal(transport.peerId, 0);
+  assert.equal(transport.presenceToken, null);
 });

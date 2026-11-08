@@ -71,3 +71,4 @@ html[data-pending-language] .app{visibility:hidden;animation:language-reveal 0s 
 .about-card .tabs{gap:24px;justify-content:flex-start}.about-card .prose{overflow-wrap:anywhere}.about-card .prose p+p{margin-top:16px}
 /* Keep the information available on phones, after the game controls. */
 @media(max-width:800px){.side{display:contents}.content{order:1}.about-card{order:2}}
+.memory-test{grid-template-columns:1fr;max-width:760px}.memory-test .row{margin:16px 0}.memory-test .play{width:auto;padding:0 24px;font-size:17px}.memory-test pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;color:var(--muted);margin:0}

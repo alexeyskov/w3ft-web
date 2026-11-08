@@ -1,6 +1,6 @@
 # Prepare your own `var/` and run locally
 
-Run commands below from the repository root. The repository supplies tools and source, not a game installation, prebuilt game-derived WASM or a downloadable `var/` bundle. Use your own lawfully obtained copy and review the applicable game/font/map licenses before copying, modifying or sharing material. See [LEGAL.md](LEGAL.md).
+Run commands below from the repository root. **Building or deploying this project requires your own valid Warcraft III: The Frozen Throne license and files from your own lawfully obtained installation.** The repository supplies tools and source, not a game installation, prebuilt game-derived WASM or a downloadable `var/` bundle. Review the applicable game/font/map licenses before copying, modifying or sharing material. See [LEGAL.md](LEGAL.md).
 
 ## Compatible game files
 
@@ -119,6 +119,8 @@ A second language supplies matching game data rather than another copy of the tr
 ```
 
 The archive reader uses `bsdtar`; localized archives and movies must be at the archive root and under `Movies/`. This tool does not unwrap an enclosing game directory. It compares game scripts/tables against `var/game`, prepares movies and writes `var/locales/en/locale.json`. `--language ru` is also supported. No language-pack download is provided.
+
+The equivalent Make target is `make locale-en ENGLISH_ARCHIVE="/absolute/path/to/your-localized-installation.zip"`. Without an override it reads `resources/Warcraft_III_en.zip`, which you must create from your own licensed installation; it does not download an archive.
 
 For English data whose interface font lacks Cyrillic, the tool also calls `prepare_fonts.py`: it copies Cyrillic glyphs from the installation's Nimrod font into its Friz Quadrata font. Those fonts and the modified output are not MIT-licensed by this project. Verify the applicable font permissions before modification or distribution; do not publish the output merely because it was generated locally. For an already prepared localization:
 

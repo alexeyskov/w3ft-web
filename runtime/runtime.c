@@ -154,9 +154,27 @@ void dispatch_tail(CPU *c) {
 EXPORT(wc3_init) int wc3_init(uint32_t capacity) {
     if (g_mem) { snprintf(error_text, sizeof(error_text), "Runtime already initialized"); return 0; }
     if (capacity < 0x1000000u || capacity > 0x80000000u) return 0;
+#if WC3_FIXED_GUEST
+    /* The guest window (cpu.h) starts where the runtime's memory ends; later
+     * runtime allocations come after the window (the allocator takes memory
+     * from the current end), so nothing of the runtime is ever inside it. */
+    if (capacity > WC3_GUEST_WINDOW - 16u) { snprintf(error_text, sizeof(error_text), "Guest capacity exceeds the guest window"); return 0; }
+    size_t pages = __builtin_wasm_memory_size(0);
+    if (pages > WC3_GUEST_BASE / 65536u) {
+        snprintf(error_text, sizeof(error_text), "Runtime memory grew past the guest base before wc3_init");
+        return 0;
+    }
+    size_t end = ((size_t)WC3_GUEST_BASE + WC3_GUEST_WINDOW + 16u + 65535u) / 65536u;
+    if (__builtin_wasm_memory_grow(0, end - pages) == (size_t)-1) {
+        snprintf(error_text, sizeof(error_text), "Cannot allocate guest address space");
+        return 0;
+    }
+    g_mem = (uint8_t *)(uintptr_t)WC3_GUEST_BASE;
+#else
     /* 16 bytes of slack: the fast access check tests only the start address. */
     g_mem = malloc((size_t)capacity + 16);
     if (!g_mem) { snprintf(error_text, sizeof(error_text), "Cannot allocate guest address space"); return 0; }
+#endif
     g_mem_size = capacity;
     if (!wc3_memory_permissions_init(capacity)) return 0;
     wc3_memory_protect(0, 0x10000, 0);
