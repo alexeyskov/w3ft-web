@@ -101,6 +101,8 @@ WC3_PACKED(wc3_f32, float); WC3_PACKED(wc3_f64, double);
 enum { R_EAX=0,R_ECX,R_EDX,R_EBX,R_ESP,R_EBP,R_ESI,R_EDI };
 void dispatch_indirect(struct CPU *c, uint32_t address);
 void dispatch_tail(struct CPU *c);
+/* Used by the builder's virtual self-call loop; preserves trace/budget checks. */
+void wc3_record_dispatch(struct CPU *c, uint32_t address);
 typedef void (*guest_fn_t)(struct CPU *);
 #define DISPATCH_CALL(c_, address_) dispatch_indirect((c_), (uint32_t)(address_))
 /* A jump to an address in a register or memory (x86 "jmp eax", including

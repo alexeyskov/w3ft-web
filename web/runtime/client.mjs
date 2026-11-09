@@ -140,7 +140,7 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
   // running. Removing the audio device makes guest code poll forever.
   try { await player.unlock(); }
   catch(error) { await audio.destroy(); throw error; }
-  const video=new VideoDispatcher({canvas,muted:!audioEnabled,sources:media,onEvent:message=>worker?.postMessage(message)});
+  const video=new VideoDispatcher({canvas,muted:!audioEnabled,sources:media,language,log:onStatus,onEvent:message=>worker?.postMessage(message)});
   let worker;
   try { worker=new Worker(new URL('./worker.mjs',import.meta.url),{type:'module'}); }
   catch(error) { video.destroy();await audio.destroy(); throw error; }
@@ -195,7 +195,11 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
     listen(stage,'pointercancel',event=>{if(event.pointerType==='touch')touch.cancel(event.pointerId);});
     listen(stage,'contextmenu',event=>event.preventDefault());
     listen(document,'fullscreenchange',()=>{if(fullscreen())lock();else if(locked())document.exitPointerLock();});
-    for(const type of ['focus','blur'])listen(canvas,type,()=>input({type}));
+    // Moving between the canvas and cinematic controls stays inside the same
+    // emulated application. A canvas blur here makes Warcraft skip its movie.
+    const gameFocus=target=>target===canvas||video.ownsControl(target);
+    listen(stage,'focusin',event=>{if(gameFocus(event.target)&&!gameFocus(event.relatedTarget))input({type:'focus'});});
+    listen(stage,'focusout',event=>{if(gameFocus(event.target)&&!gameFocus(event.relatedTarget))input({type:'blur'});});
     canvas.focus();
     // Play requests fullscreen before the runtime loads; its change event may
     // already have fired.

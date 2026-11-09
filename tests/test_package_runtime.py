@@ -44,6 +44,8 @@ class CompatPackageTests(unittest.TestCase):
         for changes in ({"sources": [{"source": "shard_0000.c", "sha256": "d" * 64}]},
                         {"runtime_headers": {"runtime/cpu.h": "e" * 64}},
                         {"modules": [{"name": "game", "sha256": "f" * 64}]},
+                        {"memory": {"layout": "compact"}},
+                        {"configuration": {"version": "clang 23", "self_calls": 1}},
                         {"features": ["+atomics", "+tail-call"]},
                         {"sha256": "0" * 64}):
             with self.subTest(changes=list(changes)):

@@ -2,6 +2,8 @@ services:
   web:
     build: .
     init: true
+    environment:
+      WC3_ADMIN_PASSWORD_HASH: ${WC3_ADMIN_PASSWORD_HASH:-}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

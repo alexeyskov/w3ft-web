@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Package the real WASM reactor with diagnostic host; never declare it playable."""
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -8,7 +9,7 @@ import shutil
 ROOT = Path(__file__).resolve().parents[1]
 # What both builds must share: the compat build differs only in how tail jumps
 # are made (tools/build_runtime.py --variant compat).
-SHARED = ('modules', 'runtime_headers', 'strict_memory', 'link_flags')
+SHARED = ('modules', 'runtime_headers', 'strict_memory', 'link_flags', 'memory')
 
 
 def compat_build(target, build):
@@ -25,6 +26,7 @@ def compat_build(target, build):
     sources = lambda value: sorted((item['source'], item['sha256']) for item in value['sources'])
     if (compat.get('variant') != 'compat' or '+tail-call' in compat.get('features', ['+tail-call'])
             or any(compat.get(key) != build.get(key) for key in SHARED) or sources(compat) != sources(build)
+            or compat['configuration'].get('self_calls') != build['configuration'].get('self_calls')
             or compat['configuration']['version'] != build['configuration']['version']):
         raise SystemExit(f'wc3-compat.wasm was not built from the same code as wc3.wasm. {rebuild}')
     hasher = hashlib.sha256()
@@ -36,8 +38,8 @@ def compat_build(target, build):
     return wasm.name
 
 
-def main():
-    target = ROOT / 'var/runtime'
+def main(target=None):
+    target = target or ROOT / 'var/runtime'
     build = json.loads((target / 'build.json').read_text())
     with (target / 'wc3.wasm').open('rb') as wasm:
         magic = wasm.read(8)
@@ -61,4 +63,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--runtime-dir', type=Path, default=ROOT / 'var/runtime')
+    main(parser.parse_args().runtime_dir)

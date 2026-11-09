@@ -28,9 +28,34 @@ test('LAN presence carries its relay token and clears it when the game stops', t
   presence.start();
   presence.socket.open();
   assert.equal(presence.socket.url.href, 'wss://warcraft.example/api/presence');
-  assert.deepEqual(presence.socket.sent.at(-1), {playing:true, lan:true, presenceToken:'connection-one'});
+  assert.deepEqual(presence.socket.sent.at(-1), {playing:true, lan:true, presenceToken:'connection-one', control:1});
   presence.update({playing:false, lan:true, presenceToken:'connection-one'});
-  assert.deepEqual(presence.socket.sent.at(-1), {playing:false, lan:false, presenceToken:null});
+  assert.deepEqual(presence.socket.sent.at(-1), {playing:false, lan:false, presenceToken:null, control:1});
+});
+
+test('an administrator kick stops automatic and page-restoration reconnects', async t => {
+  const presence = counter(t).start(), socket = presence.socket;
+  let kicks = 0;
+  presence.addEventListener('kicked', () => kicks++);
+  socket.open();
+  socket.message({type:'kick'});
+  await Promise.resolve();
+  assert.equal(kicks, 1);
+  assert.equal(presence.kicked, true);
+  assert.equal(presence.socket, null);
+  assert.equal(presence.timer, null);
+  presence.start();
+  assert.equal(presence.socket, null, 'pageshow must not undo a kick');
+  socket.message({type:'kick'});
+  assert.equal(kicks, 1);
+});
+
+test('the reserved close code also stops reconnection if the kick message was lost', t => {
+  const presence = counter(t).start(), socket = presence.socket;
+  socket.open();
+  socket.onclose({code:4003});
+  assert.equal(presence.kicked, true);
+  assert.equal(presence.timer, null);
 });
 
 test('one change event exposes matching presence and lobby snapshots', t => {

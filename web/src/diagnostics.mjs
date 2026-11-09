@@ -206,6 +206,19 @@ export function stopGame() {
   if (session.controller) session.controller.finish();
   else session.preparing?.cancel();
 }
+
+// Unlike a user pressing Stop during import/download, an administrator's kick
+// must release the game view even if that asynchronous startup is still pending.
+// The runtime's normal stop path flushes saves and has a worker-stop timeout.
+export async function endSession() {
+  const item = session;
+  if (!item) return;
+  item.cancelled = true;
+  item.preparing?.cancel();
+  changed('stopping');
+  appendLog('Game session ended by administrator.');
+  await release(item);
+}
 // Closing or reloading the page is the player's own doing, not an interruption.
 window.addEventListener('pagehide', () => { persistLog(); if (session) running(session, false); });
 document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement) unlockKeyboard(); });

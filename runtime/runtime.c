@@ -39,7 +39,16 @@ _Static_assert(offsetof(Wc3Context, cpu) == 0, "Context must preserve CPU pointe
 static Wc3Context main_context = {.magic = CONTEXT_MAGIC, .dispatch_budget = 10000000};
 static _Thread_local Wc3Context *active_context;
 static _Thread_local char error_text[512]; /* Loader/broker or faults outside a guest call. */
-static _Atomic uint32_t heap_next = 0x30000000u;
+#ifndef WC3_HEAP_BASE
+#define WC3_HEAP_BASE 0x30000000u
+#endif
+#ifndef WC3_HEAP_LIMIT
+#define WC3_HEAP_LIMIT 0x50000000u
+#endif
+#ifndef WC3_MAIN_STACK_TOP
+#define WC3_MAIN_STACK_TOP 0x07fff000u
+#endif
+static _Atomic uint32_t heap_next = WC3_HEAP_BASE;
 static const uint32_t return_sentinel = 0xfffffffcu;
 typedef struct { uint32_t address; guest_fn_t fn; } Entry;
 static Entry *entries;
@@ -108,14 +117,14 @@ static guest_fn_t find_function(uint32_t address) {
 #endif
     return function;
 }
-static void record_dispatch(CPU *c, uint32_t address) {
+void wc3_record_dispatch(CPU *c, uint32_t address) {
     Wc3Context *context = context_for(c);
     context->last_address = address;
     context->trace[context->trace_index++ % 128] = address;
     if (++context->dispatches > context->dispatch_budget) wc3_cpu_fault(c, address, "Guest dispatch budget exhausted");
 }
 void dispatch_indirect(CPU *c, uint32_t address) {
-    record_dispatch(c, address);
+    wc3_record_dispatch(c, address);
     if (address == return_sentinel) { c->eip = address; return; }
     if (address >= 0xf1000000u && address < 0xf2000000u) {
         wc3_host_call((address - 0xf1000000u) / 16, c);
@@ -136,7 +145,7 @@ void wc3_tail_resume(CPU *c) {
 #endif
 void dispatch_tail(CPU *c) {
     uint32_t address = c->eip;
-    record_dispatch(c, address);
+    wc3_record_dispatch(c, address);
     if (address == return_sentinel) return;
     if (address >= 0xf1000000u && address < 0xf2000000u) {
         wc3_host_call((address - 0xf1000000u) / 16, c);
@@ -189,7 +198,7 @@ EXPORT(wc3_init) int wc3_init(uint32_t capacity) {
     qsort(entries, entry_count, sizeof(Entry), compare_entry);
     for (uint32_t i = 1; i < entry_count; ++i)
         if (entries[i-1].address == entries[i].address) { snprintf(error_text, sizeof(error_text), "Overlapping lifted module addresses"); return 0; }
-    uint32_t main_esp = capacity > 0x08000000u ? 0x07fff000u : capacity - 0x1000u;
+    uint32_t main_esp = capacity > WC3_MAIN_STACK_TOP + 0x1000u ? WC3_MAIN_STACK_TOP : capacity - 0x1000u;
     memset(g_mem + 0x00c00000, 0, 0x20000);
     if (!wc3_context_init(&main_context.cpu, 1, main_esp - 0x100000u, 0x101000u, 0x00c00000u)) return 0;
     main_context.cpu.esp = main_esp; /* Preserve the existing main-thread boot stack. */
@@ -199,6 +208,7 @@ EXPORT(wc3_init) int wc3_init(uint32_t capacity) {
 }
 
 EXPORT(wc3_memory_base) uintptr_t wc3_memory_base(void) { return (uintptr_t)g_mem; }
+EXPORT(wc3_memory_capacity) uint32_t wc3_memory_capacity(void) { return (uint32_t)g_mem_size; }
 EXPORT(wc3_cpu_pointer) uintptr_t wc3_cpu_pointer(void) { return (uintptr_t)&main_context.cpu; }
 EXPORT(wc3_permissions_pointer) uintptr_t wc3_permissions_pointer(void) { return (uintptr_t)g_page_access; }
 EXPORT(wc3_protect_guest) int wc3_protect_guest(uint32_t address, uint32_t size, int access) { return wc3_memory_protect(address, size, access); }
@@ -274,7 +284,7 @@ EXPORT(wc3_guest_alloc) uint32_t wc3_guest_alloc(uint32_t bytes) {
     if (!rounded) rounded = 16;
     uint32_t address = atomic_load_explicit(&heap_next, memory_order_relaxed);
     do {
-        if (address + rounded > 0x50000000u || address + rounded > g_mem_size) return 0;
+        if (address + rounded > WC3_HEAP_LIMIT || address + rounded > g_mem_size) return 0;
     } while (!atomic_compare_exchange_weak_explicit(&heap_next, &address, address + (uint32_t)rounded,
                                                    memory_order_relaxed, memory_order_relaxed));
     memset(g_mem + address, 0, (size_t)rounded);
@@ -283,6 +293,11 @@ EXPORT(wc3_guest_alloc) uint32_t wc3_guest_alloc(uint32_t bytes) {
 EXPORT(wc3_load) uint32_t wc3_load(const char *name, const uint8_t *bytes, uint32_t size) {
     Wc3Module *module = NULL;
     if (!wc3_pe_load(&loader, name, bytes, size, 0, &module, error_text, sizeof(error_text))) return 0;
+    return module->base;
+}
+EXPORT(wc3_load_at) uint32_t wc3_load_at(const char *name, const uint8_t *bytes, uint32_t size, uint32_t base) {
+    Wc3Module *module = NULL;
+    if (!wc3_pe_load(&loader, name, bytes, size, base, &module, error_text, sizeof(error_text))) return 0;
     return module->base;
 }
 EXPORT(wc3_module) uint32_t wc3_module(const char *name) {

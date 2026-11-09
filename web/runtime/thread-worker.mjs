@@ -57,6 +57,7 @@ export async function runThread(options, postFn = message => globalThis.postMess
     exports.__stack_pointer.value = nativeStackTop;
     exports.__wasm_init_tls(tlsBase);
     host.instance=instance;host.exports=exports;host.base=options.guestBase??0;host.permissionsBase=options.permissionsBase??0;
+    host.capacity=exports.wc3_memory_capacity?.()>>>0||host.capacity;
     host.started=options.processStarted??host.started;host.registerContext(cpu,threadId,options.threadState);
     if(options.localImports)local=localImportDispatcher(host,options.localImports,cpu);
     if(options.graphicsBatch)batch=new GraphicsCommandQueue(host,options.graphicsBatch,{post:postFn,framesInFlight:options.framesInFlight??1});

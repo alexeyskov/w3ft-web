@@ -46,10 +46,10 @@ lift-smoke:
 	$(PYTHON) tools/lift_wc3.py --image var/game/game.dll --output var/lift/game-smoke --max-functions 32
 
 lift-runtime:
-	$(PYTHON) tools/lift_wc3.py --image var/game/war3.exe --output var/lift-v2/war3 --max-functions 0
-	$(PYTHON) tools/lift_wc3.py --image var/game/game.dll --output var/lift-v2/game --max-functions 0
-	$(PYTHON) tools/lift_wc3.py --image var/game/Storm.dll --output var/lift-v2/storm --max-functions 0
-	$(PYTHON) tools/lift_wc3.py --image var/game/ijl15.dll --output var/lift-v2/ijl15 --max-functions 0
+	$(PYTHON) tools/lift_wc3.py --image var/game/war3.exe --output var/lift-compact/war3 --max-functions 0
+	$(PYTHON) tools/lift_wc3.py --image var/game/game.dll --output var/lift-compact/game --image-base 0x02000000 --max-functions 0
+	$(PYTHON) tools/lift_wc3.py --image var/game/Storm.dll --output var/lift-compact/storm --image-base 0x03000000 --max-functions 0
+	$(PYTHON) tools/lift_wc3.py --image var/game/ijl15.dll --output var/lift-compact/ijl15 --image-base 0x03100000 --max-functions 0
 
 # wc3.wasm, and wc3-compat.wasm for browsers without WebAssembly tail calls.
 runtime:

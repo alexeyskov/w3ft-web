@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Admin — w3ft-web</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="stylesheet" href="/styles/admin.css?v=2">
+<script type="module" src="/src/admin.mjs"></script>
+</head>
+<body>
+<main>
+  <header><h1 data-text="title">Управление сессиями</h1><nav><a href="/" data-text="site">На сайт</a><span class="admin-language-control"><select id="admin-language" aria-label="Language"><option value="ru">Русский</option><option value="en">English</option></select><svg viewBox="0 0 12 12" aria-hidden="true" focusable="false"><path d="M2 4l4 4 4-4"/></svg></span><button class="btn" id="logout" data-text="logout" hidden>Выйти</button></nav></header>
+  <p class="message" id="message" role="status" hidden></p>
+  <section class="panel login" id="login-panel" hidden>
+    <h2 data-text="loginTitle">Вход администратора</h2>
+    <form id="login-form"><label for="password" data-text="password">Пароль</label><input id="password" type="password" autocomplete="current-password" required minlength="16" maxlength="1024"><button class="btn" id="login-submit" data-text="login">Войти</button></form>
+  </section>
+  <section id="dashboard" hidden>
+    <div class="panel"><p id="counts" role="status"></p><div class="toolbar"><label><input id="playing-only" type="checkbox" checked> <span data-text="playingOnly">Только в игре</span></label><button class="btn" id="refresh" data-text="refresh">Обновить</button></div><p class="hint" data-text="explanation">«В игре» включает загрузку и меню. Отключение закрывает соединение на сервере; обновлённая вкладка также останавливает игру. После обновления страницы посетитель сможет войти снова.</p></div>
+    <div id="sessions" aria-live="polite"></div>
+  </section>
+</main>
+<dialog id="kick-dialog" aria-labelledby="kick-title"><h2 id="kick-title" data-text="confirmTitle">Завершить сессию?</h2><p id="kick-target"></p><p id="kick-hint" class="hint" data-text="confirmHint">Игра остановится, а подключение к лобби закроется. Текущий матч прервётся.</p><div class="toolbar"><button class="btn" id="kick-cancel" data-text="cancel">Отмена</button><button class="btn danger" id="kick-confirm" data-text="kick">Отключить</button></div></dialog>
+</body>
+</html>

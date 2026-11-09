@@ -59,6 +59,34 @@ def pe32_fixture():
 
 @unittest.skipUnless(HAVE_DEPS, "Install requirements.txt for lifter tests")
 class LifterTests(unittest.TestCase):
+    def test_rebase_applies_relocations_before_discovery_and_keeps_input_hash(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); image = root / "fixture.dll"
+            original = pe32_fixture(); image.write_bytes(original)
+            report = adapter.generate(image, root / "lift", max_functions=0, image_base=0x02000000)
+            self.assertEqual(report['image_base'], '0x02000000')
+            self.assertEqual(report['preferred_base'], '0x00400000')
+            self.assertEqual(report['image_size'], 0x4000)
+            self.assertEqual(report['sha256'], hashlib.sha256(original).hexdigest())
+            self.assertEqual(image.read_bytes(), original)
+            self.assertEqual(report['generated_functions'], 2)
+            code = (root / 'lift/shard_0000.c').read_text()
+            self.assertIn('sub_02001010', code)
+            self.assertNotIn('sub_00401010', code)
+            self.assertIn('0x8900acu', code)  # a numeric constant is not a pointer relocation
+
+    def test_rebase_refuses_missing_or_unsupported_relocations(self):
+        for kind in ('stripped', 'missing', 'unsupported'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp); image = root / 'fixture.dll'; data = pe32_fixture()
+                if kind == 'stripped': struct.pack_into('<H', data, 0x96, 0x103)
+                elif kind == 'missing': struct.pack_into('<II', data, 0x98 + 96 + 5 * 8, 0, 0)
+                else: struct.pack_into('<H', data, 0x608, 0xa000)
+                image.write_bytes(data)
+                with self.assertRaisesRegex(ValueError, '[Rr]elocat'):
+                    adapter.generate(image, root / 'lift', image_base=0x02000000)
+
     def test_nfs_settings_cannot_leak_into_target(self):
         with patch.dict(os.environ, {"FTOL2INL": "1", "LREGS": "1", "FLAGABI": "/missing", "INLINE_LIST": "/missing"}):
             with adapter.isolated_lifter() as lifter:

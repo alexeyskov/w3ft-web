@@ -113,6 +113,11 @@ class Relay:
         socket = self.presence_tokens.get(token)
         return socket is not None and socket.prepared and not socket.closed
 
+    async def disconnect_presence(self, token):
+        socket = self.presence_tokens.get(token)
+        if socket is not None:
+            await socket.close(code=4003, message=b"Session ended by administrator")
+
     def lobby_info(self, key, room):
         info = {"id": key, "name": room.name, "players": len(room.peers), "maxPlayers": room.capacity}
         if room.shared:

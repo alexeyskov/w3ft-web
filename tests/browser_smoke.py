@@ -260,6 +260,73 @@ async def fixture_runtime(page, body, compat=False):
     await page.route('**/runtime/notice-fixture.mjs', lambda route: route.fulfill(content_type='text/javascript', body=body))
 
 
+async def check_user_agreement(browser, base):
+    context = await browser.new_context(locale='ru-RU', viewport={'width': 1440, 'height': 1000})
+    try:
+        page = await context.new_page()
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        await fixture_runtime(page, 'export async function runDiagnostics(){throw new Error("Agreement must not launch the game")}')
+        await page.goto(base)
+        await wait_for(page, '!document.getElementById("launch").disabled')
+        await page.evaluate('''() => {
+          window.agreementLaunches=0;
+          document.getElementById('launch').addEventListener('click', event => {
+            window.agreementLaunches++; event.preventDefault(); event.stopImmediatePropagation();
+          }, true);
+        }''')
+        base_url = page.url
+        output = Path('var/qa')
+        output.mkdir(parents=True, exist_ok=True)
+        for language, title, date, final_heading in (
+            ('ru', 'Пользовательское соглашение', '9 ноября 2026 года', '9. Применимое законодательство'),
+            ('en', 'User Agreement', 'November 9, 2026', '9. Governing Law'),
+        ):
+            await page.locator('#language').select_option(language)
+            notice = page.locator('.agreement-notice')
+            assert await notice.is_visible()
+            assert await notice.locator('a').count() == 1
+            await page.locator('#agreement-open').click()
+            assert page.url == base_url, 'Agreement link navigated away from the launcher'
+            assert await page.locator('#user-agreement').is_visible()
+            assert await page.locator('#agreement-title').inner_text() == title
+            assert await page.locator('#user-agreement time').inner_text() == date
+            article = page.locator(f'[data-agreement-language="{language}"]')
+            assert await article.is_visible() and await article.locator('h4').count() == 9
+            assert await page.locator('[data-agreement-language]:visible').count() == 1
+            await page.locator('#agreement-body').focus()
+            await page.keyboard.press('Enter')
+            assert await page.evaluate('window.agreementLaunches') == 0
+            for width in (1440, 390, 320):
+                await page.set_viewport_size({'width': width, 'height': 844})
+                await page.evaluate('document.getElementById("agreement-body").scrollTop=0')
+                assert await page.evaluate('''() => {
+                  const modal=document.getElementById('user-agreement');
+                  const body=document.getElementById('agreement-body');
+                  const rect=modal.getBoundingClientRect();
+                  return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight
+                    && body.scrollWidth<=body.clientWidth && body.scrollHeight>body.clientHeight;
+                }'''), f'Agreement overflow at {width}px'
+                await page.screenshot(path=str(output / f'agreement-{language}-{width}.png'), full_page=True)
+                await article.locator('h4').last.scroll_into_view_if_needed()
+                assert await article.locator('h4').last.inner_text() == final_heading
+                assert await page.locator('#agreement-close').is_visible(), 'Close button scrolled out of view'
+            await page.keyboard.press('Escape')
+            assert await page.locator('#user-agreement').is_hidden()
+            await wait_for(page, 'document.getElementById("agreement-open") === document.activeElement')
+            await page.locator('#agreement-open').click()
+            assert await page.locator('#agreement-body').evaluate('node => node.scrollTop') == 0
+            await page.locator('#agreement-close').click()
+            assert await page.locator('#user-agreement').is_hidden()
+        await page.locator('#status').evaluate('node => {node.tabIndex=0;node.focus()}')
+        await page.keyboard.press('Enter')
+        assert await page.evaluate('window.agreementLaunches') == 1, 'Closing the agreement broke the launch shortcut'
+        assert not errors, errors
+    finally:
+        await context.close()
+    print('User agreement: RU/EN, effective date, modal navigation, mobile scrolling and Enter isolation passed')
+
+
 async def check_launch_notices(browser, base):
     # A screenshot from the game becomes a download; a running game is marked so
     # that a page the browser reloads mid-game (out of memory) says so once.
@@ -314,21 +381,24 @@ async def check_launch_notices(browser, base):
     for each in (page, other):  # no route handler may outlive the context
         await each.unroute_all(behavior='ignoreErrors')
     await context.close()
-    # iPhone (Chrome there is WebKit too): the page says so before Play.
+    # iPhone gets no experimental-support warning; an actual interrupted launch
+    # still gets the same one-time notice as on other devices.
     context = await browser.new_context(viewport={'width': 844, 'height': 390}, is_mobile=True, has_touch=True, locale='ru-RU',
         user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 26_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/157.0.8103.37 Mobile/15E148 Safari/604.1')
     page = await context.new_page()
     page.on('pageerror', lambda error: errors.append(str(error)))
     await page.goto(base)
+    await wait_for(page, '!document.getElementById("launch").disabled')
+    assert await page.locator('#device-warning').is_hidden()
+    assert await page.locator('#launch-message').is_hidden()
     await page.evaluate("localStorage.setItem('wc3-game-running', new Date().toISOString())")
     await page.reload()
-    await wait_for(page, '!document.getElementById("device-warning").hidden')
-    assert 'iPhone' in await page.locator('#device-warning').inner_text()
-    await page.wait_for_timeout(300)
-    assert await page.locator('#launch-message').is_hidden(), 'On iPhone the device warning explains the reload'
+    await wait_for(page, '!document.getElementById("launch-message").hidden')
+    assert await page.locator('#device-warning').is_hidden()
+    assert 'Прошлый запуск прервался' in await page.locator('#launch-message').inner_text()
     await context.close()
     assert not errors, errors
-    print('Launch notices: screenshot download, interrupted launch, other tab, iPhone warning passed')
+    print('Launch notices: screenshot download, interrupted launch, other tab, iPhone without warning passed')
 
 
 async def check_outdated_browser(browser, base):
@@ -772,6 +842,7 @@ async def main(base):
             await check_live_lobby_counts(browser, base)
             await check_launch_and_lobby(browser, base)
             await check_default_language(browser, base)
+            await check_user_agreement(browser, base)
             await check_touch_controls(browser, base)
             await check_loading_screen(browser, base)
             await check_launch_notices(browser, base)

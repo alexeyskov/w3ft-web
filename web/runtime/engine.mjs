@@ -9,25 +9,33 @@ export async function createRuntime({wasm, images, profile, log = () => {}, ...o
     expected.delete(image.name.toLowerCase());
   }
   if (expected.size) throw new GuestFault(`Missing modules: ${[...expected.keys()].join(', ')}`);
-  const memory = options.memory || new WebAssembly.Memory({initial: 1024, maximum: 65536, shared: true});
+  const memory = options.memory || new WebAssembly.Memory({initial: profile.memory?.initial_pages ?? 1024,
+    maximum: profile.memory?.maximum_pages ?? 65536, shared: true});
   const host = new WarcraftHost({...options, memory, log});
   const result = await WebAssembly.instantiate(wasm, host.imports());
   const instance = result.instance || result;
   host.instance = instance; host.exports = instance.exports;
   instance.exports._initialize?.();
   log('WebAssembly instance ready');
-  if (!instance.exports.wc3_init(0x78000000)) throw new GuestFault(host.nativeString(instance.exports.wc3_error_pointer()));
+  const capacity = profile.memory?.guest_capacity ?? 0x78000000;
+  log(`Allocating guest address space (${profile.memory?.layout || 'legacy'})`);
+  if (!instance.exports.wc3_init(capacity)) throw new GuestFault(host.nativeString(instance.exports.wc3_error_pointer()));
   log(`Guest address space ready: ${(memory.buffer.byteLength / 1048576).toFixed(0)} MB`);
   host.attach(instance);
   const modules = [];
   for (const image of images) {
+    const target = profile.modules.find(module => module.image.toLowerCase() === image.name.toLowerCase());
+    const loadBase = target?.image_base === undefined ? 0 : Number(target.image_base);
+    if (!Number.isInteger(loadBase) || loadBase < 0 || loadBase > 0x7fffffff) throw new GuestFault('Invalid module load address', {name:image.name, loadBase});
     const size = image.bytes.byteLength, p = instance.exports.malloc(size) >>> 0;
     if (!p) throw new GuestFault('Cannot allocate module input', {name: image.name, size});
     host.bytes.set(image.bytes, p);
     let base;
-    try { base = host.withNativeString(image.name, name => instance.exports.wc3_load(name, p, size) >>> 0); }
+    try { base = host.withNativeString(image.name, name => (instance.exports.wc3_load_at
+      ? instance.exports.wc3_load_at(name, p, size, loadBase) : instance.exports.wc3_load(name, p, size)) >>> 0); }
     finally { instance.exports.free(p); }
     if (!base) throw new GuestFault(`PE load ${image.name}: ${host.nativeString(instance.exports.wc3_error_pointer())}`);
+    if (loadBase && base !== loadBase) throw new GuestFault('Runtime loaded a different image base than the static build; rebuild and deploy the runtime together', {name:image.name, expected:loadBase, actual:base});
     host.moduleNames.set(base, image.name);
     modules.push({name: image.name, base, size});
     log(`Mapped ${image.name} at 0x${base.toString(16)}`);
@@ -73,6 +81,7 @@ export async function createRuntime({wasm, images, profile, log = () => {}, ...o
       });
       const registers=host.lastFaultRegisters||Object.fromEntries(['eax','ecx','edx','ebx','esp','ebp','esi','edi','eip'].map((name,i)=>[name,'0x'+host.view.getUint32(cpu+i*4,true).toString(16).padStart(8,'0')]));
       return {schemaVersion: 1, stage:exited?'guest-exited':stage, modules, wasmExecuted: true,
+        memory:{layout:profile.memory?.layout || 'legacy', guestCapacity:capacity, wasmBytes:memory.buffer.byteLength},
         guestReturned: stage === 'guest-returned', gameplayVerified: false, profileVerified: true,
         ...(exited?{exitCode:error.code>>>0}:{}),
         error: error&&!(exited&&error.code===0) ? {type:error.name,message:error.message,details:error.details||null} : null,

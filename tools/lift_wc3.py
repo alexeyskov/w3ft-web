@@ -312,7 +312,7 @@ def target_lifter(vendor):
 
 def generate(image: Path, output: Path, max_functions: int = 128,
              functions_per_shard: int = 64, comments: bool = True, module_name: str | None = None,
-             scan_data_pointers: str = "auto", scan_code_pointers: str = "auto"):
+             scan_data_pointers: str = "auto", scan_code_pointers: str = "auto", image_base: int | None = None):
     import pefile
 
     try:
@@ -321,6 +321,23 @@ def generate(image: Path, output: Path, max_functions: int = 128,
         raise ValueError(f"Invalid PE image: {exc}") from exc
     if pe.FILE_HEADER.Machine != 0x14C or pe.OPTIONAL_HEADER.Magic != 0x10B:
         raise ValueError("Expected an x86 PE32 executable or DLL")
+    preferred_base = pe.OPTIONAL_HEADER.ImageBase
+    if image_base is not None and image_base != preferred_base:
+        if image_base < 0x10000 or image_base & 0xffff or image_base + pe.OPTIONAL_HEADER.SizeOfImage > 0x80000000:
+            raise ValueError("Image base must be 64 KiB aligned and fit in Win32 user memory")
+        relocations = getattr(pe, 'DIRECTORY_ENTRY_BASERELOC', [])
+        if pe.FILE_HEADER.Characteristics & 1 or not relocations:
+            raise ValueError("Cannot rebase an image without usable base relocations")
+        for block in relocations:
+            for entry in block.entries:
+                if entry.type not in (0, 3):
+                    raise ValueError(f"Unsupported PE32 relocation type {entry.type}")
+                if entry.type == 3 and (entry.rva + 4 > pe.OPTIONAL_HEADER.SizeOfImage or len(pe.get_data(entry.rva, 4)) != 4):
+                    raise ValueError("Relocation target is outside the backed image")
+        # Relocate the in-memory PE before reading code, callback pointers and
+        # jump tables. The on-disk input and its recorded SHA-256 stay original.
+        # The runtime applies the same HIGHLOW relocations when loading it.
+        pe.relocate_image(image_base)
     sections = executable_sections(pe)
     if scan_data_pointers not in ("auto", "always", "never"):
         raise ValueError("scan-data-pointers must be auto, always or never")
@@ -460,6 +477,7 @@ def generate(image: Path, output: Path, max_functions: int = 128,
     summary = {
         "schema": 2, "image": image.name, "module": module_name, "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
         "image_base": f"0x{base:08x}", "entrypoint": f"0x{base + pe.OPTIONAL_HEADER.AddressOfEntryPoint:08x}",
+        "preferred_base": f"0x{preferred_base:08x}", "image_size": pe.OPTIONAL_HEADER.SizeOfImage,
         "upstream": json.loads((VENDOR / "provenance.json").read_text()),
         "profile": {"nfs_operand_patches": False, "nfs_retpast_addresses": False,
                     "nfs_inline_addresses": False, "nfs_hooks": False, "environment": LIFT_ENV},
@@ -512,6 +530,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, required=True, help="war3.exe or game.dll (x86 PE32)")
     parser.add_argument("--output", type=Path, required=True, help="New or empty output directory")
+    parser.add_argument("--image-base", type=lambda value: int(value, 0),
+                        help="Relocate the PE before translating (e.g. 0x02000000); input file is not modified")
     parser.add_argument("--max-functions", type=int, default=128, help="Bounded analysis; 0 means unlimited")
     parser.add_argument("--functions-per-shard", type=int, default=64)
     parser.add_argument("--no-comments", action="store_true")
@@ -527,7 +547,7 @@ def main():
     try:
         report = generate(args.image.resolve(), args.output.resolve(), args.max_functions,
                           args.functions_per_shard, not args.no_comments, args.module,
-                          args.scan_data_pointers, args.scan_code_pointers)
+                          args.scan_data_pointers, args.scan_code_pointers, args.image_base)
     except (OSError, ValueError, ImportError) as exc:
         parser.exit(2, f"lift_wc3: {exc}\n")
     print(json.dumps({key: report[key] for key in (

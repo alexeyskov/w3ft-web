@@ -18,6 +18,7 @@ export class GuestThreadExit extends Error {
 export class WarcraftHost {
   constructor({memory, readFile, readFileLater = null, fileSize, listFiles = () => [], log = () => {}, graphics = null, audio = null, video = null, network = null, clock = () => performance.now(), commandLine = 'war3.exe -opengl -window',tlsSlots,resolution,graphicsSettings,allowLocalFiles=false} = {}) {
     this.memory = memory;
+    this.capacity = 0x78000000;
     this.readFile = readFile;
     this.readFileLater = readFileLater; this.importMayWait = false;
     this.fileSize = fileSize;
@@ -40,6 +41,7 @@ export class WarcraftHost {
   attach(instance) {
     this.instance = instance; this.exports = instance.exports;
     this.base = this.exports.wc3_memory_base() >>> 0;
+    this.capacity = this.exports.wc3_memory_capacity?.() >>> 0 || this.capacity;
     this.permissionsBase = this.exports.wc3_permissions_pointer?.() >>> 0;
     if(this.exports.wc3_cpu_pointer)this.registerContext(this.exports.wc3_cpu_pointer(),1);
     this.commandPointer = this.string(this.commandLine);
@@ -80,7 +82,7 @@ export class WarcraftHost {
   // After check() the cached _view/_bytes cover the whole returned range.
   check(address, length = 1) {
     address >>>= 0;
-    if (!Number.isSafeInteger(length) || length < 0 || address + length > 0x78000000) throw new GuestFault('Guest memory access outside address space', {address, length});
+    if (!Number.isSafeInteger(length) || length < 0 || address + length > this.capacity) throw new GuestFault('Guest memory access outside address space', {address, length});
     const end = this.base + address + length;
     if (end > this._length) {
       const buffer = this.memory.buffer; if (buffer !== this._buffer) this._attach(buffer);

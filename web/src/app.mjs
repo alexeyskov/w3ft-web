@@ -1,23 +1,26 @@
 import {SaveStore} from './storage.mjs';
 import {FrameTransport} from './transport.mjs';
 import {PresenceCounter} from './presence.mjs';
-import {openGame, gameRunning, stopGame, toggleFullscreen, gameLog, appendLog, interruptedLaunch} from './diagnostics.mjs';
+import {openGame, gameRunning, stopGame, endSession, toggleFullscreen, gameLog, appendLog, interruptedLaunch} from './diagnostics.mjs';
 
 const $ = id => document.getElementById(id);
 $('help-discord').href = $('discord').href;
 const store = new SaveStore();
 const english = {
-  fan:'Fan project. Not affiliated with Blizzard Entertainment.', changelog:'Changelog', play:'Play', downloadLog:'Download log', creditsLicenses:'Credits & licenses',
+  fan:'Technical demonstration. Not affiliated with Blizzard Entertainment.', changelog:'Changelog', play:'Play', downloadLog:'Download log', creditsLicenses:'Credits & licenses',
   about:'About', credits:'Credits',
-  aboutLead:'The original Warcraft III: The Frozen Throne in your browser. The game code is recompiled to WebAssembly, with graphics through WebGL 2 and sound through Web Audio.',
-  aboutPlay:'Choose campaigns, battles and maps inside the game. Saves stay in your browser, and LAN lobbies let you play with friends.',
-  aboutEditions:'The Russian and English editions of Warcraft are supported. The game follows the selected site language.',
+  agreementConsent:'By clicking Play or Launch, you agree to the', agreementLink:'User Agreement', agreementTitle:'User Agreement',
+  agreementDateLabel:'Effective date:', agreementDate:'November 9, 2026', agreementEnd:'End of Agreement',
+  aboutLead:'The Frozen Throne Reborn demonstrates the capabilities of an x86-to-WebAssembly static recompiler using Warcraft III: The Frozen Throne.',
+  aboutPlay:'The demonstration runs recompiled code in the browser, with graphics through WebGL 2, audio through Web Audio, and networking through a virtual LAN.',
+  aboutEditions:'Russian and English editions of Warcraft are supported for the demonstration. Preparing and running your own build requires files from your own licensed copy of the game.',
   aboutHelp:'Questions and bug reports:', aboutHelpOr:'or', aboutRightsHolders:'Rights holders:',
   creditsSource:'Source code on', creditsAdapted:'The launcher layout, static recompilation tools and CPU helpers are adapted from', creditsBased:'which builds on', creditsAuthor:'by Talha Müderrisoğlu',
   creditsPinned:'The imported files come from the pinned', creditsMitVersion:'MIT-licensed version', creditsMpq:'MPQ format reference:', creditsGeo:'IP Geolocation by',
   creditsLicense:'MIT license', creditsNotices:'Third-party credits and notices',
   creditsWarcraft:'Warcraft III: The Frozen Throne and Blizzard Entertainment are trademarks of Blizzard Entertainment, Inc. Game content remains the property of its respective rights holders.',
   logHint:"After reloading, your last game's log is still available.", inGame:'In the game', menuHint:'Campaigns, battles and maps are selected in Warcraft itself.', mapHint:'Server maps appear directly in the game\'s map list.',
+  preloadHint:'To reduce in-game stuttering, we recommend preloading all game data: Game → Preload the rest.',
   saves:'Saves', online:'Online', game:'Game', controls:'Controls', profiles:'Profiles and saves', backup:'Download backup', restore:'Restore',
   saveHint:'Saves stay in this browser. Download a backup to move them to another device.', lobbies:'LAN lobbies', refresh:'Refresh',
   lanHint:'Play without a chosen lobby puts you in the first public lobby of your language with a free seat (up to 200 players). You can join any lobby, players with different game languages play together, or create your own. In Warcraft, open Local Area Network: one player hosts a match, the others join.',
@@ -58,8 +61,8 @@ const messages = {
   gameDataFailed:['Загрузка прервалась: {message}','Download failed: {message}'], settingsReset:['Настройки сброшены.','Settings reset.'],
   bytesMB:['МБ','MB'], bytesGB:['ГБ','GB'],
   gameLanguageMissing:['Английские файлы игры на сервере не установлены, игра запустится на русском.','English game files are not installed on this server; the game starts in Russian.'],
-  appleUnsupported:['На iPhone и iPad игра пока не запускается: все браузеры там работают на движке Safari, и он перезагружает страницу, когда игре не хватает памяти. Играйте на компьютере или на Android.','Warcraft does not run on iPhone and iPad yet: every browser there uses Safari\'s engine, which reloads the page when the game runs out of memory. Play on a computer or Android.'],
   interrupted:['Прошлый запуск прервался: браузер перезагрузил страницу во время игры. Обычно так бывает, когда устройству не хватает памяти.','The last launch was cut short: the browser reloaded the page during the game. This usually means the device ran out of memory.'],
+  kicked:['Сессия завершена администратором. Чтобы войти снова, обновите страницу.','Your session was ended by the administrator. Reload the page to join again.'],
   autoLobbyFailed:['Не удалось войти в общее лобби — игра запущена без сети.','Could not join a public lobby; the game started without network.'], exitFullscreen:['Выйти из полного экрана','Exit fullscreen'], downloadingGame:['Загрузка файлов игры','Downloading game files'], downloadAmount:['{done} из {total} МБ · {percent}%','{done} of {total} MB · {percent}%'], touchKeyboard:['Клавиатура','Keyboard'],
 };
 // Warcraft's own Video options: [minimum, maximum, launcher default]. game.dll
@@ -139,7 +142,7 @@ function available() { return !!(server?.game.prepared && server?.runtime.instal
 function updateState() {
   const active = gameRunning();
   document.body.dataset.phase = phase;
-  $('launch').disabled = !available() || active || lobbyBusy || saving || gameDataBusy;
+  $('launch').disabled = presence.kicked || !available() || active || lobbyBusy || saving || gameDataBusy;
   $('status').textContent = t(phase);
   $('status-sub').textContent = t(phase === 'ready' ? 'readyHint' : phase === 'loading' ? active ? 'starting' : 'checking' : `${phase}Hint`);
   if (!active && server && !available()) {
@@ -147,6 +150,7 @@ function updateState() {
     $('status-sub').textContent = t(!server.game.prepared ? 'filesMissing' : !server.runtime.installed || !server.runtime.diagnostics ? 'runtimeMissing' : !shared || !webgl ? 'browserUnsupported' : 'browserOutdated');
   }
   if (startupError) notice('launch-message', startupError);
+  if (presence.kicked) notice('launch-message', t('kicked'));
   for (const id of ['resolution','audio-enabled','fullscreen-enabled']) $(id).disabled = active;
   for (const name of Object.keys(GRAPHICS)) graphicsInput(name).disabled = active;
   for (const input of document.querySelectorAll('input[name=fps]')) input.disabled = active;
@@ -156,8 +160,8 @@ function updateState() {
   $('export-saves').disabled = active || saving;
   $('import-saves').disabled = active || saving;
   $('import-saves').parentElement.setAttribute('aria-disabled', String(active || saving));
-  for (const id of ['create-lobby','lobby-name','join-code','room-code','leave-lobby']) $(id).disabled = active || lobbyBusy || !server?.transport.available;
-  for (const button of $('lobby-list').querySelectorAll('button')) button.disabled = active || lobbyBusy || button.dataset.unavailable === 'true';
+  for (const id of ['create-lobby','lobby-name','join-code','room-code','leave-lobby']) $(id).disabled = presence.kicked || active || lobbyBusy || !server?.transport.available;
+  for (const button of $('lobby-list').querySelectorAll('button')) button.disabled = presence.kicked || active || lobbyBusy || button.dataset.unavailable === 'true';
   updateFullscreen();
 }
 function renderPresence() {
@@ -171,15 +175,12 @@ function renderGameLanguage() {
   const missing = !!server && gameLanguage() !== language;
   $('game-language-missing').hidden = !missing; if (missing) $('game-language-missing').textContent = t('gameLanguageMissing');
 }
-// iPhone and iPad, also iPadOS asking for desktop pages: every browser there is
-// WebKit, which closes the page when the game outgrows its memory
-// (docs/port-status.md). A launch cut short elsewhere is reported after reload.
-const appleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 let interruptedNotice = false;
 function renderNotices() {
-  const warning = appleMobile ? 'appleUnsupported' : compatBuild() ? 'compatBuild' : '';
+  const warning = compatBuild() ? 'compatBuild' : '';
   $('device-warning').hidden = !warning; if (warning) $('device-warning').textContent = t(warning);
-  if (interruptedNotice && !startupError) notice('launch-message', t('interrupted'));
+  if (presence.kicked) notice('launch-message', t('kicked'));
+  else if (interruptedNotice && !startupError) notice('launch-message', t('interrupted'));
 }
 function updateFullscreen() {
   $('diagnostic-fullscreen').disabled = !document.fullscreenEnabled;
@@ -190,6 +191,7 @@ function translate() {
   for (const node of document.querySelectorAll('[data-i18n]')) node.textContent = t(node.dataset.i18n);
   for (const node of document.querySelectorAll('[data-info-label]')) node.setAttribute('aria-label', t('about'));
   for (const node of document.querySelectorAll('[data-i18n-label]')) node.setAttribute('aria-label', t(node.dataset.i18nLabel));
+  for (const node of document.querySelectorAll('[data-agreement-language]')) node.hidden = node.dataset.agreementLanguage !== language;
   $('lobby-name').placeholder = t('lobbyName'); $('room-code').placeholder = t('roomCode');
   $('import-saves').setAttribute('aria-label', t('restore'));
   $('language').setAttribute('aria-label', language === 'en' ? 'Page language' : 'Язык страницы');
@@ -278,7 +280,7 @@ function lobbyRow(lobby) {
   const joined = room?.room === lobby.id, full = lobby.players >= lobby.maxPlayers;
   const button = element('button', t(joined ? 'joined' : full ? 'full' : 'join'), 'btn');
   button.dataset.unavailable = String(joined || full);
-  button.disabled = joined || full || lobbyBusy || gameRunning();
+  button.disabled = presence.kicked || joined || full || lobbyBusy || gameRunning();
   button.onclick = () => void joinLobby(lobby.id, true);
   row.append(info, button); return row;
 }
@@ -300,6 +302,7 @@ async function refreshLobbies() {
   finally { if (request === lobbyRequest) $('refresh-lobbies').disabled = false; }
 }
 function setRoom(transport) {
+  if (presence.kicked && transport) { transport.close(); return; }
   const old = room; room = transport; old?.close();
   if (transport) {
     transport.addEventListener('peers', () => { if (room === transport) renderRoom(); });
@@ -336,7 +339,7 @@ async function joinSharedLobby() {
   }
 }
 async function joinLobby(id, publicLobby) {
-  if (lobbyBusy || gameRunning()) return;
+  if (presence.kicked || lobbyBusy || gameRunning()) return;
   lobbyBusy = true; notice('lobby-status'); updateState();
   try { await connectLobby(id, publicLobby); await refreshLobbies(); }
   catch (error) { notice('lobby-status', error.message); }
@@ -346,6 +349,13 @@ async function joinLobby(id, publicLobby) {
 $('language').onchange = () => { language = $('language').value; try { localStorage.setItem('wc3-language', language); } catch {} translate(); void refreshGameData(); };
 $('changelog-open').onclick = () => $('changelog').showModal();
 $('changelog-close').onclick = () => $('changelog').close();
+$('agreement-open').onclick = event => {
+  event.preventDefault();
+  $('user-agreement').showModal();
+  $('agreement-body').scrollTop = 0;
+};
+$('agreement-close').onclick = () => $('user-agreement').close();
+$('user-agreement').addEventListener('close', () => $('agreement-open').focus({preventScroll:true}));
 for (const tab of document.querySelectorAll('[data-tab]')) {
   tab.onclick = () => showTab(tab.dataset.tab);
   tab.onkeydown = event => {
@@ -440,7 +450,7 @@ function renderGameData() {
 }
 $('preload-game-data').onclick = async () => {
   if (preload) { preload.cancel(); return; }
-  if (gameRunning() || gameDataBusy) return;
+  if (presence.kicked || gameRunning() || gameDataBusy) return;
   notice('game-data-status');
   try {
     const job = (await runtime()).preloadGameData({language:gameLanguage(), onProgress:progress => { if (preload) { preload.done = progress.done; preload.total = progress.total; renderGameData(); } }});
@@ -474,7 +484,7 @@ $('stop-diagnostic').onclick = stopGame;
 $('diagnostic-fullscreen').onclick = () => toggleFullscreen().catch(error => appendLog(`Fullscreen: ${error.message}`));
 window.addEventListener('fullscreenchange', updateFullscreen);
 window.addEventListener('keydown', event => {
-  if (event.defaultPrevented || event.key !== 'Enter' || event.repeat || gameRunning() || $('changelog').open || event.target.closest('input,select,textarea,button,a,summary,canvas')) return;
+  if (event.defaultPrevented || event.key !== 'Enter' || event.repeat || gameRunning() || document.querySelector('dialog[open]') || event.target.closest('input,select,textarea,button,a,summary,canvas')) return;
   event.preventDefault(); $('launch').click();
 });
 window.addEventListener('warcraft-session-state', event => {
@@ -501,7 +511,7 @@ $('import-saves').onchange = async event => {
   finally { event.target.value = ''; saving = false; updateState(); }
 };
 $('create-lobby-form').onsubmit = async event => {
-  event.preventDefault(); if (lobbyBusy || gameRunning()) return;
+  event.preventDefault(); if (presence.kicked || lobbyBusy || gameRunning()) return;
   lobbyBusy = true; notice('lobby-status'); updateState();
   const controller = lobbyCreation = new AbortController();
   try {
@@ -527,11 +537,18 @@ presence.addEventListener('change', () => {
     updateLobbies(presence.lobbies);
   }
 });
+presence.addEventListener('kicked', () => {
+  lobbyCreation?.abort(); pendingRoom?.close(); setRoom(null);
+  preload?.cancel();
+  appendLog('Disconnected by administrator; automatic reconnection disabled.');
+  void endSession().catch(error => appendLog(error.message)).finally(updateState);
+  updateState();
+});
 presence.start();
 language = chosenLanguage ?? await languageSuggestion;
 translate();
 document.documentElement.removeAttribute('data-pending-language');
-void interruptedLaunch.then(value => { interruptedNotice = value && !appleMobile && !gameRunning(); renderNotices(); });
+void interruptedLaunch.then(value => { interruptedNotice = value && !gameRunning(); renderNotices(); });
 void updateSaves();
 try {
   server = await json('/api/status'); phase = 'ready'; renderGameLanguage(); renderNotices(); updateState(); void refreshGameData();

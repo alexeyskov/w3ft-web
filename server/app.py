@@ -18,11 +18,13 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from .admin import Admin
 from .compression import GzipCache, accepts_gzip, compressible
 from .geoip import GeoLanguage
 from .maps import MapCatalog
 from .presence import Presence
 from .relay import Relay
+from .sessions import SessionReport, default_report_path
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = web.AppKey("state", dict)
@@ -376,24 +378,30 @@ async def headers(request, response):
 
 
 def create_app(*, game_dir=None, maps_dir=None, runtime_dir=None, report_path=None, web_dir=None,
-               locales_dir=None, base_language="ru", geoip_path=None):
+               locales_dir=None, base_language="ru", geoip_path=None, presence_report=None, admin_password_hash=None):
     app = web.Application(client_max_size=1024 * 1024)
     game = Path(game_dir or ROOT / "var/game").absolute()
     runtime = Path(runtime_dir or ROOT / "var/runtime").absolute()
     relay = Relay()
-    presence = Presence(relay=relay)
+    admin_password_hash = os.environ.get("WC3_ADMIN_PASSWORD_HASH", "") if admin_password_hash is None else admin_password_hash
+    presence = Presence(relay=relay, track_clients=presence_report is not None or bool(admin_password_hash),
+                        legacy_kick_guard=bool(admin_password_hash))
+    admin = Admin(presence, admin_password_hash, web_dir or ROOT / "web")
     relay.on_change = presence.changed
     geo = GeoLanguage(geoip_path or ROOT / "var/geoip/dbip-country-lite.csv.gz")
     app[STATE] = {"game": game, "maps": MapCatalog(maps_dir or default_maps_dir()),
                   "runtime": runtime, "report": Path(report_path or ROOT / "var/reports/game.json"),
-                  "relay": relay, "presence": presence, "geo": geo, "gzip": GzipCache(), "asset_files": MapCatalog(game),
+                  "relay": relay, "presence": presence, "admin": admin, "geo": geo, "gzip": GzipCache(), "asset_files": MapCatalog(game),
                   "locales": Path(locales_dir or ROOT / "var/locales").absolute(), "base_language": base_language,
                   "runtime_files": MapCatalog(runtime), "web_files": MapCatalog(web_dir or ROOT / "web")}
     app.on_response_prepare.append(headers)
     app.cleanup_ctx.append(geo.watch)
     app.cleanup_ctx.append(compress_runtime)
+    if presence_report is not None:
+        app.cleanup_ctx.append(SessionReport(presence, presence_report).watch)
     app.on_shutdown.append(relay.shutdown)
     app.on_shutdown.append(presence.shutdown)
+    admin.install(app)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/maps", maps)
     app.router.add_get("/api/maps/{id}/download", download_map)
@@ -422,11 +430,16 @@ def main():
     parser.add_argument("--base-language", default="ru", help="Language of the base installation")
     parser.add_argument("--geoip", type=Path, default=ROOT / "var/geoip/dbip-country-lite.csv.gz",
                         help="DB-IP country database from tools/fetch_geoip.py: default page language")
+    reports = parser.add_mutually_exclusive_group()
+    reports.add_argument("--presence-report", type=Path,
+                         help="Private live session report (default: temporary directory, w3ft-presence-PORT.json)")
+    reports.add_argument("--no-presence-report", action="store_true", help="Disable private connection diagnostics")
     args = parser.parse_args()
     web.run_app(create_app(game_dir=args.game_dir, maps_dir=args.maps_dir,
                            runtime_dir=args.runtime_dir, report_path=args.report_path,
                            locales_dir=args.locales_dir, base_language=args.base_language,
-                           geoip_path=args.geoip),
+                           geoip_path=args.geoip,
+                           presence_report=None if args.no_presence_report else args.presence_report or default_report_path(args.port)),
                 host=args.host, port=args.port)
 
 

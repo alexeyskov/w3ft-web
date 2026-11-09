@@ -3,6 +3,8 @@
 
 Incremental objects are keyed by source, headers, compiler and flags. This
 build produces a real WASM artifact, not evidence of playable Warcraft.
+Both builds turn eligible virtual self-calls into guest-stack loops so deep
+script trees do not exhaust the browser's native call stack.
 
 --variant compat builds the same code for engines without WebAssembly tail
 calls (Safari before 18.2, Chrome before 112, Firefox before 121) as
@@ -24,7 +26,13 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODULES = [ROOT / "var/lift-v2" / name for name in ("war3", "game", "storm", "ijl15")]
+DEFAULT_MODULES = [ROOT / "var/lift-compact" / name for name in ("war3", "game", "storm", "ijl15")]
+MEMORY_LAYOUTS = {
+    "legacy": {"guest_capacity": 0x78000000, "guest_window": 0x80000000, "heap_base": 0x30000000,
+               "heap_limit": 0x50000000, "main_stack_top": 0x07fff000, "maximum_pages": 65536},
+    "compact": {"guest_capacity": 0x1fff0000, "guest_window": 0x20000000, "heap_base": 0x04000000,
+                "heap_limit": 0x1fff0000, "main_stack_top": 0x01fff000, "maximum_pages": 16384},
+}
 FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", "-matomics", "-mbulk-memory", "-mtail-call",
          "-O1", "-fno-delete-null-pointer-checks", "-std=c11",
          "-Wno-parentheses-equality"]
@@ -34,10 +42,139 @@ VARIANTS = {
                "link_log": "link-compat.log"},
 }
 TRAMPOLINE_VERSION = 1
+SELF_CALL_VERSION = 2
 # A call statement of its own: at the start of a line or after ; { }.
 DIRECT_CALL = re.compile(r"(?:^|(?<=[;{}]))[ \t]*sub_[0-9a-f]{8}\(c\);", re.M)
 CALL_LIKE = re.compile(r"\bsub_[0-9a-f]{8}\(")
 DEFINITION = re.compile(r"^void sub_[0-9a-f]{8}\(CPU \*restrict c\) \{$", re.M)
+FUNCTION_BODY = re.compile(r"(^void sub_([0-9a-f]{8})\(CPU \*restrict c\) \{\n)(.*?)(^\})", re.M | re.S)
+INDIRECT_CALL = re.compile(r"\{ uint32_t _ct = ([^;\n]+); PUSH32\((0x[0-9a-f]+u)\); DISPATCH_CALL\(c, _ct\); \}")
+GUEST_RETURN = re.compile(r"(POP32\(c->eip\);(?: c->esp \+= [0-9]+u;)? )return;")
+DIRECT_GUEST_CALL = re.compile(r"PUSH32\((0x[0-9a-f]+u)\); sub_([0-9a-f]{8})\(c\);")
+
+
+def virtual_callees(sources):
+    """Small virtual visitors that can be inlined into deleting wrappers."""
+    result = {}
+    for source in sources:
+        text = source.read_text()
+        if 'WC3_LREGS' in text or 'LR_ENTER' in text:
+            continue
+        for match in FUNCTION_BODY.finditer(text):
+            _, address, body, _ = match.groups()
+            calls = body.count('DISPATCH_CALL(')
+            if (len(body) <= 12000 and 0 < calls <= 2 and calls == len(INDIRECT_CALL.findall(body))
+                    and 'DISPATCH_TAIL' not in body and GUEST_RETURN.search(body)
+                    and not re.search(r'\breturn\b', GUEST_RETURN.sub('', re.sub(r'/\*.*?\*/', '', body, flags=re.S)))):
+                result[address] = body
+    return result
+
+
+def inline_virtual_wrappers(text, callees):
+    """Expose self-recursion through small C++ scalar-deleting wrappers.
+
+    Such a wrapper calls the destructor body and tests a low-bit stack flag
+    before freeing the object. Inlining just one level of its small virtual
+    visitor exposes the recursive edge to self_call_source. This is ordinary
+    guest-code inlining: PUSH/POP, SEH setup, frees and all other instructions
+    still execute. Bounds keep this from duplicating large game functions.
+    """
+    if 'WC3_LREGS' in text or 'LR_ENTER' in text:
+        return text, 0
+    count = 0
+
+    def rewrite(match):
+        nonlocal count
+        header, address, body, end = match.groups()
+        if (len(body) > 6000 or 'DISPATCH_CALL' in body or 'DISPATCH_TAIL' in body or
+                not re.search(r'MR8\(c->esp\+0x[0-9a-f]+u\) & 0x1u', body)):
+            return match.group(0)
+        calls = list(DIRECT_GUEST_CALL.finditer(body))
+        targets = {call[2] for call in calls if call[2] in callees and call[2] != address}
+        if len(targets) != 1:
+            return match.group(0)
+        target = targets.pop()
+        # A single call site gives each inlined return address an unambiguous
+        # outer continuation, even after recursive frames have been flattened.
+        if sum(call[2] == target for call in calls) != 1:
+            return match.group(0)
+        serial = 0
+
+        def inline(call):
+            nonlocal serial, count
+            returned, called = call.groups()
+            if called != target:
+                return call.group(0)
+            prefix = f'wc3_inline_{serial}_'
+            serial += 1
+            inner = re.sub(r'\bL_([0-9a-f]{8})\b', lambda label: prefix + label[1], callees[called])
+            inner = GUEST_RETURN.sub(lambda ret: ret[1] + f'goto {prefix}done;', inner)
+            count += 1
+            return f'PUSH32({returned}); {{\n{inner}{prefix}done:;\n    }}'
+
+        return header + DIRECT_GUEST_CALL.sub(inline, body) + end
+
+    return FUNCTION_BODY.sub(rewrite, text), count
+
+
+def self_call_source(text):
+    """Keep virtual self-recursion on the guest stack, not the browser stack.
+
+    Unoptimized lifted functions store all long-lived state in CPU/guest
+    memory. A virtual call back to the same entry can therefore jump to the
+    entry label and RET can jump to its continuation, after performing the
+    original PUSH/POP/ret-immediate operations. The per-activation depth is
+    essential: an outer caller can have the same guest return address.
+
+    Limit this pass to virtual-call-only functions and inlined deleting
+    wrappers with normal returns and no tail exits. Other callees use the usual dispatcher (including
+    its compat tail trampoline). No game addresses or map names are used.
+    Register-local lifts and unknown call/return shapes stay untouched.
+    """
+    if 'WC3_LREGS' in text or 'LR_ENTER' in text:
+        return text, 0
+    optimized = 0
+
+    def rewrite(match):
+        nonlocal optimized
+        header, address, body, end = match.groups()
+        entry = f'L_{address}'
+        calls = list(INDIRECT_CALL.finditer(body))
+        if (not calls or not GUEST_RETURN.search(body) or f'{entry}:;' not in body or
+                len(calls) != body.count('DISPATCH_CALL(') or
+                'DISPATCH_TAIL' in body or (CALL_LIKE.search(body) and 'wc3_inline_' not in body) or
+                re.search(r'\breturn\b', GUEST_RETURN.sub('', re.sub(r'/\*.*?\*/', '', body, flags=re.S)))):
+            return match.group(0)
+        continuations = {}
+
+        def call(site):
+            target, returned = site.groups()
+            number = len(continuations)
+            # The lifter may emit the same instruction in overlapping blocks.
+            # All copies resume after that instruction; only one label is needed.
+            label = continuations.get(returned)
+            continuation = ''
+            if label is None:
+                label = continuations[returned] = f'wc3_self_resume_{number}'
+                continuation = f' {label}:;'
+            return (f'{{ uint32_t _ct = {target}; PUSH32({returned}); '
+                    f'if (_ct == 0x{address}u) {{ ++wc3_self_depth; '
+                    f'wc3_record_dispatch(c, _ct); goto {entry}; }} '
+                    f'DISPATCH_CALL(c, _ct); }}{continuation}')
+
+        body = INDIRECT_CALL.sub(call, body)
+        body = GUEST_RETURN.sub(r'\1goto wc3_self_return;', body)
+        returns = ''.join(f'        case {returned}: goto {label};\n' for returned, label in continuations.items())
+        body += ('wc3_self_return:;\n'
+                 '    if (!wc3_self_depth) return;\n'
+                 '    --wc3_self_depth;\n'
+                 '    switch (c->eip) {\n' + returns +
+                 '        default: wc3_cpu_fault(c, c->eip, "Invalid self-call return address");\n'
+                 '    }\n')
+        optimized += 1
+        return header + '    uint32_t wc3_self_depth = 0;\n' + body + end
+
+    return FUNCTION_BODY.sub(rewrite, text), optimized
 
 
 def variant_flags(variant):
@@ -146,6 +283,24 @@ def registry_source(modules):
     return "\n".join(lines)
 
 
+def memory_layout(name, modules):
+    layout = dict(MEMORY_LAYOUTS[name])
+    if name == "compact":
+        reserved = [(0, 0x10000), (0x00c00000, 0x00c20000),
+                    (layout['main_stack_top'] - 0x100000, layout['main_stack_top'] + 0x1000),
+                    (layout['heap_base'], layout['guest_capacity'])]
+        for module in modules:
+            report = module['report']; start = int(report['image_base'], 16)
+            size = report.get('image_size')
+            if not isinstance(size, int) or size <= 0:
+                raise ValueError('Regenerate modules with make lift-runtime: image_size is required for the compact layout')
+            end = start + size
+            if start < 0x10000 or end > layout['guest_capacity'] or any(start < high and low < end for low, high in reserved):
+                raise ValueError(f"{module['name']} does not fit the compact layout; regenerate with make lift-runtime")
+            reserved.append((start, end))
+    return layout
+
+
 def build(args):
     started = time.monotonic()
     variant = getattr(args, "variant", "standard")
@@ -154,6 +309,9 @@ def build(args):
     compiler = sdk / "bin/clang"
     version = subprocess.run([str(compiler), "--version"], check=True, capture_output=True, text=True).stdout
     modules = module_inputs(args.module_dirs)
+    callees = virtual_callees(source for module in modules for source in module['sources'])
+    layout_name = getattr(args, "memory_layout", "legacy")
+    layout = memory_layout(layout_name, modules)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     cache = output / names["objects"]
@@ -162,7 +320,11 @@ def build(args):
     original_header_hashes = {str(path): digest(path) for path in headers}
     header_key = json.dumps(original_header_hashes, sort_keys=True)
     flags = variant_flags(variant) + (["-DWC3_STRICT_MEMORY=1"] if getattr(args, "strict_memory", False) else [])
-    configuration = {"compiler": str(compiler), "version": version, "flags": flags}
+    flags += [f"-D{name}=0x{layout[key]:x}u" for name, key in (
+        ('WC3_GUEST_WINDOW', 'guest_window'), ('WC3_HEAP_BASE', 'heap_base'),
+        ('WC3_HEAP_LIMIT', 'heap_limit'), ('WC3_MAIN_STACK_TOP', 'main_stack_top'))]
+    configuration = {"compiler": str(compiler), "version": version, "flags": flags,
+                     "self_calls": SELF_CALL_VERSION}
     if variant != "standard":
         configuration.update(variant=variant, trampoline=TRAMPOLINE_VERSION)
     configuration_key = json.dumps(configuration, sort_keys=True)
@@ -173,17 +335,24 @@ def build(args):
         hash_path = object_path.with_suffix(".sha256")
         source_hash = digest(source)
         include_hash = digest(include / "decls.h") if include else ""
-        key = hashlib.sha256((source_hash + include_hash + header_key + configuration_key).encode()).hexdigest()
+        text = None
+        if include:
+            text, _ = inline_virtual_wrappers(source.read_text(), callees)
+            text, _ = self_call_source(text)
+            if variant == "compat":
+                text, _ = trampoline_source(text, str(source))
+        # An inlined visitor can live in another shard. Hash the actual input
+        # as well as the original source so changing it invalidates its callers.
+        compiled_hash = hashlib.sha256(text.encode()).hexdigest() if text is not None else source_hash
+        key = hashlib.sha256((source_hash + compiled_hash + include_hash + header_key + configuration_key).encode()).hexdigest()
         if object_path.exists() and hash_path.exists() and hash_path.read_text().strip() == key:
             return {"path": object_path, "cached": True, "source": str(source), "sha256": source_hash}
         temporary = object_path.with_suffix(".tmp.o")
         command = [str(compiler), *flags, "-I" + str(ROOT / "runtime")]
         if include:
             command += ["-I" + str(include)]
-        text = None
-        if include and variant == "compat":
+        if include:
             # Lifted C goes to the compiler from memory; the shards stay as generated.
-            text, _ = trampoline_source(source.read_text(), str(source))
             command += ["-x", "c", "-c", "-", "-o", str(temporary)]
         else:
             command += ["-c", str(source), "-o", str(temporary)]
@@ -222,7 +391,7 @@ def build(args):
         raise RuntimeError("Runtime headers changed during final compilation; rerun")
     wasm = output / names["artifact"]
     temporary = wasm.with_suffix(".tmp.wasm")
-    link_flags = ["-Wl,--import-memory,--export-memory,--shared-memory,--max-memory=4294967296",
+    link_flags = [f"-Wl,--import-memory,--export-memory,--shared-memory,--max-memory={layout['maximum_pages'] * 65536}",
                   "-Wl,--initial-memory=67108864", "-Wl,-z,stack-size=16777216",
                   "-Wl,--export=malloc,--export=free,--export=_initialize,--no-entry",
                   "-Wl,--export=__stack_pointer,--export=__wasm_init_tls,--export=__tls_size,--export=__tls_align",
@@ -251,9 +420,8 @@ def build(args):
         "sha256": digest(wasm), "bytes": wasm.stat().st_size,
         "configuration": configuration, "link_flags": link_flags, "runtime_headers": original_header_hashes,
         "memory": {"import": "env.memory", "shared": True, "initial_pages": 1024,
-                   "maximum_pages": 65536, "stack_bytes": 16777216,
-                   "guest_capacity": 0x78000000, "guest_base": 0x04000000, "guest_window": 0x80000000,
-                   "layout": "runtime/cpu.h WC3_GUEST_BASE/WC3_GUEST_WINDOW; wc3_memory_base() after wc3_init"},
+                   "stack_bytes": 16777216, "guest_base": 0x04000000, **layout,
+                   "layout": layout_name},
         "worker_abi": {"version": 1, "shared_instances": True,
                        "initialization": ["instantiate with existing env.memory", "set __stack_pointer", "__wasm_init_tls(nativeTlsBase)"],
                        "initialize_main_instance_only": True, "context": "wc3_context_create/call_context/destroy",
@@ -286,6 +454,8 @@ def main():
     parser.add_argument("--objects-only", action="store_true")
     parser.add_argument("--variant", choices=sorted(VARIANTS), default="standard",
                         help="compat: wc3-compat.wasm for engines without WebAssembly tail calls")
+    parser.add_argument("--memory-layout", choices=sorted(MEMORY_LAYOUTS), default="compact",
+                        help="compact: relocated DLLs in a 512 MiB guest window; legacy: original DLL bases")
     parser.add_argument("--strict-memory", action="store_true",
                         help="Diagnostic build: guest accesses also check page permissions (slower)")
     args = parser.parse_args()

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0b1118">
-<meta name="description" content="Warcraft III: The Frozen Throne в браузере. Кампания, сохранения и LAN-лобби.">
+<meta name="description" content="Демонстрация возможностей статического рекомпилятора x86 → WebAssembly на примере Warcraft III: The Frozen Throne.">
 <title>w3ft-web</title>
 <link rel="icon" type="image/x-icon" href="/favicon.ico?v=1" sizes="16x16 32x32 48x48">
 <link rel="icon" type="image/png" href="/favicon.png?v=1" sizes="64x64">
@@ -14,7 +14,7 @@
 <body data-phase="loading">
 <main class="app" id="app">
   <header class="top">
-    <div class="brand"><h1>The Frozen Throne Reborn</h1><p class="hint" data-i18n="fan">Фанатский проект. Не связан с Blizzard Entertainment.</p></div>
+    <div class="brand"><h1>The Frozen Throne Reborn</h1><p class="hint" data-i18n="fan">Техническая демонстрация. Не связана с Blizzard Entertainment.</p></div>
     <nav class="top-end" aria-label="Сайт">
       <label class="language"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c5 5 5 13 0 18M12 3c-5 5-5 13 0 18"/></svg><select id="language" aria-label="Язык страницы"><option value="ru">Русский</option><option value="en">English</option></select></label>
       <button class="btn" id="changelog-open" aria-haspopup="dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12M3 6h1M3 12h1M3 18h1"/></svg><span data-i18n="changelog">Изменения</span></button>
@@ -26,8 +26,10 @@
       <h2 class="status" id="status" role="status">Загрузка</h2><p class="status-sub" id="status-sub">Проверяем файлы игры.</p>
       <p class="notice" id="device-warning" hidden></p>
       <button class="play" id="launch" disabled><span data-i18n="play">Играть</span><kbd>Enter</kbd></button>
+      <p class="hint agreement-notice"><span data-i18n="agreementConsent">Нажимая «Играть» или «Запустить», вы соглашаетесь с</span> <a id="agreement-open" href="#user-agreement" aria-haspopup="dialog" aria-controls="user-agreement" data-i18n="agreementLink">пользовательским соглашением</a>.</p>
       <button class="text-button" id="download-log" data-i18n="downloadLog">Скачать журнал</button>
       <p class="hint" data-i18n="logHint">После перезагрузки журнал последней игры остаётся доступен.</p>
+      <p class="hint" data-i18n="preloadHint">Чтобы уменьшить подвисания в игре, рекомендуем заранее загрузить все игровые данные: Игра → Загрузить остальное.</p>
       <p class="notice" id="launch-message" role="status" hidden></p>
     </section>
     <section class="panel online" aria-labelledby="online-title"><h2 id="online-title" data-i18n="playingNow">Сейчас играют</h2><dl class="online-counts"><div><dt data-i18n="onlinePlaying">в игре</dt><dd id="online-playing">—</dd></div><div><dt data-i18n="onlineLan">по сети</dt><dd id="online-lan">—</dd></div><div><dt data-i18n="onlineSite">на сайте</dt><dd id="online-site">—</dd></div></dl></section>
@@ -37,9 +39,9 @@
         <button class="tab" id="info-tab-credits" type="button" role="tab" aria-selected="false" aria-controls="info-pane-credits" tabindex="-1" data-info-tab="credits" data-i18n="credits">Авторы</button>
       </div>
       <div class="prose" id="info-pane-about" role="tabpanel" aria-labelledby="info-tab-about">
-        <p data-i18n="aboutLead">Оригинальный Warcraft III: The Frozen Throne в браузере. Игровой код перекомпилирован в WebAssembly, графика работает через WebGL 2, звук — через Web Audio.</p>
-        <p data-i18n="aboutPlay">Кампания, сражения и карты выбираются в самой игре. Сохранения остаются в браузере, а с друзьями можно играть через LAN-лобби.</p>
-        <p data-i18n="aboutEditions">Поддерживаются русская и английская версии Warcraft. Язык игры совпадает с выбранным языком сайта.</p>
+        <p data-i18n="aboutLead">The Frozen Throne Reborn — демонстрация возможностей статического рекомпилятора x86 → WebAssembly на примере Warcraft III: The Frozen Throne.</p>
+        <p data-i18n="aboutPlay">Демонстрация показывает работу перекомпилированного кода в браузере: графику через WebGL 2, звук через Web Audio и сетевое взаимодействие через виртуальную LAN.</p>
+        <p data-i18n="aboutEditions">В демонстрации поддерживаются русская и английская версии Warcraft. Для самостоятельной подготовки и запуска сборки нужны файлы собственной лицензионной копии игры.</p>
         <p><span data-i18n="aboutHelp">Вопросы и сообщения об ошибках можно оставить в</span> <a href="https://github.com/alexeyskov/w3ft-web/issues" target="_blank" rel="noopener noreferrer">GitHub Issues</a> <span data-i18n="aboutHelpOr">или в</span> <a id="help-discord" target="_blank" rel="noopener noreferrer">Discord</a>.</p>
         <p><span data-i18n="aboutRightsHolders">Правообладателям:</span> <a href="mailto:legal@w3ft.online">legal@w3ft.online</a></p>
       </div>
@@ -107,6 +109,120 @@
   <p class="hint">0.1 · <time datetime="2026-11-07">07.11.2026</time></p>
   <ul><li data-i18n="changeInitialRelease">Первый публичный выпуск.</li></ul>
   <p class="hint credit"><a href="https://db-ip.com" target="_blank" rel="noopener">IP Geolocation by DB-IP</a></p>
+</dialog>
+<dialog class="agreement-dialog" id="user-agreement" aria-labelledby="agreement-title">
+  <div class="agreement-header"><h2 id="agreement-title" tabindex="-1" autofocus data-i18n="agreementTitle">Пользовательское соглашение</h2><button class="btn" id="agreement-close" data-i18n="close">Закрыть</button></div>
+  <div class="agreement-body" id="agreement-body" tabindex="0">
+    <p><strong>THE FROZEN THRONE REBORN</strong></p>
+    <p><strong data-i18n="agreementDateLabel">Дата вступления в силу:</strong> <time datetime="2026-11-09" data-i18n="agreementDate">9 ноября 2026 года</time></p>
+    <section lang="ru" data-agreement-language="ru">
+      <h3>РУССКАЯ ВЕРСИЯ</h3>
+      <h4>1. Общие положения</h4>
+      <p>The Frozen Throne Reborn (далее — «Проект») является независимым неофициальным программным проектом, предоставляющим программные инструменты и программную среду для запуска совместимого программного обеспечения в браузере.</p>
+      <p>Проект не является частью Blizzard Entertainment, не связан с ней и не одобрен ею.</p>
+      <p>Используя Проект, пользователь подтверждает, что ознакомился с настоящим соглашением и принимает его условия.</p>
+      <h4>2. Игровое программное обеспечение и материалы</h4>
+      <p>Проект не предоставляет пользователям лицензии на Warcraft III, Warcraft III: The Frozen Throne или связанные с этими играми материалы.</p>
+      <p>Названия, программный код, игровые ресурсы, графика, музыка, видеоматериалы, шрифты, карты и другие элементы Warcraft III принадлежат соответствующим правообладателям, включая Blizzard Entertainment и третьих лиц.</p>
+      <p>Лицензия на программное обеспечение самого Проекта не распространяется на интеллектуальную собственность Blizzard Entertainment или других сторонних правообладателей.</p>
+      <h4>3. Подтверждения пользователя</h4>
+      <p>Используя инструменты Проекта, пользователь подтверждает, что:</p>
+      <ol>
+        <li>Он самостоятельно и законным способом получил используемую копию Warcraft III: The Frozen Throne.</li>
+        <li>Он обладает необходимыми правами на использование этой копии в соответствии с применимым законодательством и условиями соответствующей лицензии.</li>
+        <li>Он самостоятельно принимает решение об использовании своей копии с программными инструментами Проекта.</li>
+        <li>Он не использует Проект для получения, распространения или предоставления третьим лицам незаконных копий игрового программного обеспечения или материалов.</li>
+        <li>Он не использует Проект для нарушения авторских, смежных или иных исключительных прав третьих лиц.</li>
+        <li>Он понимает, что настоящее соглашение не предоставляет ему дополнительных прав на интеллектуальную собственность Blizzard Entertainment.</li>
+      </ol>
+      <h4>4. Обработка пользовательских файлов</h4>
+      <p>При условии использования локальной версии инструментов Проекта пользователь самостоятельно выбирает и предоставляет файлы собственной установки игры для обработки на своём устройстве.</p>
+      <p>В рамках такой архитектуры:</p>
+      <ul>
+        <li>игровые исполняемые файлы и архивы предоставляются пользователем самостоятельно;</li>
+        <li>извлечение игровых ресурсов и преобразование программного кода выполняются локально;</li>
+        <li>промежуточные файлы и результаты сборки хранятся на устройстве пользователя;</li>
+        <li>Проект не предоставляет другим пользователям доступ к индивидуальной игровой сборке пользователя.</li>
+      </ul>
+      <p>Настоящий раздел описывает предполагаемый порядок работы локальной версии Проекта и применяется только в той мере, в которой фактическая техническая реализация ему соответствует.</p>
+      <h4>5. Ограничения использования</h4>
+      <p>Пользователь обязуется:</p>
+      <ol>
+        <li>Соблюдать применимое законодательство и условия лицензирования используемого программного обеспечения.</li>
+        <li>Не использовать Проект для незаконного распространения игровых файлов и материалов.</li>
+        <li>Не пытаться получать доступ к защищённым материалам или функциям в обход технических средств защиты.</li>
+        <li>Не использовать Проект для нарушения прав Blizzard Entertainment или других правообладателей.</li>
+        <li>Не представлять Проект как официальный продукт Blizzard Entertainment.</li>
+      </ol>
+      <h4>6. Интеллектуальная собственность Проекта</h4>
+      <p>Исключительные права на самостоятельно разработанные компоненты Проекта принадлежат их соответствующим правообладателям и регулируются отдельными лицензиями, опубликованными в репозитории.</p>
+      <p>Наличие открытой лицензии на исходный код Проекта не предоставляет права на использование игровых материалов Blizzard Entertainment.</p>
+      <h4>7. Отсутствие гарантий и аффилированности</h4>
+      <p>Проект предоставляется на условиях соответствующей открытой лицензии и, если применимо, без дополнительных гарантий работоспособности или пригодности для конкретной цели.</p>
+      <p>Blizzard Entertainment, Warcraft III и The Frozen Throne являются обозначениями соответствующих правообладателей.</p>
+      <p>The Frozen Throne Reborn является независимым неофициальным проектом. Отсутствие аффилированности с Blizzard Entertainment не означает наличия разрешения Blizzard на использование её интеллектуальной собственности.</p>
+      <h4>8. Прекращение использования</h4>
+      <p>Пользователь может прекратить использование Проекта в любое время.</p>
+      <p>Оператор Проекта вправе приостанавливать доступ к его отдельным функциям или прекращать предоставление сервиса при наличии технических, правовых или иных обоснованных причин.</p>
+      <h4>9. Применимое законодательство</h4>
+      <p>К настоящему соглашению применяется законодательство, определяемое с учётом обязательных норм применимого права и обстоятельств конкретного использования Проекта.</p>
+      <p>Ничто в настоящем соглашении не ограничивает права потребителей и другие права, которые не могут быть исключены или ограничены соглашением сторон.</p>
+    </section>
+    <section lang="en" data-agreement-language="en" hidden>
+      <h3>ENGLISH VERSION</h3>
+      <h4>1. General Provisions</h4>
+      <p>The Frozen Throne Reborn (the &quot;Project&quot;) is an independent, unofficial software project providing software tools and an environment for running compatible software in a web browser.</p>
+      <p>The Project is not affiliated with, associated with, sponsored by, or endorsed by Blizzard Entertainment.</p>
+      <p>By using the Project, the user confirms that they have read and agree to these terms.</p>
+      <h4>2. Game Software and Assets</h4>
+      <p>The Project does not grant users any license to Warcraft III, Warcraft III: The Frozen Throne, or any associated game materials.</p>
+      <p>The names, software code, game assets, graphics, music, videos, fonts, maps, and other elements of Warcraft III remain the property of their respective rights holders, including Blizzard Entertainment and third parties.</p>
+      <p>The software license applicable to the Project does not extend to intellectual property owned by Blizzard Entertainment or other third-party rights holders.</p>
+      <h4>3. User Representations</h4>
+      <p>By using the Project&#x27;s tools, the user represents and confirms that:</p>
+      <ol>
+        <li>They have independently and lawfully obtained the copy of Warcraft III: The Frozen Throne that they intend to use.</li>
+        <li>They possess the necessary rights to use that copy under applicable law and the relevant license terms.</li>
+        <li>They independently choose to use their copy with the Project&#x27;s software tools.</li>
+        <li>They do not use the Project to obtain, distribute, or provide unauthorized copies of game software or assets to third parties.</li>
+        <li>They do not use the Project to infringe the copyrights or other intellectual property rights of third parties.</li>
+        <li>They understand that this Agreement does not grant them any additional rights to intellectual property owned by Blizzard Entertainment.</li>
+      </ol>
+      <h4>4. Processing of User-Provided Files</h4>
+      <p>When using the locally operated version of the Project, the user independently selects and provides files from their own game installation for processing on their device.</p>
+      <p>Under this architecture:</p>
+      <ul>
+        <li>executable game files and archives are independently provided by the user;</li>
+        <li>extraction of game assets and software code transformation are performed locally;</li>
+        <li>intermediate files and generated builds are stored on the user&#x27;s device;</li>
+        <li>the Project does not provide other users with access to an individual user&#x27;s game build.</li>
+      </ul>
+      <p>This section describes the intended operation of the locally operated version of the Project and applies only to the extent that the actual technical implementation conforms to it.</p>
+      <h4>5. Restrictions on Use</h4>
+      <p>The user agrees to:</p>
+      <ol>
+        <li>Comply with applicable laws and license terms governing the software they use.</li>
+        <li>Not use the Project to unlawfully distribute game files or assets.</li>
+        <li>Not attempt to access protected materials or functionality by circumventing technological protection measures.</li>
+        <li>Not use the Project to infringe the rights of Blizzard Entertainment or other rights holders.</li>
+        <li>Not represent the Project as an official Blizzard Entertainment product.</li>
+      </ol>
+      <h4>6. Project Intellectual Property</h4>
+      <p>Copyright and other intellectual property rights in independently developed components of the Project belong to their respective rights holders and are governed by the separate licenses published in the Project&#x27;s repository.</p>
+      <p>The availability of open-source software licenses for the Project does not grant any rights to Blizzard Entertainment&#x27;s game assets.</p>
+      <h4>7. No Warranty or Affiliation</h4>
+      <p>The Project is provided under the terms of its applicable open-source licenses and, where applicable, without additional warranties of functionality or fitness for a particular purpose.</p>
+      <p>Blizzard Entertainment, Warcraft III, and The Frozen Throne are names and marks belonging to their respective rights holders.</p>
+      <p>The Frozen Throne Reborn is an independent, unofficial project. The absence of affiliation with Blizzard Entertainment does not imply that Blizzard has authorized the use of its intellectual property.</p>
+      <h4>8. Termination of Use</h4>
+      <p>Users may discontinue their use of the Project at any time.</p>
+      <p>The Project operator may suspend individual features or discontinue the service for technical, legal, or other legitimate reasons.</p>
+      <h4>9. Governing Law</h4>
+      <p>This Agreement shall be interpreted in accordance with the applicable law, taking into account mandatory legal provisions and the circumstances of the particular use of the Project.</p>
+      <p>Nothing in this Agreement excludes or limits consumer rights or other rights that cannot legally be waived or restricted by agreement.</p>
+    </section>
+    <p><strong data-i18n="agreementEnd">Конец соглашения</strong></p>
+  </div>
 </dialog>
 </body>
 </html>

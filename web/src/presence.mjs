@@ -6,8 +6,9 @@ export class PresenceCounter extends EventTarget {
     this.state = {playing:false, lan:false, presenceToken:null};
     this.counts = null; this.socket = null; this.retry = 1000; this.timer = null;
     this.lobbies = null;
+    this.kicked = false;
   }
-  start() { this.stopped = false; if (!this.socket) this.connect(); return this; }
+  start() { if (this.kicked) return this; this.stopped = false; if (!this.socket) this.connect(); return this; }
   // Closing the page closes the connection at once, so the counts drop now
   // rather than after the server's ping timeout.
   stop() {
@@ -22,7 +23,13 @@ export class PresenceCounter extends EventTarget {
     this.send();
   }
   send() {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(this.state));
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({...this.state, control:1}));
+  }
+  kick() {
+    if (this.kicked) return;
+    this.kicked = true;
+    this.stop();
+    this.dispatchEvent(new Event('kicked'));
   }
   connect() {
     clearTimeout(this.timer); this.timer = null;
@@ -34,13 +41,15 @@ export class PresenceCounter extends EventTarget {
     socket.onmessage = event => {
       if (this.socket !== socket) return;
       let message; try { message = JSON.parse(event.data); } catch { return; }
+      if (message?.type === 'kick') { this.kick(); return; }
       if (message?.type !== 'presence' || ![message.online, message.playing, message.lan].every(Number.isSafeInteger)) return;
       this.counts = {online:message.online, playing:message.playing, lan:message.lan};
       this.lobbies = Array.isArray(message.lobbies) ? {lobbies:message.lobbies, privatePlayers:message.privatePlayers ?? 0} : null;
       this.dispatchEvent(new Event('change'));
     };
-    socket.onclose = () => {
+    socket.onclose = event => {
       if (this.socket !== socket) return;
+      if (event?.code === 4003) { this.kick(); return; }
       this.socket = null;
       this.lobbies = null;
       if (this.counts) { this.counts = null; this.dispatchEvent(new Event('change')); }

@@ -35,7 +35,8 @@ try{
 finally{scheduler?.stop();}
 if(args.includes('--probe-storm')&&engine){
   // Read-only loader/MPQ diagnostics; never replace guest cryptographic state.
-  const h=engine.host,crypt=h.u32(0x1504c2e4);
+  const h=engine.host,storm=engine.modules.find(module=>module.name.toLowerCase()==='storm.dll');
+  const crypt=h.u32(storm.base+0x4c2e4);
   console.log(JSON.stringify({crypt:crypt.toString(16),cryptHead:crypt?Array.from({length:8},(_,i)=>h.u32(crypt+i*4).toString(16)):[]}));
 }
 const report=engine?engine.report(error):{schemaVersion:1,wasmExecuted:false,gameplayVerified:false,error:{type:error?.name,message:error?.message,stack:error?.stack}};

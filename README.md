@@ -11,7 +11,7 @@ Based on [nfsu2-web](https://github.com/th0mk/nfsu2-web) by th0mk, using its MIT
 - **The game:** your own licensed copy and a complete classic 32-bit Windows installation with The Frozen Throne. The tested binaries report **1.26.0.6401**. Reforged and arbitrary other patches are not supported just by copying their data. See the [tested binary hashes and compatibility notes](docs/SELF_HOSTING.md#compatible-game-files).
 - **To build:** macOS or Linux, Python 3.11+, a recent Node.js with WebAssembly threads and tail calls, FFmpeg (`ffmpeg` and `ffprobe`), Make, and [wasi-sdk 34](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34). Use Linux/WSL for Windows development. Optional localization preparation also needs `bsdtar`.
 - **To play:** a desktop browser with WebGL 2, OffscreenCanvas, SharedArrayBuffer and WebAssembly threads. Chromium and Firefox are tested. A browser without WebAssembly tail calls (Safari before 18.2, Chrome before 112, Firefox before 121) gets a compatible build of the same code; by the features it uses, that means Safari 17 or newer, Chrome 96 or Firefox 114. Desktop Safari runs the game and saved games too, but creating or joining a LAN game currently stops it (a WebKit stack limit), so play online in Chrome, Edge or Firefox. Use localhost or HTTPS.
-- **On phones and tablets:** Chrome on Android, held sideways; a recent phone with 8 GB of memory or more is advisable. On iPhone and iPad every browser uses WebKit, which runs out of memory: on an iPhone 17 the browser reloads the page before the main menu appears, so the site warns iPhone and iPad visitors (see [port status](docs/port-status.md#mobile-browsers)).
+- **On phones and tablets:** Chrome on Android, held sideways; a recent phone with 8 GB of memory or more is advisable. Startup on a physical iPhone has also been confirmed by the maintainer. The compact build reduces the initial WASM memory from about 2.1 GiB to 576 MiB by relocating the DLLs. See [port status](docs/port-status.md#mobile-browsers) for device coverage and remaining limitations.
 
 ## Build
 
@@ -31,7 +31,7 @@ make runtime
 make boot-set   # optional, needs Playwright: the startup download behind the progress bar
 ```
 
-This creates your own `var/game`, `var/maps`, `var/lift-v2`, `var/runtime` and `var/reports`. Generated C and WASM are derived from the supplied game and stay outside Git. The [self-hosting guide](docs/SELF_HOSTING.md) also covers using an installed directory, alternate SDK locations, languages, maps and rebuilding for different binaries. No prebuilt `var/` download is required.
+This creates your own `var/game`, `var/maps`, `var/lift-compact`, `var/runtime` and `var/reports`. Generated C and WASM are derived from the supplied game and stay outside Git. When upgrading from the old `var/lift-v2` layout, run `make lift-runtime` before `make runtime`; updating JavaScript alone does not reduce the WASM memory requirement. The [self-hosting guide](docs/SELF_HOSTING.md) also covers using an installed directory, alternate SDK locations, languages, maps and rebuilding for different binaries. No prebuilt `var/` download is required.
 
 ## Play
 
@@ -44,6 +44,8 @@ Open **http://localhost:8080/** and press **Play**. Select campaigns and maps in
 On a touch screen, a tap is a click, a long press or a two-finger tap is a right click, two fingers dragged scroll the map and a pinch zooms. The buttons beside the picture open the device keyboard (for chat, press its Enter), send Escape and leave fullscreen.
 
 For LAN play, join the same site lobby, launch both clients and open **Local Area Network** in Warcraft. One player hosts the match; the others join it. Battle.net is not implemented. Other devices require HTTPS; [compose.yaml](compose.yaml) and [deploy/Caddyfile](deploy/Caddyfile) provide a deployment starting point.
+
+Server owners can enable a password-protected `/admin` page to inspect active connections and end individual sessions. It is disabled until a password is configured; see the [admin setup instructions](docs/SELF_HOSTING.md#private-admin-panel).
 
 **Hosting serves your game files and game-derived WASM to connected browsers.** Owning a game copy does not itself grant permission to redistribute those files or operate an Internet matchmaking service. Read the [publication and hosting notes](docs/LEGAL.md) before making a deployment public.
 

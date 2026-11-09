@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Frame-rate and CPU benchmark of the real Warcraft runtime in Chromium.
+"""Frame-rate benchmark of the real Warcraft runtime; optional Chromium CPU trace.
 
 Uses the hardware GPU by default (Chromium new headless, ANGLE Metal/D3D/GL);
 --software selects SwiftShader as in the older reports. The menu is measured
@@ -94,13 +94,20 @@ def main(args):
         options['profileRpc'] = True
     saves = args.saves.read_text() if args.saves and args.saves.is_file() else None
     result = {'url': args.url, 'options': options, 'measurements': []}
-    launch = {'args': ['--autoplay-policy=no-user-gesture-required']}
-    if args.software:
-        launch['args'] += ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']
-    else:
-        launch['channel'] = 'chromium'  # new headless keeps hardware acceleration
+    engine = getattr(args, 'browser', 'chromium')
+    if engine != 'chromium' and (args.software or args.trace):
+        raise ValueError('--software and --trace require Chromium')
+    launch = {}
+    if engine == 'chromium':
+        launch['args'] = ['--autoplay-policy=no-user-gesture-required']
+        if args.software:
+            launch['args'] += ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']
+        else:
+            launch['channel'] = 'chromium'  # new headless keeps hardware acceleration
+    elif engine == 'firefox':
+        launch['firefox_user_prefs'] = {'media.autoplay.default':0, 'media.autoplay.blocking_policy':0}
     with sync_playwright() as p:
-        browser = p.chromium.launch(**launch)
+        browser = getattr(p, engine).launch(**launch)
         page = browser.new_page(viewport={'width': 1024, 'height': 768})
         try:
             page.set_default_timeout(args.timeout * 1000)
@@ -213,6 +220,8 @@ def main(args):
             report = page.evaluate('probe.report')
             result['error'] = report.get('error')
             result['graphics'] = report.get('graphics')
+            result['memory'] = report.get('memory')
+            result['heap'] = report.get('heap')
         except Exception as error:
             result['failure'] = str(error)
             page.screenshot(path=str(output / 'failure.png'))
@@ -227,6 +236,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--url', default='http://127.0.0.1:8080')
+    parser.add_argument('--browser', choices=('chromium', 'webkit', 'firefox'), default='chromium')
     parser.add_argument('--output', type=Path, default=ROOT / 'var/reports/benchmark')
     parser.add_argument('--scene', choices=('menu', 'save', 'both'), default='both')
     parser.add_argument('--seconds', type=float, default=10)

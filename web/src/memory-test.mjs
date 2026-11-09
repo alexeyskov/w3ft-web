@@ -1,14 +1,14 @@
 // How much memory this browser lets the game's page use, step by step as the
 // game starts: compile the real module, let the compiler's temporary memory
 // go, create the shared memory as the runtime does (64 MB) and grow it in
-// 64 MB steps without writing to it (to 2112 MB like wc3_init: the runtime's
-// 64 MB and the 2 GB guest window; up to 4 GB without the module), then fill it. A page closed while growing
-// means the browser counts memory that was only reserved.
+// 64 MB steps without writing to it (to the build profile's guest window;
+// up to 4 GB without the module), then fill it. The last completed step is
+// evidence about this run, not a measurement of a fixed browser RAM limit.
 // iOS closes a page that outgrows its limit without any error, and the browser
 // reloads it: every step is saved before it runs, so the reloaded page tells
 // where the last test stopped.
 const $ = id => document.getElementById(id);
-const KEY = 'wc3-memory-test', STEP = 64, PAGE = 16384, GUEST_PAGES = (0x04000000 + 0x80000000) / 65536 + 1, MAX_PAGES = 65520, SETTLE_MS = 8000;
+const KEY = 'wc3-memory-test', STEP = 64, PAGE = 16384, MAX_PAGES = 65520, SETTLE_MS = 8000;
 const english = (localStorage.getItem('wc3-language') || navigator.language || '').toLowerCase().startsWith('en');
 const t = (ru, en) => english ? en : ru;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -28,7 +28,8 @@ function summary(r) {
   if (!r) return '';
   return [`memory-test ${r.finished ? 'finished' : r.error ? 'error' : 'stopped'}: step=${r.step}`,
     r.compileSeconds !== undefined ? `compile=${r.compileSeconds} s` : '', `grown=${r.grownMB || 0} MB`, `filled=${r.filledMB || 0} MB`,
-    r.error ? `error=${r.error}` : '', `mode=${r.mode}`, 'v2', r.ua].filter(Boolean).join('; ');
+    r.targetMB ? `target=${r.targetMB} MB` : '', r.attemptMB ? `attempt=${r.attemptMB} MB` : '',
+    r.error ? `error=${r.error}` : '', `mode=${r.mode}`, `v${r.version || 2}`, r.ua].filter(Boolean).join('; ');
 }
 const steps = {
   compile: t('компиляция модуля игры', 'compiling the game module'), settle: t('ожидание после компиляции', 'waiting after compiling'),
@@ -44,19 +45,26 @@ function render(r, previous) {
   $('copy').hidden = !r;
   if (previous && r && !r.finished && !r.error) {
     $('previous').hidden = false;
-    $('previous').textContent = t(`Прошлая проверка не закончилась: браузер закрыл страницу на шаге «${steps[r.step] || r.step}», выделено ${r.grownMB || 0} МБ, заполнено ${r.filledMB || 0} МБ. Это и есть предел памяти для этого браузера.`,
-      `The last test did not finish: the browser closed the page during "${steps[r.step] || r.step}" with ${r.grownMB || 0} MB grown and ${r.filledMB || 0} MB filled. That is this browser's memory limit.`);
+    $('previous').textContent = t(`Прошлая проверка не закончилась на шаге «${steps[r.step] || r.step}»: выделено ${r.grownMB || 0} МБ, заполнено ${r.filledMB || 0} МБ. Это последний сохранённый результат; возможная причина перезагрузки — нехватка памяти, но точный предел браузера он не определяет.`,
+      `The last test did not finish during "${steps[r.step] || r.step}" with ${r.grownMB || 0} MB grown and ${r.filledMB || 0} MB filled. This is the last saved result. Memory pressure may have caused the reload; it does not establish an exact browser memory limit.`);
   }
 }
 
 async function run(mode) {
   $('full').disabled = $('memory').disabled = true; $('previous').hidden = true;
-  record = {mode, ua: navigator.userAgent, started: new Date().toISOString(), filledMB: 0};
+  keep = [];
+  record = {version:3, mode, ua: navigator.userAgent, started: new Date().toISOString(), filledMB: 0};
   try {
     if (!crossOriginIsolated) throw new Error('crossOriginIsolated is false');
+    let initial = 1024, maximum = 65536, pages = MAX_PAGES;
     if (mode === 'full') {
       await save({step: 'compile'});
       const status = await (await fetch('/api/status', {cache: 'no-store'})).json(), started = performance.now();
+      const profile = await (await fetch('/runtime/build.json', {cache:'no-store'})).json();
+      initial = profile.memory?.initial_pages ?? initial;
+      maximum = profile.memory?.maximum_pages ?? maximum;
+      pages = Math.ceil(((profile.memory?.guest_base ?? 0x04000000) + (profile.memory?.guest_window ?? 0x80000000) + 16) / 65536);
+      await save({targetMB:Math.round(pages / 16), layout:profile.memory?.layout || 'legacy'});
       const tailCalls = WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,3,2,0,0,10,11,2,4,0,65,0,11,4,0,18,0,11]));
       const url = !tailCalls && status.runtime.compatWasmUrl || status.runtime.wasmUrl;
       keep.push(await WebAssembly.compileStreaming(fetch(url)));
@@ -64,13 +72,14 @@ async function run(mode) {
       await sleep(SETTLE_MS);
     }
     await save({step: 'memory'});
-    const memory = new WebAssembly.Memory({initial: 1024, maximum: 65536, shared: true});
+    const memory = new WebAssembly.Memory({initial, maximum, shared: true});
     keep.push(memory);
     await save({step: 'grow', grownMB: 64});
-    const pages = mode === 'full' ? GUEST_PAGES : MAX_PAGES;
     while (memory.buffer.byteLength / 65536 < pages) {
-      memory.grow(Math.min(STEP * 16, pages - memory.buffer.byteLength / 65536));
-      await save({grownMB: Math.round(memory.buffer.byteLength / 1048576)});
+      const next = Math.min(memory.buffer.byteLength / 65536 + STEP * 16, pages);
+      await save({attemptMB:Math.round(next / 16)});
+      memory.grow(next - memory.buffer.byteLength / 65536);
+      await save({grownMB: Math.round(memory.buffer.byteLength / 1048576), attemptMB:null});
     }
     await save({step: 'fill'});
     const bytes = new Uint8Array(memory.buffer);
@@ -79,7 +88,7 @@ async function run(mode) {
       await save({filledMB: mb + STEP});
     }
     await save({step: 'done', finished: true});
-    $('status').textContent = mode === 'full' ? t('Браузер выдержал всё: модуль и 2,1 ГБ памяти.', 'The browser held everything: the module and 2.1 GB of memory.')
+    $('status').textContent = mode === 'full' ? t(`Проверка закончилась: модуль и ${record.grownMB} МБ памяти. Это ещё не проверка самой игры.`, `The test completed: the module and ${record.grownMB} MB of memory. This does not yet verify gameplay.`)
       : t('Браузер выдержал всё: 4 ГБ памяти.', 'The browser held everything: 4 GB of memory.');
   } catch (error) {
     await save({error: `${error.name}: ${error.message}`});
@@ -88,8 +97,8 @@ async function run(mode) {
 }
 
 $('title').textContent = t('Проверка памяти', 'Memory test');
-$('intro').textContent = t('Для iPhone и iPad: страница повторяет запуск игры, выделяет и заполняет память шагами по 64 МБ. Если браузер закроет и перезагрузит её, после перезагрузки здесь будет видно, сколько памяти он позволил. Пришлите эту строку разработчику.',
-  'For iPhone and iPad: the page repeats the game\'s startup, then grows and fills memory in 64 MB steps. If the browser closes and reloads it, this page then shows how much memory it allowed. Send that line to the developer.');
+$('intro').textContent = t('Для iPhone и iPad: страница компилирует модуль игры, затем выделяет и заполняет память по профилю сборки шагами по 64 МБ. Если проверка прервётся, после перезагрузки здесь будет виден последний сохранённый шаг. Пришлите эту строку разработчику. Для повторной проверки сначала перезагрузите страницу.',
+  'For iPhone and iPad: this page compiles the game module, then grows and fills memory in 64 MB steps using the build profile. If the test is interrupted, the last saved step appears after reloading. Send that line to the developer. Reload the page before repeating a test.');
 $('full').textContent = t('Проверить с модулем игры', 'Test with the game module');
 $('memory').textContent = t('Только память', 'Memory only');
 $('copy').textContent = t('Скопировать результат', 'Copy the result');

@@ -235,7 +235,7 @@ export function installKernel(h) {
   add('GetTimeZoneInformation', 1, ([pointer]) => { h.zero(pointer, 172); writeWide(pointer + 4, 'UTC', 32); return 0; });
   add('GetVersion', 0, () => 0x0a280105); // Windows XP 5.1 build 2600 virtual ABI.
   add('GetVersionExA', 1, ([pointer]) => { const length = h.u32(pointer); if (length < 148) return error(87); h.zero(pointer + 4, length - 4); h.w32(pointer + 4, 5); h.w32(pointer + 8, 1); h.w32(pointer + 12, 2600); h.w32(pointer + 16, 2); h.writeString(pointer + 20, 'Service Pack 3', 128); if (length >= 156) h.w16(pointer + 148, 3); return 1; });
-  add('GetSystemInfo', 1, ([pointer]) => { h.zero(pointer, 36); h.w16(pointer, 0); h.w32(pointer + 4, 4096); h.w32(pointer + 8, 0x10000); h.w32(pointer + 12, 0x77ffffff); h.w32(pointer + 16, 1); h.w32(pointer + 20, 1); h.w32(pointer + 24, 586); h.w32(pointer + 28, 65536); h.w16(pointer + 32, 6); });
+  add('GetSystemInfo', 1, ([pointer]) => { h.zero(pointer, 36); h.w16(pointer, 0); h.w32(pointer + 4, 4096); h.w32(pointer + 8, 0x10000); h.w32(pointer + 12, h.capacity - 1); h.w32(pointer + 16, 1); h.w32(pointer + 20, 1); h.w32(pointer + 24, 586); h.w32(pointer + 28, 65536); h.w16(pointer + 32, 6); });
   for(const[suffix,wide]of[['A',false],['W',true]])add(`GetVolumeInformation${suffix}`,8,([root,label,labelSize,serial,maxComponent,flags,filesystem,filesystemSize])=>{
     const path=root?inputString(root,wide).replaceAll('/','\\').toLowerCase():'c:\\';
     if(path!=='c:\\')return error(15);
@@ -246,7 +246,7 @@ export function installKernel(h) {
     if(flags)h.w32(flags,0x6); // Case-preserving, Unicode names; lookups are case-insensitive.
     return 1;
   });
-  add('GlobalMemoryStatus', 1, ([pointer]) => { h.zero(pointer, 32); const used = [...h.allocations.values()].reduce((sum, value) => sum + value, 0), total = 0x78000000; [32, Math.floor(100 * used / total), total, total - used, total, total - used, total, total - used].forEach((value, i) => h.w32(pointer + i * 4, value)); });
+  add('GlobalMemoryStatus', 1, ([pointer]) => { h.zero(pointer, 32); const used = [...h.allocations.values()].reduce((sum, value) => sum + value, 0), total = h.capacity; [32, Math.floor(100 * used / total), total, total - used, total, total - used, total, total - used].forEach((value, i) => h.w32(pointer + i * 4, value)); });
   add('GetStartupInfoA', 1, ([pointer]) => { h.zero(pointer, 68); h.w32(pointer, 68); });
   add('IsDebuggerPresent', 0, () => 0);
   add('SetErrorMode', 1, ([value]) => { const previous = errorMode; errorMode = value; return previous; });
