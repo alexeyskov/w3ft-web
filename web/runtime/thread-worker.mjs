@@ -1,7 +1,7 @@
 import {WarcraftHost, GuestFault} from './host.mjs';
 import {GuestCallProxy, serializeGuestError} from './thread-rpc.mjs';
 import {localImportDispatcher} from './worker-fast.mjs';
-import {GraphicsCommandQueue} from './graphics-batch.mjs';
+import {GraphicsCommandQueue,GRAPHICS_NATIVE_FLUSH} from './graphics-batch.mjs';
 import {webkitCollectorNudge} from './webkit-gc.mjs';
 
 const validPointer = value => Number.isInteger(value) && value > 0 && value <= 0xffffffff;
@@ -29,12 +29,19 @@ export async function runThread(options, postFn = message => globalThis.postMess
     let local=null,batch=null;
     // Queued GL work is handed to the broker asynchronously (callback return,
     // thread exit, swaps); the broker executes it before any graphics import.
-    const flush=()=>batch?.submit();
+    const flush=()=>{if(batch)exports.wc3_graphics_flush?.(cpu);batch?.submit();};
     const hostCall = (id, context) => {
       id>>>=0;context>>>=0;
+      host.enterImportViews();
+      try {
+      if(id===GRAPHICS_NATIVE_FLUSH){
+        if(!batch)throw new GuestFault('Native graphics flush without a command queue');
+        batch.appendNative(exports.wc3_graphics_pointer()>>>0,exports.wc3_graphics_bytes()>>>0);return;
+      }
       if(batch?.enqueue(id,context)||local?.(id,context))return;
       rpc.call(id,context,batch?.syncPoint());
       batch?.afterSync(id,context);
+      } finally { host.leaveImportViews(); }
     };
     // Safari only (webkit-gc.mjs): this worker never returns to its event loop,
     // so the nudge rides on host calls, about twice a second on a busy thread.
@@ -61,13 +68,20 @@ export async function runThread(options, postFn = message => globalThis.postMess
     host.started=options.processStarted??host.started;host.registerContext(cpu,threadId,options.threadState);
     if(options.localImports)local=localImportDispatcher(host,options.localImports,cpu);
     if(options.graphicsBatch)batch=new GraphicsCommandQueue(host,options.graphicsBatch,{post:postFn,framesInFlight:options.framesInFlight??1});
+    // Native STATE recording remains opt-in: fewer WASM/JS crossings did not
+    // reduce total CPU work in the real saved-game benchmark on Metal.
+    if(batch&&options.nativeGraphics===true&&exports.wc3_graphics_enable&&!exports.wc3_graphics_enable(1))throw new GuestFault('Cannot enable native graphics staging');
     const guestCall=call=>{
       const stack=exports.__stack_pointer.value,depth=exports.wc3_context_depth(cpu);
-      try{return call();}
+      try{const result=call();flush();return result;}
       catch(error){
         const registers=Object.fromEntries(['eax','ecx','edx','ebx','esp','ebp','esi','edi','eip'].map((name,i)=>[name,'0x'+host.view.getUint32(cpu+i*4,true).toString(16).padStart(8,'0')]));
         error.details={...error.details,registers};
-        exports.__stack_pointer.value=stack;exports.wc3_context_recover(cpu,depth);
+        exports.__stack_pointer.value=stack;
+        // Preserve already captured state on a guest failure, but never hide
+        // the original error with a failed cleanup or retry a failed flush.
+        try{flush();}catch{}
+        exports.wc3_graphics_discard?.();exports.wc3_context_recover(cpu,depth);
         throw error;
       }
     };

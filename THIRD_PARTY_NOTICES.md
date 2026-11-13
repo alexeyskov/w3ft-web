@@ -8,7 +8,7 @@ Source: https://github.com/th0mk/nfsu2-web
 
 Vendored revision: `3e61f9c37cb7ce4084dde182047c1b782bd9ac1a`.
 
-The files in `vendor/nfsu2/provenance.json` are unmodified upstream copies, used by `tools/lift_wc3.py`. `runtime/cpu.h` adapts the upstream CPU ABI and arithmetic helpers. The launcher layout in `web/styles/main.css` is also adapted from nfsu2-web and retains its full MIT notice. Changes for Warcraft include a separate memory/dispatch model, PE discovery, a game-specific host and a different rendering/network protocol.
+The files in `vendor/nfsu2/provenance.json` are unmodified upstream copies, used by `tools/lift_wc3.py`. `runtime/cpu.h` adapts the upstream CPU ABI and arithmetic helpers. `tools/local_regs.py` adapts the upstream register-localization pass, with conservative flag synchronization and convergent dataflow analysis. The launcher layout in `web/styles/main.css` is also adapted from nfsu2-web and retains its full MIT notice. Changes for Warcraft include a separate memory/dispatch model, PE discovery, a game-specific host and a different rendering/network protocol.
 
 The upstream license names **th0mk** and **Talha Müderrisoğlu**, the author of the original recompiler and macOS runtime. These credits describe the borrowed components; they do not identify either author as the developer or endorser of this Warcraft port. The project uses the pinned MIT snapshot, not later revisions or their license terms.
 
@@ -29,6 +29,7 @@ These are fetched or installed separately, rather than copied into this source t
 | Component | Use | License / upstream |
 | --- | --- | --- |
 | aiohttp 3.13.2 | HTTP and WebSocket server | Apache-2.0 AND MIT; https://github.com/aio-libs/aiohttp |
+| psutil 7.2.2 | Private admin server metrics | BSD-3-Clause; https://github.com/giampaolo/psutil |
 | Capstone 5.0.6 | x86 decoding for the lifter | BSD-3-Clause, with additional bundled notices; https://github.com/capstone-engine/capstone |
 | pefile 2024.8.26 | PE inspection/translation | MIT; https://github.com/erocarrera/pefile |
 | mpyq 0.2.5 | MPQ table parsing | BSD-2-Clause; https://github.com/eagleflo/mpyq |

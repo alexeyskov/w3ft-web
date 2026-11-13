@@ -64,9 +64,9 @@ test('one change event exposes matching presence and lobby snapshots', t => {
   socket.open();
   const changes = [];
   presence.addEventListener('change', () => changes.push({counts:presence.counts, lobbies:presence.lobbies}));
-  const lobbies = [{id:'shared-en-1', players:1, maxPlayers:200}];
+  const lobbies = [{id:'shared-1', players:1, maxPlayers:200}];
   socket.message({type:'presence', online:2, playing:1, lan:1, lobbies, privatePlayers:0});
-  assert.deepEqual(changes, [{counts:{online:2, playing:1, lan:1}, lobbies:{lobbies, privatePlayers:0}}]);
+  assert.deepEqual(changes, [{counts:{online:2, playing:1, lan:1, lanGames:null}, lobbies:{lobbies, privatePlayers:0}}]);
   // Roster changes still reach the UI when no game/presence flag changes.
   socket.message({type:'presence', online:2, playing:1, lan:1, lobbies:[], privatePlayers:1});
   assert.equal(changes.length, 2);
@@ -88,10 +88,23 @@ test('stopped and replaced sockets cannot restore stale lobby counts', async t =
   replacement.open();
   replacement.message({type:'presence', online:1, playing:0, lan:0, lobbies:[], privatePlayers:0});
   old.message({type:'presence', online:99, playing:99, lan:99, lobbies:[], privatePlayers:99});
-  assert.deepEqual(presence.counts, {online:1, playing:0, lan:0});
+  assert.deepEqual(presence.counts, {online:1, playing:0, lan:0, lanGames:null});
   presence.stop();
   replacement.message({type:'presence', online:99, playing:99, lan:99, lobbies:[], privatePlayers:99});
   assert.equal(presence.counts, null);
   assert.equal(presence.lobbies, null);
   assert.equal(presence.timer, null);
+});
+
+test('the LAN game count is independent of players and changes within one lobby', t => {
+  const presence = counter(t).start(), socket = presence.socket;
+  socket.open();
+  const snapshot = {type:'presence', online:8, playing:6, lan:6, lobbies:[]};
+  socket.message({...snapshot, lanGames:1});
+  assert.equal(presence.counts.lanGames, 1);
+  assert.equal(presence.counts.lan, 6);
+  socket.message({...snapshot, lanGames:2});
+  assert.equal(presence.counts.lanGames, 2);
+  socket.message(snapshot); // Old server: show unknown, never relabel players as games.
+  assert.equal(presence.counts.lanGames, null);
 });

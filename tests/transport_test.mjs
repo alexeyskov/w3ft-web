@@ -36,6 +36,9 @@ test('a lobby joined before launch retains its peer roster and binary LAN transp
   assert.equal(transport.lobby.players, 3);
   transport.send(1, Uint8Array.of(0xf7, 0, 0xff));
   assert.deepEqual([...socket.sent], [1, 0xf7, 0, 0xff]);
+  transport.send(255, Uint8Array.of(9, 1));
+  assert.deepEqual([...socket.sent], [255, 9, 1]);
+  assert.throws(()=>transport.send(256, Uint8Array.of(1)), /Invalid peer/);
   socket.message(Uint8Array.of(3, 0xf7, 0, 0xff).buffer);
   assert.equal(packet.source, 3);
   assert.deepEqual([...packet.data], [0xf7, 0, 0xff]);

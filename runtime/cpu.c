@@ -16,6 +16,10 @@ __attribute__((noinline, cold)) _Noreturn void wc3_mem_fault(uint32_t address) {
 __attribute__((noinline)) uint8_t *wc3_mem_check(uint32_t address, size_t bytes) {
     if (!g_mem || address > g_mem_size || bytes > g_mem_size - address)
         wc3_cpu_fault(NULL, address, "guest memory access out of range");
+#if WC3_FIXED_GUEST && WC3_GROWING_GUEST
+    if ((uint64_t)WC3_GUEST_BASE + address + bytes > (uint64_t)__builtin_wasm_memory_size(0) * 65536u)
+        wc3_cpu_fault(NULL, address, "guest memory is not committed");
+#endif
     if (g_page_access && bytes) {
         uint32_t first = address >> WC3_PAGE_SHIFT;
         uint32_t last = (uint32_t)(((uint64_t)address + bytes - 1) >> WC3_PAGE_SHIFT);

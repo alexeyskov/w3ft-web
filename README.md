@@ -10,8 +10,8 @@ Based on [nfsu2-web](https://github.com/th0mk/nfsu2-web) by th0mk, using its MIT
 
 - **The game:** your own licensed copy and a complete classic 32-bit Windows installation with The Frozen Throne. The tested binaries report **1.26.0.6401**. Reforged and arbitrary other patches are not supported just by copying their data. See the [tested binary hashes and compatibility notes](docs/SELF_HOSTING.md#compatible-game-files).
 - **To build:** macOS or Linux, Python 3.11+, a recent Node.js with WebAssembly threads and tail calls, FFmpeg (`ffmpeg` and `ffprobe`), Make, and [wasi-sdk 34](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34). Use Linux/WSL for Windows development. Optional localization preparation also needs `bsdtar`.
-- **To play:** a desktop browser with WebGL 2, OffscreenCanvas, SharedArrayBuffer and WebAssembly threads. Chromium and Firefox are tested. A browser without WebAssembly tail calls (Safari before 18.2, Chrome before 112, Firefox before 121) gets a compatible build of the same code; by the features it uses, that means Safari 17 or newer, Chrome 96 or Firefox 114. Desktop Safari runs the game and saved games too, but creating or joining a LAN game currently stops it (a WebKit stack limit), so play online in Chrome, Edge or Firefox. Use localhost or HTTPS.
-- **On phones and tablets:** Chrome on Android, held sideways; a recent phone with 8 GB of memory or more is advisable. Startup on a physical iPhone has also been confirmed by the maintainer. The compact build reduces the initial WASM memory from about 2.1 GiB to 576 MiB by relocating the DLLs. See [port status](docs/port-status.md#mobile-browsers) for device coverage and remaining limitations.
+- **To play:** a desktop browser with WebGL 2, OffscreenCanvas, SharedArrayBuffer and WebAssembly threads. Chromium and Firefox are tested. A browser without WebAssembly tail calls (Safari before 18.2, Chrome before 112, Firefox before 121) gets a compatible build of the same code; by the features it uses, that means Safari 17 or newer, Chrome 96 or Firefox 114. Desktop WebKit has also passed a short mixed-browser LAN match with Chromium, in both host/guest directions; this does not establish compatibility with every Safari/iOS version or custom map. Use localhost or HTTPS.
+- **On phones and tablets:** Chrome on Android, held sideways; a recent phone with 8 GB of memory or more is advisable. Startup on a physical iPhone has also been confirmed by the maintainer. The runtime grows guest memory as the game allocates it instead of committing the entire guest window at startup. Compiled code, graphics and browser overhead still require additional memory. See [port status](docs/port-status.md#mobile-browsers) for device coverage and remaining limitations.
 
 ## Build
 
@@ -28,10 +28,10 @@ Download the wasi-sdk 34 archive for your machine and unpack it under `var/toolc
 ```sh
 make lift-runtime
 make runtime
-make boot-set   # optional, needs Playwright: the startup download behind the progress bar
+make boot-set   # needs Playwright: startup set and ordered background download plans
 ```
 
-This creates your own `var/game`, `var/maps`, `var/lift-compact`, `var/runtime` and `var/reports`. Generated C and WASM are derived from the supplied game and stay outside Git. When upgrading from the old `var/lift-v2` layout, run `make lift-runtime` before `make runtime`; updating JavaScript alone does not reduce the WASM memory requirement. The [self-hosting guide](docs/SELF_HOSTING.md) also covers using an installed directory, alternate SDK locations, languages, maps and rebuilding for different binaries. No prebuilt `var/` download is required.
+This creates your own `var/game`, `var/maps`, `var/lift-compact`, `var/runtime` and `var/reports`. Generated C and WASM are derived from the supplied game and stay outside Git. Updating JavaScript alone does not install compiler or guest-memory improvements: existing builds need regenerated translation outputs and both WASM variants. See the [upgrade instructions](docs/SELF_HOSTING.md#4-translate-and-compile). The self-hosting guide also covers using an installed directory, alternate SDK locations, languages, maps and rebuilding for different binaries. No prebuilt `var/` download is required.
 
 ## Play
 
@@ -41,11 +41,21 @@ This creates your own `var/game`, `var/maps`, `var/lift-compact`, `var/runtime` 
 
 Open **http://localhost:8080/** and press **Play**. Select campaigns and maps inside Warcraft. Saves remain in the browser and can be exported from the launcher. Print Screen saves the game's screenshot as a PNG in the browser's downloads. If your base installation is English, start with `./run.sh --base-language en`.
 
+Startup intros are skipped. After the critical startup download, remaining data is cached automatically while you play: menus, multiplayer, match resources, then campaign content. Immediate game reads take priority over background downloads. Completed blocks are reused on later visits; no download controls or manual action are required. **Game → Game data on this device** shows stored data. See the [download plan and caching details](docs/SELF_HOSTING.md#faster-first-launch).
+
 On a touch screen, a tap is a click, a long press or a two-finger tap is a right click, two fingers dragged scroll the map and a pinch zooms. The buttons beside the picture open the device keyboard (for chat, press its Enter), send Escape and leave fullscreen.
 
 For LAN play, join the same site lobby, launch both clients and open **Local Area Network** in Warcraft. One player hosts the match; the others join it. Battle.net is not implemented. Other devices require HTTPS; [compose.yaml](compose.yaml) and [deploy/Caddyfile](deploy/Caddyfile) provide a deployment starting point.
 
-Server owners can enable a password-protected `/admin` page to inspect active connections and end individual sessions. It is disabled until a password is configured; see the [admin setup instructions](docs/SELF_HOSTING.md#private-admin-panel).
+There are four shared lobbies with 200 seats each, regardless of game language. Play joins the first lobby with a free seat; temporary overflow lobbies appear when needed. You can also create a lobby or join one by code.
+
+**Games over LAN** counts started matches, including a LAN host playing against computer opponents. Several players in the same match count as one game; waiting rooms and loading screens do not count.
+
+The browser profile also keeps Warcraft's LAN name and game settings when you close the game. On the site's **Saves** tab, **Save** downloads a JSON backup of saves and settings; **Load** imports that backup.
+
+After a failure, **Report issue** lets the player review and send the saved log and technical details, with an optional comment. Sending is opt-in. Reports are grouped in the password-protected `/admin` Issues tab, with counts, filters, status, notes and log downloads. The private SQLite database is stored in `var/issues` locally or the persistent `issue_data` Docker volume. See [self-hosting](docs/SELF_HOSTING.md#issue-reports) for storage and limits.
+
+Server owners can enable a password-protected `/admin` page to monitor CPU, memory, disk space and network traffic, view visitor activity over time, inspect active connections and end individual sessions. The activity chart keeps 90 days of concurrent page counts (on site and in game) and running LAN match counts, not unique visitor records. History survives server restarts. The panel is disabled until a password is configured; see the [admin setup instructions](docs/SELF_HOSTING.md#private-admin-panel).
 
 **Hosting serves your game files and game-derived WASM to connected browsers.** Owning a game copy does not itself grant permission to redistribute those files or operate an Internet matchmaking service. Read the [publication and hosting notes](docs/LEGAL.md) before making a deployment public.
 

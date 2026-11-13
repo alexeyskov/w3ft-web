@@ -33,3 +33,35 @@ test('synchronous guest callbacks reject blocking imports instead of returning f
   assert.throws(()=>h.invoke((h.resolve('test.dll','blocking')-0xf1000000)/16,0x1000),GuestFault);
   assert.equal(h.view.getUint32(0x1010,true),0x10000);
 });
+
+test('import views refresh at boundaries and on newly grown shared ranges',()=>{
+  const memory=new WebAssembly.Memory({initial:4,maximum:8,shared:true});let reads=0;
+  const h=new WarcraftHost({memory:{get buffer(){reads++;return memory.buffer;}}});h.base=0;
+  const cpu=0x1000,stack=0x10000;h.view.setUint32(cpu+16,stack,true);h.w32(stack,0x401000);
+  h.add('test.dll','grow',0,()=>{
+    const before=reads;
+    for(let i=0;i<100;i++){h.view.setUint32(0x8000,i,true);h.bytes[0x9000]=i;}
+    assert.equal(reads,before,'no memory.buffer getter per accessor inside an import');
+    const old=memory.buffer.byteLength;memory.grow(1);
+    h.w32(old,123);assert.equal(h.u32(old),123,'check refreshes newly committed ranges');
+    return 7;
+  });
+  h.invoke((h.resolve('test.dll','grow')-0xf1000000)/16,cpu);
+  assert.equal(h.view.getUint32(cpu,true),7);assert.equal(h._viewDepth,0);
+  memory.grow(1);assert.equal(h.bytes.length,memory.buffer.byteLength,'external readers refresh');
+  const calls=h.calls;assert.equal(calls.get('test.dll!grow'),1);
+  assert.deepEqual(h.history,[{name:'test.dll!grow',threadId:1,returnAddress:0x401000}]);
+  h.add('test.dll','fail',0,()=>{throw new Error('expected');});
+  h.view.setUint32(cpu+16,stack,true);
+  assert.throws(()=>h.invoke((h.resolve('test.dll','fail')-0xf1000000)/16,cpu),/expected/);
+  assert.equal(h._viewDepth,0,'exceptions do not leave cached-import scope active');
+});
+
+test('unshared test runtimes refresh detached buffers during an import',()=>{
+  const memory=new WebAssembly.Memory({initial:4,maximum:8});
+  const h=new WarcraftHost({memory});h.base=0;
+  h.view.setUint32(0x1010,0x10000,true);h.w32(0x10000,0x401000);
+  h.add('test.dll','grow',0,()=>{memory.grow(1);h.view.setUint32(0x8000,123,true);return 9;});
+  h.invoke((h.resolve('test.dll','grow')-0xf1000000)/16,0x1000);
+  assert.equal(h.u32(0x8000),123);assert.equal(h.view.getUint32(0x1000,true),9);
+});

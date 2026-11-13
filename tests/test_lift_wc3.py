@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 try:
@@ -59,6 +60,19 @@ def pe32_fixture():
 
 @unittest.skipUnless(HAVE_DEPS, "Install requirements.txt for lifter tests")
 class LifterTests(unittest.TestCase):
+    def test_flag_liveness_reaches_a_fixed_point_past_64_blocks(self):
+        vendor = SimpleNamespace(CC={}, X86_OP_IMM=2, F_ALL=63,
+                                 _flag_defuse=lambda insn: (0, 63 if insn.mnemonic == 'ret' else 0))
+        # Address order is the reverse of control flow; a capped reverse scan
+        # needs one iteration per edge and would lose flags at the entry.
+        blocks = {}
+        for address in range(200):
+            blocks[address] = [SimpleNamespace(address=address, size=1,
+                mnemonic='jmp' if address else 'ret',
+                operands=[SimpleNamespace(type=2, imm=address-1)] if address else [])]
+        after = adapter.flag_liveness(vendor, blocks, sorted(blocks), lambda _: True)
+        self.assertEqual(set(after.values()), {63})
+
     def test_rebase_applies_relocations_before_discovery_and_keeps_input_hash(self):
         import hashlib
         with tempfile.TemporaryDirectory() as temp:
@@ -95,8 +109,25 @@ class LifterTests(unittest.TestCase):
                 self.assertEqual(lifter.split_operand(0x8900ac, 0x401000, True), "0x8900acu")
                 self.assertEqual(os.environ["FLAGABI"], "")
                 self.assertEqual(os.environ["LREGS"], "0")
+                self.assertEqual(os.environ["FLAGOPT"], "1")
             self.assertEqual(os.environ["FTOL2INL"], "1")
             self.assertEqual(os.environ["FLAGABI"], "/missing")
+
+    def test_flag_liveness_eliminates_only_overwritten_flags(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); image = root / 'flags.exe'
+            data = pe32_fixture()
+            # cmp eax,1; je branch; xor eax,eax; ret; branch: xor edx,edx; ret
+            # Both exits replace arithmetic flags except undefined AF, which
+            # the runtime preserves. CMP needs only ZF and the preserved AF.
+            data[0x200:0x20b] = bytes.fromhex('83f801740331c0c331d2c3')
+            struct.pack_into('<I', data, 0x400, 0x401000)
+            image.write_bytes(data)
+            report = adapter.generate(image, root / 'lift', max_functions=0)
+            source = (root / 'lift/shard_0000.c').read_text()
+            self.assertEqual(report['failed_functions'], 0)
+            self.assertRegex(source, r'FLAGS_SUB_M\([^;]*0x0cu\)')
+            self.assertIn('0x3fu', source, 'Returned flags remain observable to the caller')
 
     def test_pe_relocations_and_references_generate_real_c(self):
         with tempfile.TemporaryDirectory() as temp:

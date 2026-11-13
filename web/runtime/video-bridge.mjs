@@ -1,40 +1,62 @@
 import {GuestFault} from './host.mjs';
+import {startupMovie} from './game-cache.mjs';
 
 // Commands cross from the synchronous guest broker to the browser media
 // element. Playback can be accepted while waiting for a user gesture: the
 // synchronous guest must not block (and time out) while the page asks for it.
 export class WorkerVideo {
-  constructor({post=message=>postMessage(message),movies=new Map(),timeout=20000}={}){
-    this.post=post;this.movies=movies;this.timeout=timeout;this.listeners=new Map();this.nextId=1;
+  constructor({post=message=>postMessage(message),movies=new Map(),timeout=20000,skipIntro=false,log=()=>{},holdDownloads=()=>{}}={}){
+    this.post=post;this.movies=movies;this.timeout=timeout;this.listeners=new Map();this.nextId=1;this.failedLoads=new Set();
+    this.skipIntro=skipIntro;this.log=log;this.skipped=new Set();this.holdDownloads=holdDownloads;this.downloadHolds=new Map();
   }
   request(id,method,fields={}){
     const control=new SharedArrayBuffer(16384),status=new Int32Array(control,0,2);
-    this.post({type:'video',id,method,control,...fields});
+    const deadline=Date.now()+this.timeout,started=performance.now();
+    this.post({type:'video',id,method,control,deadline,...fields});
     while(Atomics.load(status,0)===0){
-      if(Atomics.wait(status,0,0,this.timeout)==='timed-out'&&Atomics.compareExchange(status,0,0,-2)===0)
-        throw new GuestFault(`Video ${method} timed out`,{id});
+      if(Atomics.wait(status,0,0,Math.max(0,this.timeout-(performance.now()-started)))==='timed-out'&&Atomics.compareExchange(status,0,0,-2)===0)
+        throw new GuestFault(`Video ${method} timed out`,{id,videoOperation:method,reason:'timeout'});
     }
     const length=Atomics.load(status,1);
     if(length<0||length>16376)throw new GuestFault('Invalid video response');
     const result=JSON.parse(new TextDecoder().decode(new Uint8Array(control,8,length).slice()));
-    if(Atomics.load(status,0)!==1)throw new GuestFault(`Video ${method}: ${result.error}`,{id});
+    if(Atomics.load(status,0)!==1)throw new GuestFault(`Video ${method}: ${result.error}`,{id,videoOperation:method,reason:'media'});
     return result;
   }
   create(listener){const id=this.nextId++;this.listeners.set(id,listener);return id;}
   load(id,path){
     const key=path.replaceAll('\\','/').replace(/^C:\/Warcraft III\/?/i,'').replace(/^\.\//,'').toLowerCase(),movie=this.movies.get(key);
+    this.skipped.delete(id);
+    // Only before the first rendered menu frame. The same TutorialIn movie
+    // remains playable later if the player starts the tutorial/campaign.
+    if(this.skipIntro&&startupMovie(key)) {
+      this.skipped.add(id);this.log(`Startup cinematic skipped: ${path}`);
+      return {width:640,height:480,duration:0,frameRate:25,skipped:true};
+    }
     if(!movie)throw new GuestFault('Browser cinematic is missing; run tools/prepare_media.py',{path});
-    const result=this.request(id,'load',{url:movie.downloadUrl}),[numerator,denominator]=movie.frameRate.split('/').map(Number);
-    return {...result,frameRate:numerator/denominator};
+    this.downloadHolds.get(id)?.();this.downloadHolds.set(id,this.holdDownloads(movie));
+    try{
+      const result=this.request(id,'load',{url:movie.downloadUrl}),[numerator,denominator]=movie.frameRate.split('/').map(Number);
+      this.failedLoads.delete(id);return {...result,frameRate:numerator/denominator};
+    }catch(error){if(error.details?.videoOperation==='load')this.failedLoads.add(id);throw error;}
   }
   dispatch(message){this.listeners.get(message.id)?.(message.event,message.error);}
-  release(id){this.request(id,'destroy');this.listeners.delete(id);}
+  release(id){
+    this.listeners.delete(id);
+    this.downloadHolds.get(id)?.();this.downloadHolds.delete(id);
+    if(this.skipped.delete(id))return;
+    // A stalled page may still be handling the abandoned load. Cleanup is
+    // ordered after it, but must not block the guest for another RPC timeout.
+    if(this.failedLoads.delete(id))this.post({type:'video',id,method:'destroy',control:new SharedArrayBuffer(16384)});
+    else this.request(id,'destroy');
+  }
 }
 
 export class VideoDispatcher {
   // sources: asset path → URL of a copy on this device (client.mjs prepareGame).
-  constructor({canvas,onEvent=()=>{},log=()=>{},language=globalThis.document?.documentElement.lang||'en',muted=false,sources=new Map()}={}){
+  constructor({canvas,onEvent=()=>{},log=()=>{},language=globalThis.document?.documentElement.lang||'en',muted=false,sources=new Map(),loadTimeout=18000,metadataTimeout=6000,retryDelay=250}={}){
     this.canvas=canvas;this.onEvent=onEvent;this.log=log;this.language=language;this.muted=!!muted;this.sources=sources instanceof Map?sources:new Map();this.players=new Map();this.destroyed=false;
+    this.loadTimeout=loadTimeout;this.metadataTimeout=metadataTimeout;this.retryDelay=retryDelay;
     this.relayout=()=>{for(const entry of this.players.values())this.layout(entry);};
     globalThis.addEventListener?.('resize',this.relayout);
     globalThis.document?.addEventListener('fullscreenchange',this.relayout);
@@ -47,30 +69,36 @@ export class VideoDispatcher {
       this.remove(id);
       const url=new URL(message.url,location.href);if(url.origin!==location.origin||!url.pathname.startsWith('/api/assets/'))throw Error('video must be a game asset');
       const video=document.createElement('video');video.preload='auto';video.playsInline=true;video.controls=false;video.muted=this.muted;
-      const entry={id,video,abort:new AbortController(),visible:false,rect:null,viewport:null,loading:true,playToken:0,blocked:false,completed:false,prompt:null};this.players.set(id,entry);
+      const entry={id,video,abort:new AbortController(),loadControl:message.control,visible:false,rect:null,viewport:null,loading:true,playToken:0,blocked:false,completed:false,prompt:null};this.players.set(id,entry);
       Object.assign(video.style,{position:'fixed',objectFit:'contain',pointerEvents:'none',background:'black',zIndex:'20',display:'none'});
       (this.canvas?.parentElement||document.body).append(video);this.layout(entry);
       video.addEventListener('ended',()=>this.complete(entry));
       // Failures while loading are retried below; the game hears of playback errors only.
       video.addEventListener('error',()=>{if(!entry.loading&&this.players.get(id)===entry&&!this.destroyed)this.onEvent({type:'video-event',id,event:'error',error:video.error?.message||'Media decode error'});});
-      // A dropped connection fails the media element like a broken file: up to
-      // three tries, the last from the server, before the game is told.
-      for(let attempt=1;;attempt++){
-        try{
-          await new Promise((resolve,reject)=>{
-            const finish=error=>{clearTimeout(timer);video.removeEventListener('loadedmetadata',ready);video.removeEventListener('error',failed);entry.abort.signal.removeEventListener('abort',aborted);error?reject(error):resolve();};
-            const ready=()=>finish(),failed=()=>finish(Error(video.error?.message||'Unsupported video media')),aborted=()=>finish(Object.assign(Error('Video load cancelled'),{cancelled:true}));
-            const timer=setTimeout(()=>finish(Error('Video metadata timeout')),15000);
-            video.addEventListener('loadedmetadata',ready);video.addEventListener('error',failed);entry.abort.signal.addEventListener('abort',aborted);
-            video.src=attempt<3&&this.sources.get(url.pathname)||url.href;video.load();
-          });
-          entry.loading=false;break;
-        }catch(error){
-          if(error.cancelled||attempt>=3||this.players.get(id)!==entry)throw error;
-          await new Promise(resolve=>setTimeout(resolve,500*attempt));
+      // All attempts share a budget shorter than the worker's RPC deadline.
+      // Retry a cached Blob failure from the server immediately, not from the
+      // same potentially unreadable Blob. A timed-out player is always removed.
+      const started=performance.now(),budget=Math.min(this.loadTimeout,
+        Number.isFinite(message.deadline)?Math.max(0,message.deadline-Date.now()-250):this.loadTimeout);
+      const remaining=()=>budget-(performance.now()-started);
+      try{
+        for(let attempt=1;attempt<=3;attempt++){
+          const cached=attempt===1&&this.sources.get(url.pathname),source=cached||url.href;
+          try{
+            if(remaining()<=0)throw Error('Video metadata timeout');
+            await this.loadMetadata(entry,source,Math.min(remaining(),this.metadataTimeout,cached?3000:Infinity));
+            if(!video.videoWidth||!video.videoHeight||!Number.isFinite(video.duration))throw Error('Invalid video metadata');
+            entry.loading=false;
+            return {width:video.videoWidth,height:video.videoHeight,duration:video.duration};
+          }catch(error){
+            if(error.cancelled||this.players.get(id)!==entry)throw error;
+            this.log(`Cinematic load attempt ${attempt} (${cached?'device cache':'server'}) ${url.pathname}: ${error.message}; mediaCode=${video.error?.code||0}, readyState=${video.readyState}, networkState=${video.networkState}`);
+            const delay=this.retryDelay*attempt;
+            if(attempt===3||remaining()<=delay)throw error;
+            await new Promise(resolve=>setTimeout(resolve,delay));
+          }
         }
-      }
-      return {width:video.videoWidth,height:video.videoHeight,duration:video.duration};
+      }catch(error){if(this.players.get(id)===entry)this.remove(id);throw error;}
     }
     if(method==='destroy'){this.remove(id);return {};}
     const entry=this.players.get(id);if(!entry)throw Error('video is not loaded');const video=entry.video;
@@ -82,6 +110,18 @@ export class VideoDispatcher {
     else if(method==='configure'){if(message.visible!==undefined)entry.visible=message.visible;if(message.rect)entry.rect=message.rect;if(message.viewport)entry.viewport=message.viewport;this.layout(entry);}
     else if(method!=='status')throw Error(`Unsupported video operation ${method}`);
     return {position:video.currentTime,duration:video.duration,ended:entry.completed||video.ended,paused:video.paused,blocked:entry.blocked,rate:video.playbackRate,width:video.videoWidth,height:video.videoHeight};
+  }
+  loadMetadata(entry,source,timeout){
+    return new Promise((resolve,reject)=>{
+      const video=entry.video,signal=entry.abort.signal;
+      const finish=error=>{clearTimeout(timer);video.removeEventListener('loadedmetadata',ready);video.removeEventListener('error',failed);signal.removeEventListener('abort',aborted);error?reject(error):resolve();};
+      const ready=()=>finish(),failed=()=>finish(Error(video.error?.message||'Unsupported video media')),
+        aborted=()=>finish(Object.assign(Error('Video load cancelled'),{cancelled:true}));
+      const timer=setTimeout(()=>finish(Error('Video metadata timeout')),timeout);
+      if(signal.aborted){aborted();return;}
+      video.addEventListener('loadedmetadata',ready);video.addEventListener('error',failed);signal.addEventListener('abort',aborted);
+      try{video.src=source;video.load();}catch(error){finish(error);}
+    });
   }
   async play(entry){
     const token=++entry.playToken;entry.completed=false;
@@ -164,7 +204,12 @@ export class VideoDispatcher {
     const state=new Int32Array(message.control,0,2);if(Atomics.load(state,0)!==0)return;
     let result,status=1;
     try{result=await this.execute(message);}catch(error){result={error:error.message};status=-1;}
-    if(Atomics.load(state,0)!==0)return;
+    if(Atomics.load(state,0)!==0){
+      // The synchronous worker can abandon a load while the tab's event loop
+      // is throttled. Do not leave its late video element/network request alive.
+      if(message.method==='load'&&this.players.get(message.id)?.loadControl===message.control)this.remove(message.id);
+      return;
+    }
     const bytes=new TextEncoder().encode(JSON.stringify(result));new Uint8Array(message.control,8,bytes.length).set(bytes);
     Atomics.store(state,1,bytes.length);Atomics.store(state,0,status);Atomics.notify(state,0);
   }

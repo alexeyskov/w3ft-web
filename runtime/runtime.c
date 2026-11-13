@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <errno.h>
 
 #ifdef __wasm__
 #define EXPORT(name) __attribute__((export_name(#name)))
@@ -49,6 +50,38 @@ static _Thread_local char error_text[512]; /* Loader/broker or faults outside a 
 #define WC3_MAIN_STACK_TOP 0x07fff000u
 #endif
 static _Atomic uint32_t heap_next = WC3_HEAP_BASE;
+#if WC3_FIXED_GUEST && WC3_GROWING_GUEST
+/* wasi-libc's dlmalloc starts with __heap_base..__heap_end, entirely in the
+ * initial runtime arena. Never let its MORECORE allocate inside the guest
+ * window after memory.grow: thread stacks, TLS and loader buffers must stay
+ * below WC3_GUEST_BASE. Exhaustion is a normal malloc failure. */
+void *sbrk(intptr_t increment) {
+    if (!increment) return (void *)(uintptr_t)WC3_GUEST_BASE;
+    errno = ENOMEM;
+    return (void *)-1;
+}
+static atomic_flag guest_growth_lock = ATOMIC_FLAG_INIT;
+static void lock_guest_growth(void) {
+    while (atomic_flag_test_and_set_explicit(&guest_growth_lock, memory_order_acquire)) { }
+}
+static void unlock_guest_growth(void) {
+    atomic_flag_clear_explicit(&guest_growth_lock, memory_order_release);
+}
+/* Called only at allocation/PE-mapping boundaries, never on a lifted load.
+ * Grow in 1 MiB steps; maximum is an address-space limit, not committed RAM. */
+static int ensure_guest_unlocked(uint32_t end) {
+    if (end > g_mem_size) return 0;
+    uint64_t target = ((uint64_t)WC3_GUEST_BASE + end + 16u + 0xfffffu) & ~UINT64_C(0xfffff);
+    size_t pages = __builtin_wasm_memory_size(0), needed = (size_t)(target / 65536u);
+    return needed <= pages || __builtin_wasm_memory_grow(0, needed - pages) != (size_t)-1;
+}
+int wc3_ensure_guest(uint32_t end) {
+    lock_guest_growth();
+    int ok = ensure_guest_unlocked(end);
+    unlock_guest_growth();
+    return ok;
+}
+#endif
 static const uint32_t return_sentinel = 0xfffffffcu;
 typedef struct { uint32_t address; guest_fn_t fn; } Entry;
 static Entry *entries;
@@ -117,6 +150,203 @@ static guest_fn_t find_function(uint32_t address) {
 #endif
     return function;
 }
+
+/* Pure CRT imports execute beside the guest CPU. In particular libm is the
+ * same WASI/musl code in every browser, rather than engine-dependent Math.*.
+ * IDs are registered by native-imports.mjs; zero retains the JS fallback. */
+#define NATIVE_THUNKS 65536u
+static _Atomic uint16_t native_imports[NATIVE_THUNKS];
+static _Atomic uint32_t native_counts[NATIVE_THUNKS];
+EXPORT(wc3_bind_native_import) int wc3_bind_native_import(uint32_t thunk, uint32_t op) {
+    if (thunk >= NATIVE_THUNKS || !((op >= 1 && op <= 12) || (op >= 20 && op <= 22) || (op >= 30 && op <= 39))) return 0;
+    atomic_store_explicit(&native_imports[thunk], (uint16_t)op, memory_order_release);
+    return 1;
+}
+EXPORT(wc3_native_counts_pointer) uintptr_t wc3_native_counts_pointer(void) { return (uintptr_t)native_counts; }
+
+static uint32_t crt_string_length(uint32_t address) {
+    for (uint32_t n = 0; n < 16u * 1024u * 1024u; ) {
+        uint32_t span = 4096u - ((address + n) & 4095u);
+        if (span > 16u * 1024u * 1024u - n) span = 16u * 1024u * 1024u - n;
+        const uint8_t *p = wc3_mem_check(address + n, span);
+        const uint8_t *end = memchr(p, 0, span);
+        if (end) return n + (uint32_t)(end - p);
+        n += span;
+    }
+    wc3_cpu_fault(NULL, address, "Unterminated CRT string");
+}
+static int crt_compare(uint32_t a, uint32_t b, uint32_t count, int fold) {
+    for (uint32_t n = 0; n < count; ) {
+        uint32_t span = 4096u - ((a + n) & 4095u), right = 4096u - ((b + n) & 4095u);
+        if (right < span) span = right;
+        if (count - n < span) span = count - n;
+        const uint8_t *x = wc3_mem_check(a + n, span), *y = wc3_mem_check(b + n, span);
+        for (uint32_t j = 0; j < span; j++) {
+            uint8_t xv = x[j], yv = y[j];
+            if (fold) { if (xv >= 'A' && xv <= 'Z') xv += 'a'-'A'; if (yv >= 'A' && yv <= 'Z') yv += 'a'-'A'; }
+            if (xv != yv) return (int)xv - yv;
+            if (!xv) return 0;
+        }
+        n += span;
+    }
+    return 0;
+}
+/* Stable index mergesort matches the former JS stable sort, including equal
+ * keys. Comparators see original guest addresses until sorting completes.
+ * They re-enter the same CPU in C, without a WASM -> JS -> WASM round trip. */
+static int crt_sort(CPU *c, uint32_t base, uint32_t count, uint32_t width, uint32_t compare) {
+    uint64_t size = (uint64_t)count * width;
+    if (!width || size > 32u * 1024u * 1024u) wc3_cpu_fault(c, base, "qsort bounds");
+    uint8_t *data = wc3_mem_check(base, (size_t)size);
+    if (count < 2) return 1;
+    uint32_t *indices = malloc((size_t)count * 2 * sizeof(uint32_t));
+    uint8_t *sorted = malloc((size_t)size);
+    /* Guest data can be much larger than the fixed native arena once thread
+     * stacks/TLS occupy it. Let the existing JS implementation use its own
+     * scratch memory instead. No comparator or CPU/data mutation has happened
+     * yet, and partial allocations are returned before the fallback runs. */
+    if (!indices || !sorted) { free(indices); free(sorted); return 0; }
+    uint32_t *from = indices, *to = indices + count;
+    for (uint32_t i = 0; i < count; i++) from[i] = i;
+    for (uint32_t run = 1; run < count; run *= 2) {
+        for (uint32_t start = 0; start < count; start += 2 * run) {
+            uint32_t middle = start + run < count ? start + run : count;
+            uint32_t end = middle + run < count ? middle + run : count;
+            uint32_t a = start, b = middle, out = start;
+            while (a < middle && b < end) {
+                uint32_t args[] = {base + from[a] * width, base + from[b] * width};
+                int32_t order = (int32_t)wc3_call_context(c, compare, 2, args);
+                to[out++] = order <= 0 ? from[a++] : from[b++];
+            }
+            while (a < middle) to[out++] = from[a++];
+            while (b < end) to[out++] = from[b++];
+        }
+        uint32_t *swap = from; from = to; to = swap;
+    }
+    for (uint32_t i = 0; i < count; i++) memcpy(sorted + i * width, data + from[i] * width, width);
+    memcpy(data, sorted, (size_t)size); free(sorted); free(indices);
+    return 1;
+}
+static int native_import(uint32_t id, CPU *c) {
+    if (id >= NATIVE_THUNKS) return 0;
+    uint16_t op = atomic_load_explicit(&native_imports[id], memory_order_acquire);
+    if (!op) return 0;
+    uint32_t esp = c->esp, result = 0, returned;
+    memcpy(&returned, wc3_mem_check(esp, 4), 4);
+    if (op != 37) atomic_fetch_add_explicit(&native_counts[id], 1, memory_order_relaxed);
+    if (op <= 12) {
+        double x = ST(0), y;
+        switch (op) {
+        case 1: y = sqrt(x); break; case 2: y = log10(x); break;
+        case 3: y = exp(x); break; case 4: y = atan(x); break;
+        case 5: y = tan(x); break; case 6: y = acos(x); break;
+        case 7: y = asin(x); break; case 8: y = sin(x); break;
+        case 9: y = cos(x); break;
+        case 10: y = pow(ST(1), x); break;
+        case 11: y = atan2(ST(1), x); break;
+        default: y = fmod(ST(1), x); break;
+        }
+        if (op >= 10) c->top = (c->top + 1) & 7;
+        ST(0) = y;
+    } else if (op <= 22) {
+        double x; memcpy(&x, wc3_mem_check(esp + 4, 8), 8);
+        FPUSH(op == 20 ? floor(x) : op == 21 ? ceil(x) : sqrt(x));
+    } else {
+        uint32_t args[4] = {0};
+        unsigned argc = op == 34 ? 1 : (op == 35 || op == 38) ? 2 : op == 37 ? 4 : 3;
+        memcpy(args, wc3_mem_check(esp + 4, argc * 4), argc * 4);
+        uint32_t a = args[0], b = args[1], n = args[2];
+        switch (op) {
+        case 30: case 31:
+            memmove(wc3_mem_check(a,n), wc3_mem_check(b,n), n); result = a; break;
+        case 32: memset(wc3_mem_check(a,n), b & 255u, n); result = a; break;
+        case 33: {
+            const uint8_t *x = wc3_mem_check(a,n), *y = wc3_mem_check(b,n);
+            for (uint32_t i=0;i<n;i++) if (x[i]!=y[i]) { result=(uint32_t)((int)x[i]-y[i]);break; }
+            break;
+        }
+        case 34: result = crt_string_length(a); break;
+        case 35: case 36: case 38: case 39:
+            result = (uint32_t)crt_compare(a,b,(op==35||op==38)?16u*1024u*1024u:n,op>=38); break;
+        case 37:
+            if (!crt_sort(c,a,b,n,args[3])) return 0;
+            atomic_fetch_add_explicit(&native_counts[id], 1, memory_order_relaxed);
+            break;
+        }
+    }
+    /* All of these MSVCR80 imports use cdecl; the caller removes arguments. */
+    c->eax = result; c->eip = returned; c->esp = esp + 4;
+    return 1;
+}
+/* Bounded worker-local staging for void OpenGL STATE calls. Records use the
+ * existing graphics-batch.mjs wire layout; arrays, uploads and swaps still go
+ * through JS, which owns their mirroring and pacing. No guest pointer remains
+ * live in a record: vector bytes are copied at the original call. */
+#define GRAPHICS_FLUSH_IMPORT UINT32_C(0xfffffffe)
+#define GRAPHICS_STAGE_WORDS 8192u
+static _Atomic uint32_t graphics_imports[NATIVE_THUNKS];
+static _Thread_local uint32_t graphics_stage[GRAPHICS_STAGE_WORDS];
+static _Thread_local uint32_t graphics_length;
+static _Thread_local int graphics_enabled, graphics_flushing;
+static _Thread_local CPU *graphics_owner;
+EXPORT(wc3_bind_graphics_import) int wc3_bind_graphics_import(uint32_t id, uint32_t descriptor) {
+    if (id >= NATIVE_THUNKS) return 0;
+    uint32_t argc = descriptor & 255u, pointer = (descriptor >> 8) & 255u, rule = (descriptor >> 16) & 255u;
+    if (descriptor && ((descriptor >> 24) != 0xa5u || argc > 16u || pointer > argc ||
+            (!pointer && rule) || (pointer && !((rule > 0u && rule <= 64u) || (rule >= 128u && rule <= 133u))) ||
+            (rule >= 128u && argc < ((rule == 130u || rule == 131u) ? 1u : 2u)))) return 0;
+    atomic_store_explicit(&graphics_imports[id], descriptor, memory_order_release);
+    return 1;
+}
+EXPORT(wc3_graphics_enable) int wc3_graphics_enable(uint32_t enabled) {
+    if (graphics_length || graphics_flushing) return 0;
+    graphics_enabled = !!enabled; graphics_owner = NULL; return 1;
+}
+EXPORT(wc3_graphics_pointer) uintptr_t wc3_graphics_pointer(void) { return (uintptr_t)graphics_stage; }
+EXPORT(wc3_graphics_bytes) uint32_t wc3_graphics_bytes(void) { return graphics_length * 4u; }
+EXPORT(wc3_graphics_discard) void wc3_graphics_discard(void) {
+    /* A host exception unwinds WASM past flush's epilogue. Recovery must not
+     * replay those records or preserve its reentrancy guard. */
+    graphics_length = 0; graphics_owner = NULL; graphics_flushing = 0;
+}
+EXPORT(wc3_graphics_flush) void wc3_graphics_flush(CPU *c) {
+    if (!graphics_length) return;
+    if (graphics_flushing) wc3_cpu_fault(c, c->eip, "Reentrant native graphics flush");
+    graphics_flushing = 1;
+    wc3_host_call(GRAPHICS_FLUSH_IMPORT, graphics_owner ? graphics_owner : c);
+    graphics_flushing = 0; graphics_length = 0; graphics_owner = NULL;
+}
+static int native_graphics_import(uint32_t id, CPU *c) {
+    if (!graphics_enabled || id >= NATIVE_THUNKS) return 0;
+    uint32_t descriptor = atomic_load_explicit(&graphics_imports[id], memory_order_acquire);
+    if (!descriptor) return 0;
+    if (graphics_flushing) wc3_cpu_fault(c, c->eip, "Reentrant native graphics record");
+    uint32_t argc = descriptor & 255u, pointer = (descriptor >> 8) & 255u, rule = (descriptor >> 16) & 255u;
+    uint32_t esp = c->esp, args[17];
+    memcpy(args, wc3_mem_check(esp, (argc + 1u) * 4u), (argc + 1u) * 4u);
+    uint32_t bytes = 0;
+    if (pointer) {
+        switch (rule) {
+        case 128: bytes = args[2] == 0x1204u ? 12u : args[2] >= 0x1200u && args[2] <= 0x1203u ? 16u : 4u; break;
+        case 129: bytes = args[2] == 0x1601u ? 4u : 16u; break;
+        case 130: bytes = args[1] == 0x0b66u ? 16u : 4u; break;
+        case 131: bytes = args[1] == 0x0b53u ? 16u : 4u; break;
+        case 132: bytes = args[2] == 0x1004u ? 16u : 4u; break;
+        case 133: bytes = args[2] == 0x2500u ? 4u : 16u; break;
+        default: bytes = rule; break;
+        }
+    }
+    const void *vector = pointer ? wc3_mem_check(args[pointer], bytes) : NULL;
+    uint32_t words = 4u + argc + (pointer ? 1u + ((bytes + 3u) / 4u) : 0u);
+    if ((graphics_owner && graphics_owner != c) || graphics_length + words > GRAPHICS_STAGE_WORDS) wc3_graphics_flush(c);
+    uint32_t *out = graphics_stage + graphics_length;
+    out[0] = words * 4u; out[1] = id; out[2] = args[0]; out[3] = argc;
+    memcpy(out + 4, args + 1, argc * 4u);
+    if (pointer) { out[4 + argc] = bytes; memcpy(out + 5 + argc, vector, bytes); }
+    graphics_owner = c; graphics_length += words;
+    c->eax = 0; c->esp = esp + (argc + 1u) * 4u; c->eip = args[0];
+    return 1;
+}
 void wc3_record_dispatch(CPU *c, uint32_t address) {
     Wc3Context *context = context_for(c);
     context->last_address = address;
@@ -127,7 +357,10 @@ void dispatch_indirect(CPU *c, uint32_t address) {
     wc3_record_dispatch(c, address);
     if (address == return_sentinel) { c->eip = address; return; }
     if (address >= 0xf1000000u && address < 0xf2000000u) {
-        wc3_host_call((address - 0xf1000000u) / 16, c);
+        uint32_t id = (address - 0xf1000000u) / 16;
+        if (native_graphics_import(id,c)) return;
+        wc3_graphics_flush(c);
+        if (!native_import(id,c)) wc3_host_call(id, c);
         return;
     }
     guest_fn_t function = find_function(address);
@@ -148,7 +381,10 @@ void dispatch_tail(CPU *c) {
     wc3_record_dispatch(c, address);
     if (address == return_sentinel) return;
     if (address >= 0xf1000000u && address < 0xf2000000u) {
-        wc3_host_call((address - 0xf1000000u) / 16, c);
+        uint32_t id = (address - 0xf1000000u) / 16;
+        if (native_graphics_import(id,c)) return;
+        wc3_graphics_flush(c);
+        if (!native_import(id,c)) wc3_host_call(id, c);
         return;
     }
     guest_fn_t function = find_function(address);
@@ -164,9 +400,9 @@ EXPORT(wc3_init) int wc3_init(uint32_t capacity) {
     if (g_mem) { snprintf(error_text, sizeof(error_text), "Runtime already initialized"); return 0; }
     if (capacity < 0x1000000u || capacity > 0x80000000u) return 0;
 #if WC3_FIXED_GUEST
-    /* The guest window (cpu.h) starts where the runtime's memory ends; later
-     * runtime allocations come after the window (the allocator takes memory
-     * from the current end), so nothing of the runtime is ever inside it. */
+    /* The guest window (cpu.h) starts after the initial native arena. Growing
+     * builds cap the native allocator there; legacy/compact builds allocate
+     * further native memory only after their fully committed guest window. */
     if (capacity > WC3_GUEST_WINDOW - 16u) { snprintf(error_text, sizeof(error_text), "Guest capacity exceeds the guest window"); return 0; }
     size_t pages = __builtin_wasm_memory_size(0);
     if (pages > WC3_GUEST_BASE / 65536u) {
@@ -174,6 +410,11 @@ EXPORT(wc3_init) int wc3_init(uint32_t capacity) {
         return 0;
     }
     size_t end = ((size_t)WC3_GUEST_BASE + WC3_GUEST_WINDOW + 16u + 65535u) / 65536u;
+#if WC3_GROWING_GUEST
+    /* Boot only needs the main stack and TEB; images and the heap commit
+     * their ranges later. The native allocator remains in the initial arena. */
+    end = ((size_t)WC3_GUEST_BASE + WC3_MAIN_STACK_TOP + 0x1000u + 65535u) / 65536u;
+#endif
     if (__builtin_wasm_memory_grow(0, end - pages) == (size_t)-1) {
         snprintf(error_text, sizeof(error_text), "Cannot allocate guest address space");
         return 0;
@@ -282,11 +523,24 @@ EXPORT(wc3_context_destroy) int wc3_context_destroy(CPU *c) {
 EXPORT(wc3_guest_alloc) uint32_t wc3_guest_alloc(uint32_t bytes) {
     uint64_t rounded = ((uint64_t)bytes + 15u) & ~15ull;
     if (!rounded) rounded = 16;
-    uint32_t address = atomic_load_explicit(&heap_next, memory_order_relaxed);
+    uint32_t address;
+#if WC3_FIXED_GUEST && WC3_GROWING_GUEST
+    lock_guest_growth();
+    address = atomic_load_explicit(&heap_next, memory_order_relaxed);
+    if (address + rounded > WC3_HEAP_LIMIT || address + rounded > g_mem_size ||
+        !ensure_guest_unlocked(address + (uint32_t)rounded)) {
+        unlock_guest_growth();
+        return 0;
+    }
+    atomic_store_explicit(&heap_next, address + (uint32_t)rounded, memory_order_relaxed);
+    unlock_guest_growth();
+#else
+    address = atomic_load_explicit(&heap_next, memory_order_relaxed);
     do {
         if (address + rounded > WC3_HEAP_LIMIT || address + rounded > g_mem_size) return 0;
     } while (!atomic_compare_exchange_weak_explicit(&heap_next, &address, address + (uint32_t)rounded,
                                                    memory_order_relaxed, memory_order_relaxed));
+#endif
     memset(g_mem + address, 0, (size_t)rounded);
     return address;
 }

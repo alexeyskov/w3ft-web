@@ -21,8 +21,10 @@ from aiohttp import web
 from .admin import Admin
 from .compression import GzipCache, accepts_gzip, compressible
 from .geoip import GeoLanguage
+from .issues import IssueTracker
 from .maps import MapCatalog
 from .presence import Presence
+from .activity import ActivityHistory
 from .relay import Relay
 from .sessions import SessionReport, default_report_path
 
@@ -102,6 +104,7 @@ def runtime_status(root):
         if compat:
             result.update(compatWasmUrl="/runtime/" + compat[0], compatWasmSize=compat[1])
         result["diagnostics"] = manifest.get("diagnostics") is True
+        result["buildId"] = str(manifest.get("buildId", "unknown"))[:128]
         result["graphics"] = manifest.get("graphics", "webgpu")
         if result["diagnostics"]:
             result["reason"] = "Доступен запуск оригинальной игры. Совместимость и производительность ещё проверяются."
@@ -272,6 +275,7 @@ async def status(request):
     languages = await asyncio.to_thread(game_languages, state["base_language"], state["locales"])
     return web.json_response({"schemaVersion": 1, "game": {**game_summary(state["game"], report), "languages": languages},
                               "runtime": runtime_status(state["runtime"]),
+                              "issueReporting": {"enabled": state["issues"].enabled},
                               "transport": {"available": True, "protocol": "wc3-frame-relay-v1",
                                             "gameNetworkingImplemented": False,
                                             "connectedPeers": sum(len(r.peers) for r in state["relay"].rooms.values())},
@@ -378,7 +382,8 @@ async def headers(request, response):
 
 
 def create_app(*, game_dir=None, maps_dir=None, runtime_dir=None, report_path=None, web_dir=None,
-               locales_dir=None, base_language="ru", geoip_path=None, presence_report=None, admin_password_hash=None):
+               locales_dir=None, base_language="ru", geoip_path=None, presence_report=None, admin_password_hash=None,
+               issues_dir=None, activity_dir=None):
     app = web.Application(client_max_size=1024 * 1024)
     game = Path(game_dir or ROOT / "var/game").absolute()
     runtime = Path(runtime_dir or ROOT / "var/runtime").absolute()
@@ -386,12 +391,16 @@ def create_app(*, game_dir=None, maps_dir=None, runtime_dir=None, report_path=No
     admin_password_hash = os.environ.get("WC3_ADMIN_PASSWORD_HASH", "") if admin_password_hash is None else admin_password_hash
     presence = Presence(relay=relay, track_clients=presence_report is not None or bool(admin_password_hash),
                         legacy_kick_guard=bool(admin_password_hash))
-    admin = Admin(presence, admin_password_hash, web_dir or ROOT / "web")
+    admin = Admin(presence, admin_password_hash, web_dir or ROOT / "web", data_dir=game)
+    issue_path = os.environ.get("WC3_ISSUES_DIR", str(ROOT / "var/issues")) if issues_dir is None else issues_dir
+    issues = IssueTracker(issue_path or None)
+    activity_path = os.environ.get("WC3_ACTIVITY_DIR", str(game.parent / "activity")) if activity_dir is None else activity_dir
+    activity = ActivityHistory(presence, activity_path or None)
     relay.on_change = presence.changed
     geo = GeoLanguage(geoip_path or ROOT / "var/geoip/dbip-country-lite.csv.gz")
     app[STATE] = {"game": game, "maps": MapCatalog(maps_dir or default_maps_dir()),
                   "runtime": runtime, "report": Path(report_path or ROOT / "var/reports/game.json"),
-                  "relay": relay, "presence": presence, "admin": admin, "geo": geo, "gzip": GzipCache(), "asset_files": MapCatalog(game),
+                  "relay": relay, "presence": presence, "admin": admin, "issues": issues, "activity": activity, "geo": geo, "gzip": GzipCache(), "asset_files": MapCatalog(game),
                   "locales": Path(locales_dir or ROOT / "var/locales").absolute(), "base_language": base_language,
                   "runtime_files": MapCatalog(runtime), "web_files": MapCatalog(web_dir or ROOT / "web")}
     app.on_response_prepare.append(headers)
@@ -400,8 +409,11 @@ def create_app(*, game_dir=None, maps_dir=None, runtime_dir=None, report_path=No
     if presence_report is not None:
         app.cleanup_ctx.append(SessionReport(presence, presence_report).watch)
     app.on_shutdown.append(relay.shutdown)
+    app.cleanup_ctx.append(relay.lifecycle)
     app.on_shutdown.append(presence.shutdown)
     admin.install(app)
+    issues.install(app, admin)
+    activity.install(app, admin)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/maps", maps)
     app.router.add_get("/api/maps/{id}/download", download_map)
@@ -428,6 +440,7 @@ def main():
     parser.add_argument("--locales-dir", type=Path, default=ROOT / "var/locales",
                         help="Other game languages prepared by tools/prepare_locale.py")
     parser.add_argument("--base-language", default="ru", help="Language of the base installation")
+    parser.add_argument("--issues-dir", type=Path, help="Persistent SQLite issue reports (default: WC3_ISSUES_DIR or var/issues)")
     parser.add_argument("--geoip", type=Path, default=ROOT / "var/geoip/dbip-country-lite.csv.gz",
                         help="DB-IP country database from tools/fetch_geoip.py: default page language")
     reports = parser.add_mutually_exclusive_group()
@@ -439,6 +452,7 @@ def main():
                            runtime_dir=args.runtime_dir, report_path=args.report_path,
                            locales_dir=args.locales_dir, base_language=args.base_language,
                            geoip_path=args.geoip,
+                           issues_dir=args.issues_dir,
                            presence_report=None if args.no_presence_report else args.presence_report or default_report_path(args.port)),
                 host=args.host, port=args.port)
 

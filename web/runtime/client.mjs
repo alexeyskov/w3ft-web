@@ -7,44 +7,71 @@ import {cacheEntries,cacheKey,cacheStatus,cacheSupported,clearCache} from './gam
 import {TouchGestures} from './touch-input.mjs';
 import {peerGonePacket} from './winsock.mjs';
 import {screenshotFile} from './screenshot.mjs';
+import {runtimeBuildId} from './runtime-build.mjs';
+import {RETRY_DELAYS} from './range-request.mjs';
+export {runtimeBuildId};
 
 // Game data on this device (game-cache.mjs) for the launcher page: the
-// archives and binaries of one language. Maps (56 MB) are stored as the game
-// reads them; the launcher does not load the map catalog.
-async function gameDataEntries(language) {
-  const response=await fetch(language?`/api/assets?language=${encodeURIComponent(language)}`:'/api/assets');
+// Selected edition, server maps and prepared campaign movies; no duplicate
+// original movie files and no startup intro downloads.
+// The lists are asked again after a dropped connection or a busy server, with
+// the pauses of the game's block reads: on a poor link one failed request
+// ended the whole download ("Failed to fetch").
+async function fetchListing(url,signal){
+  for(let attempt=0;;attempt++){
+    let response=null,error=null;
+    try{response=await fetch(url,{signal});}catch(caught){error=caught;}
+    const retry=error?error.name!=='AbortError':response.status===408||response.status===429||response.status>=500;
+    if(!retry||attempt>=RETRY_DELAYS.length){if(error)throw error;return response;}
+    await new Promise(resolve=>setTimeout(resolve,RETRY_DELAYS[attempt]));
+    if(signal?.aborted)throw signal.reason??new DOMException('Aborted','AbortError');
+  }
+}
+async function gameDataEntries(language,signal) {
+  const [response,maps]=await Promise.all([
+    fetchListing(language?`/api/assets?language=${encodeURIComponent(language)}`:'/api/assets',signal),
+    fetchListing('/api/maps',signal).then(r=>r.ok?r.json():{maps:[]})]);
   if(!response.ok)throw new Error(`HTTP ${response.status}`);
-  return cacheEntries((await response.json()).files);
+  return cacheEntries((await response.json()).files,maps.maps||[]);
 }
 export async function gameDataStatus({language}={}){return cacheStatus(await gameDataEntries(language));}
 export async function deleteGameData(){await clearCache();}
-export function preloadGameData({language,onProgress=()=>{}}={}){
+export function preloadGameData({language,onProgress=()=>{},onStatus=()=>{}}={}){
   const worker=new Worker(new URL('./game-cache-worker.mjs',import.meta.url),{type:'module'});
   let settle;const done=new Promise((resolve,reject)=>{settle={resolve,reject};});
   const fail=(message,code)=>{worker.terminate();const error=new Error(message||code);error.code=code;settle.reject(error);};
   worker.onmessage=({data})=>{
     if(data.type==='progress')onProgress(data);
-    else if(data.type==='done'||data.type==='cancelled'){worker.terminate();settle.resolve(data);}
-    else if(data.type==='error')fail(data.message,data.code);
+    else if(data.type==='status')onStatus(data.message);
+    else if(data.type==='done'||data.type==='cancelled'){
+      onStatus(`Game data preload: ${JSON.stringify(data.metrics||{})}`);
+      worker.terminate();settle.resolve(data);
+    }else if(data.type==='error'){
+      onStatus(`Game data preload: ${JSON.stringify(data.metrics||{})}`);fail(data.message,data.code);
+    }
   };
   worker.onerror=event=>fail(event.message||'Preload worker failed','network');
-  gameDataEntries(language).then(entries=>{
+  // Stopping while the lists are still being asked for is a cancellation too.
+  const listing=new AbortController();
+  gameDataEntries(language,listing.signal).then(entries=>{
     navigator.storage?.persist?.().catch(()=>{}); // ask the browser not to evict it
     worker.postMessage({type:'preload',entries});
-  },error=>fail(error.message,'network'));
-  return {done,cancel:()=>worker.postMessage({type:'cancel'})};
+  },error=>{
+    if(listing.signal.aborted){worker.terminate();settle.resolve({type:'cancelled'});}
+    else fail(error.message,'network');
+  });
+  return {done,cancel:()=>{listing.abort();worker.postMessage({type:'cancel'});}};
 }
 
-// Before the game starts: what it reads up to its main menu, downloaded at
-// once with progress instead of block by block after the intro cinematic.
-// boot-<language>.json (tools/record_boot_set.py) lists the files read whole
-// (executables), the archive blocks and the intro cinematic; without it only
-// the executables are fetched. The WebAssembly module stays in the browser's
-// HTTP cache, where the runtime worker revalidates it; the rest goes to game
-// data on this device (game-cache.mjs), and the cinematic plays from there:
-// pass `media` to runDiagnostics. Failures only mean slower loading, so they
-// go to onStatus and the launch continues.
-export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,onProgress=()=>{},onStatus=()=>{}}={}){
+// Critical startup resources first, before automatic background work begins.
+// boot-<language>.json lists executable files and the archive blocks needed
+// by the main menu. Intros are skipped by default. skipIntro:false retains
+// the old explicit cinematic diagnostic when the recorded set includes one.
+// WASM uses the HTTP cache; game files use OPFS. Failures fall back to demand
+// reads, are logged, and do not prevent starting the game.
+export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,skipIntro=true,onProgress=()=>{},onStatus=()=>{}}={}){
+  const started=performance.now(),milliseconds=value=>Math.round(value);
+  onStatus(`Runtime build: ${runtimeBuildId}; preload language=${language||'base'}`);
   const abort=new AbortController(),parts={wasm:{done:0,total:0,known:false},data:{done:0,total:0,known:false}};
   let worker=null,cancelled=false,settleWorker=null;
   // The total only once both parts know their size: a growing total would
@@ -53,15 +80,21 @@ export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,onP
   const known=part=>{if(!part.known){part.known=true;report();}};
   const json=response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json();};
   const wasm=(async()=>{
+    const began=performance.now();
     // Already in the HTTP cache at the server's version (ETag): nothing to fetch.
     const cached=await fetch(wasmUrl,{cache:'only-if-cached',mode:'same-origin',signal:abort.signal}).catch(()=>null);
     if(cached?.ok){
       cached.body?.cancel().catch(()=>{});
       const current=await fetch(wasmUrl,{method:'HEAD',cache:'no-store',signal:abort.signal}).catch(()=>null);
       const version=current?.ok?current.headers.get('ETag'):null;
-      if(version&&version===cached.headers.get('ETag')){known(parts.wasm);return;}
+      if(version&&version===cached.headers.get('ETag')){
+        onStatus(`WebAssembly preload: ${JSON.stringify({cache:'validated',elapsedMs:milliseconds(performance.now()-began),bytes:0})}`);
+        known(parts.wasm);return;
+      }
     }
+    const requestStarted=performance.now();
     const response=await fetch(wasmUrl,{signal:abort.signal});
+    const headersAt=performance.now();
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     // A gzip download: the stream yields the uncompressed module, so progress
     // scales it to the compressed size the network carries.
@@ -70,10 +103,12 @@ export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,onP
     const reader=response.body.getReader();let received=0;
     for(;;){const {done,value}=await reader.read();if(done)break;received+=value.length;if(size)parts.wasm.done=Math.min(parts.wasm.total,Math.round(received/size*parts.wasm.total));report();}
     parts.wasm.done=parts.wasm.total;report();
+    onStatus(`WebAssembly preload: ${JSON.stringify({cache:'downloaded',elapsedMs:milliseconds(performance.now()-began),firstByteMs:milliseconds(headersAt-requestStarted),bodyMs:milliseconds(performance.now()-headersAt),transferBytes:sent||received,decodedBytes:received})}`);
   })();
   const data=(async()=>{
     if(!cacheSupported()){known(parts.data);return [];}
     const signal=abort.signal;
+    const metadataStarted=performance.now();
     const [assets,boot,build]=await Promise.all([
       fetch(language?`/api/assets?language=${encodeURIComponent(language)}`:'/api/assets',{signal}).then(json),
       fetch(new URL(`./boot-${language||'base'}.json`,import.meta.url),{signal}).then(response=>response.ok?response.json():null).catch(()=>null),
@@ -81,23 +116,30 @@ export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,onP
     const files=new Map(assets.files.map(file=>[file.path.toLowerCase(),file])),items=[],media=[];
     const add=(path,blocks)=>{
       const file=files.get(String(path).toLowerCase());if(!file?.version)return null;
-      const item={key:cacheKey('a',file.id,file.version),size:file.size,url:file.downloadUrl,...blocks?{blocks}:{}};items.push(item);return {file,item};
+      const item={key:cacheKey('a',file.id,file.version),size:file.size,url:file.downloadUrl,label:file.path,...blocks?{blocks}:{}};items.push(item);return {file,item};
     };
     if(boot?.schemaVersion===1){
       for(const entry of boot.files||[]){
-        if(files.get(String(entry.path).toLowerCase())?.size!==entry.size)continue; // another copy of the file: its blocks differ
+        const current=files.get(String(entry.path).toLowerCase());
+        if(current?.size!==entry.size || (entry.version&&entry.version!==current.version))continue;
         add(entry.path,entry.whole?null:(entry.blocks||[]).flatMap(([first,last])=>Array.from({length:Math.max(0,last-first+1)},(_,i)=>first+i)));
       }
-      for(const path of boot.media||[]){const added=add(path,null);if(added)media.push(added);}
+      if(!skipIntro)for(const path of boot.media||[]){const added=add(path,null);if(added)media.push(added);}
     }else for(const module of build.modules||[])add(module.image,null);
+    onStatus(`Preload metadata: ${JSON.stringify({elapsedMs:milliseconds(performance.now()-metadataStarted),bootSet:boot?.schemaVersion===1,items:items.length})}`);
     if(!items.length){known(parts.data);return [];}
     await new Promise((resolve,reject)=>{
       worker=new Worker(new URL('./game-cache-worker.mjs',import.meta.url),{type:'module'});
       settleWorker=resolve;
       worker.onmessage=({data:message})=>{
         if(message.type==='progress'){parts.data.done=message.done;parts.data.total=message.total;parts.data.known=true;report();}
-        else if(message.type==='done'||message.type==='cancelled')resolve();
-        else if(message.type==='error')reject(Object.assign(new Error(message.message||message.code),{code:message.code}));
+        else if(message.type==='status')onStatus(message.message);
+        else if(message.type==='done'||message.type==='cancelled'){
+          onStatus(`Preload game data: ${JSON.stringify(message.metrics||{})}`);resolve();
+        }else if(message.type==='error'){
+          onStatus(`Preload game data: ${JSON.stringify(message.metrics||{})}`);
+          reject(Object.assign(new Error(message.message||message.code),{code:message.code}));
+        }
       };
       worker.onerror=event=>reject(new Error(event.message||'Game data worker failed'));
       worker.postMessage({type:'prepare',items,concurrency:6});
@@ -118,6 +160,7 @@ export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,onP
         if(stored.size===file.size)sources.set(new URL(file.downloadUrl,location.href).pathname,URL.createObjectURL(stored));
       }catch(error){onStatus(`Cinematic ${file.path}: ${error.message}`);}
     }
+    onStatus(`Preload complete: ${JSON.stringify({elapsedMs:milliseconds(performance.now()-started),cancelled,cinematicsOnDevice:sources.size})}`);
     return {cancelled,media:sources,release:()=>{for(const url of sources.values())URL.revokeObjectURL(url);sources.clear();}};
   });
   return {done,cancel:()=>{if(cancelled)return;cancelled=true;abort.abort();if(worker)worker.postMessage({type:'cancel'});else settleWorker?.();}};
@@ -125,7 +168,7 @@ export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,onP
 
 // An actual translated-code boot diagnostic. Campaign/multiplayer remain
 // disabled in the runtime manifest until their acceptance tests pass.
-export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtime/wc3.wasm',saves,transport=null,map=null,onStatus=()=>{},onReport=()=>{},onFrame=()=>{},onSnapshot,onScreenshot,captureGraphics=false,graphicsDebugChecks=false,batchGraphics=true,legacyClampToEdge=true,nativeTextureShader=true,strictFinish=false,vsync=true,maxFps=0,profileRpc=false,audioEnabled=true,resolution,graphicsSettings,onGraphicsSetting=()=>{},language,timeout=30000,dispatchBudget=10000000}={}) {
+export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtime/wc3.wasm',saves,transport=null,map=null,onStatus=()=>{},onReport=()=>{},onFrame=()=>{},onSnapshot,onScreenshot,onCacheProgress=()=>{},backgroundCache=true,skipIntro=true,captureGraphics=false,graphicsDebugChecks=false,batchGraphics=true,nativeGraphics=false,legacyClampToEdge=true,nativeTextureShader=true,streamingBuffers=false,strictFinish=false,vsync=true,maxFps=0,profileRpc=false,audioEnabled=true,resolution,graphicsSettings,onGraphicsSetting=()=>{},language,timeout=30000,dispatchBudget=10000000}={}) {
   if(!Number.isInteger(dispatchBudget)||dispatchBudget<0||dispatchBudget>0xffffffff)throw new Error('Diagnostic dispatch budget must be uint32 (zero disables the limit)');
   if(!Number.isInteger(timeout)||timeout<0||timeout>0x7fffffff)throw new Error('Invalid session timeout (zero disables the limit)');
   resolution=gameResolution(resolution);graphicsSettings=gameGraphics(graphicsSettings);
@@ -140,7 +183,8 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
   // running. Removing the audio device makes guest code poll forever.
   try { await player.unlock(); }
   catch(error) { await audio.destroy(); throw error; }
-  const video=new VideoDispatcher({canvas,muted:!audioEnabled,sources:media,language,log:onStatus,onEvent:message=>worker?.postMessage(message)});
+  const video=new VideoDispatcher({canvas,muted:!audioEnabled,sources:new Map(media),language,log:onStatus,onEvent:message=>worker?.postMessage(message)});
+  const cachedMedia=new Map();
   let worker;
   try { worker=new Worker(new URL('./worker.mjs',import.meta.url),{type:'module'}); }
   catch(error) { video.destroy();await audio.destroy(); throw error; }
@@ -215,6 +259,7 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
   gone();
   const cleanup=()=>cleanupPromise??=(async()=>{
     finished=true;clearTimeout(timer);clearTimeout(shutdownTimer);for(const remove of listeners)remove();touch?.reset();video.destroy();worker.terminate();
+    for(const url of cachedMedia.values())URL.revokeObjectURL(url);cachedMedia.clear();
     gone();
     // Leaving fullscreen from script keeps Pointer Lock; the page needs its cursor back.
     if(canvas&&document.pointerLockElement===canvas)document.exitPointerLock();
@@ -252,12 +297,21 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
     const message=event.data;
     try{
       if(message.type==='status')onStatus(message.message);
+      else if(message.type==='cache-progress')onCacheProgress(message.progress);
+      else if(message.type==='cached-media'){
+        const path=new URL(message.url,location.href).pathname,previous=cachedMedia.get(path);
+        if(previous)URL.revokeObjectURL(previous);
+        const url=URL.createObjectURL(message.file);cachedMedia.set(path,url);video.sources.set(path,url);
+      }
       else if(message.type==='frame')onFrame(message.frame);
       else if(message.type==='graphics-setting')onGraphicsSetting(message.name,message.value);
       else if(message.type==='snapshot')onSnapshot?.(message.snapshot);
       else if(message.type==='screenshot')void screenshot(message);
       else if(message.type==='save-changes')await saveWriter.enqueue(message.changes);
-      else if(message.type==='packet')transport?.send(message.destination,message.data);
+      else if(message.type==='packet'){
+        if(message.destination===255){try{transport?.send(255,message.data);}catch{ /* Optional telemetry. */ }}
+        else transport?.send(message.destination,message.data);
+      }
       else if(message.type==='audio'){
         const result=await audio.handle(message);
         if(result.error)onStatus(`Audio ${result.operation}: ${result.error}`);
@@ -275,7 +329,7 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
   try{
     const savedFiles=await saves?.list()||[];
     const offscreen=canvas?.transferControlToOffscreen();
-    worker.postMessage({type:'start',options:{wasmUrl,canvas:offscreen,map,captureGraphics,graphicsDebugChecks,batchGraphics,legacyClampToEdge,nativeTextureShader,strictFinish,vsync,maxFps,profileRpc,resolution,graphicsSettings,language,monitor:typeof onSnapshot==='function',persist:!!saves,timeout,budget:dispatchBudget,audio:true,peerId:transport?.peerId,peerIds:transport?.peerIds,savedFiles}},offscreen?[offscreen]:[]);
+    worker.postMessage({type:'start',options:{wasmUrl,canvas:offscreen,map,backgroundCache,skipIntro,captureGraphics,graphicsDebugChecks,batchGraphics,nativeGraphics,legacyClampToEdge,nativeTextureShader,streamingBuffers,strictFinish,vsync,maxFps,profileRpc,resolution,graphicsSettings,language,monitor:typeof onSnapshot==='function',persist:!!saves,timeout,budget:dispatchBudget,audio:true,peerId:transport?.peerId,peerIds:transport?.peerIds,savedFiles}},offscreen?[offscreen]:[]);
   }catch(error){await cleanup();throw error;}
   // On-screen keys (touch screens): the same messages a keyboard sends.
   const key=(type,{keyCode,text='',extended=false}={})=>{

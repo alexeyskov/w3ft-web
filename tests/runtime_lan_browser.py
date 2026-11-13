@@ -39,7 +39,7 @@ HOST_ACTIONS = [
     {'click':[144,314],'frames':15}, {'click':[876,649],'frames':24},
 ]
 
-BOOT = r'''async ({room,resolution,compat}) => {
+BOOT = r'''async ({room,resolution,compat,language}) => {
   if (!crossOriginIsolated) throw Error('Missing cross-origin isolation');
   const status=await (await fetch('/api/status')).json();
   const module=await import(status.runtime.moduleUrl);
@@ -83,8 +83,9 @@ BOOT = r'''async ({room,resolution,compat}) => {
   document.body.append(canvas);
   const wasmUrl=compat?status.runtime.compatWasmUrl:status.runtime.wasmUrl;
   if(!wasmUrl)throw Error('The server has no compatible build');
-  window.session=await module.runDiagnostics({canvas,wasmUrl,saves:probeSaves,transport,resolution,
+  window.session=await module.runDiagnostics({canvas,wasmUrl,saves:probeSaves,transport,resolution,language,
     audioEnabled:false,timeout:0,dispatchBudget:0,
+    onCacheProgress:progress=>probe.cache=progress,
     onStatus:message=>{probe.log.push(message);if(probe.log.length>100)probe.log.shift();},
     onReport:report=>probe.report=report,
     onFrame:frame=>probe.frame={...frame,rendererFrame:frame.frames,frames:(probe.frame?.frames||0)+1}});
@@ -130,10 +131,12 @@ class Peer:
         (self.output/'live.json').write_text(json.dumps(live,ensure_ascii=False,indent=2)+'\n')
 
     async def start(self, room, resolution, compat=False):
-        await self.page.evaluate(BOOT, {'room':room,'resolution':resolution,'compat':compat})
-        await self.wait('[...document.querySelectorAll("video")].some(v=>v.currentTime>3)')
-        await self.page.locator('#game-probe').press('Escape')
+        await self.page.evaluate(BOOT, {'room':room,'resolution':resolution,'compat':compat,'language':'ru'})
         await self.wait('!document.querySelector("video") && probe.frame?.frames>=10')
+        # The first rendered frames include the native menu's slide-in. Its
+        # controls are not ready until that wall-clock animation has finished.
+        await asyncio.sleep(2.5)
+        await self.frames(2)
         await self.capture('menu')
         print(json.dumps({'peer':self.name,'stage':'menu'}),flush=True)
 
@@ -177,7 +180,7 @@ class Peer:
         return result
 
 
-async def main(url,output,timeout,resolution,compat='none',host_browser='chromium',guest_browser='chromium'):
+async def main(url,output,timeout,resolution,compat='none',host_browser='chromium',guest_browser='chromium',late_guest=False):
     output.mkdir(parents=True,exist_ok=True)
     width,height=map(int,resolution.split('x'))
     run_id=datetime.now(timezone.utc).isoformat()
@@ -203,14 +206,24 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             response=await host.page.request.post(url+'/api/lobbies',data={'name':'Original Warcraft LAN regression'})
             assert response.status==201,await response.text()
             lobby=await response.json();evidence['lobby']=lobby
-            await asyncio.gather(*(peer.start(lobby['id'],{'width':width,'height':height},compat in (peer.name,'both')) for peer in peers))
+            if late_guest:
+                await host.start(lobby['id'],{'width':width,'height':height},compat in ('host','both'))
+                rows=await map_list_rows(host.page.request,url)
+                for action in HOST_ACTIONS:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
+                # The host already advertises before the guest even launches.
+                # Discovery must work by the later SEARCHGAME/response exchange.
+                await guest.start(lobby['id'],{'width':width,'height':height},compat in ('guest','both'))
+            else:
+                await asyncio.gather(*(peer.start(lobby['id'],{'width':width,'height':height},compat in (peer.name,'both')) for peer in peers))
             listing=await (await host.page.request.get(url+'/api/lobbies')).json()
             assert next(item for item in listing['lobbies'] if item['id']==lobby['id'])['players']==2
+            assert (await (await host.page.request.get(url+'/api/status')).json())['presence']['lanGames']==0, 'Waiting in a lobby is not a match'
             await guest.action({'click':[875,332],'frames':8})
             await guest.action({'click':[230,138],'frames':2})
             await guest.action({'text':'WebGuest','frames':2})
-            rows=await map_list_rows(host.page.request,url)
-            for action in HOST_ACTIONS:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
+            if not late_guest:
+                rows=await map_list_rows(host.page.request,url)
+                for action in HOST_ACTIONS:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
             await guest.wait('(probe.network.received["30"]||0)>0')
             await guest.action({'click':[185,235],'frames':5},'discovered')
             assert await guest.page.evaluate('probe.network.recent.some(p=>p.id==="30"&&p.text?.includes("WebHost"))'),'Original host was not advertised'
@@ -222,6 +235,8 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             await host.action({'click':[878,633],'frames':10},'starting')
             await guest.wait('(probe.network.sent["23"]||0)>0 && (probe.network.received["0c"]||0)>=5')
             await host.wait('(probe.network.received["23"]||0)>0')
+            await host.wait('document.getElementById("online-lan").textContent === "1"')
+            assert (await (await host.page.request.get(url+'/api/status')).json())['presence']['lanGames']==1, 'Two clients must count as one match'
             await asyncio.gather(*(peer.frames(15) for peer in peers))
             await asyncio.gather(*(peer.capture('gameplay') for peer in peers))
             baseline=await guest.page.evaluate('({actions:probe.network.sent["26"]||0,steps:probe.network.received["0c"]||0})')
@@ -244,8 +259,9 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             guest_packets=evidence['network']['guest']['received']
             assert guest_packets.get('07',0)==0 and guest_packets.get('1c',0)==0,'Player left or was kicked during the observed match'
             assert evidence['network']['guest']['sent'].get('21',0)==0,'Guest left the match before shutdown'
-            evidence['checks']={'publicLobbyTwoPeers':True,'originalDiscovery':True,'originalJoin':True,
-                'bothLoadedEchoIsles':True,'guestCommandSentAndReceived':True,'continuedLockstepFrames':True,'runtimeFaults':False}
+            evidence['checks']={'publicLobbyTwoPeers':True,'originalDiscovery':True,'originalJoin':True,'guestLaunchedAfterHosting':late_guest,
+                'bothLoadedEchoIsles':True,'guestCommandSentAndReceived':True,'continuedLockstepFrames':True,
+                'liveLANGameCount':True,'runtimeFaults':False}
             print(json.dumps({'stage':'match-verified','checks':evidence['checks']}),flush=True)
         except BaseException as error:
             evidence['failure']=repr(error)
@@ -260,6 +276,12 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
                 for peer,result in zip(peers,stopped):
                     if isinstance(result,BaseException):evidence.setdefault('cleanupErrors',{})[peer.name]=str(result)
                     elif result:results.append(result)
+                if not evidence.get('failure') and not evidence.get('cleanupErrors'):
+                    try:
+                        await peers[0].wait('fetch("/api/status").then(r=>r.json()).then(s=>s.presence.lanGames===0)', allow_report=True)
+                        evidence['checks']['LANGameCountClearedAfterStop']=True
+                    except Exception as error:
+                        evidence.setdefault('cleanupErrors',{})['LANGameCounter']=str(error)
             for peer in peers:
                 try:await peer.browser.close()
                 except Exception:pass
@@ -270,7 +292,8 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
     for result in results:
         report=result['report']
         assert report.get('wasmExecuted') and report.get('profileVerified'),report
-        assert report.get('error',{}).get('message')=='Guest process stopped',report.get('error')
+        assert ((report.get('error') or {}).get('message')=='Guest process stopped' or
+                report.get('stage')=='guest-exited' and report.get('exitCode')==0 and report.get('error') is None),report.get('error')
     evidence.update(passed=True,status='passed',completedAt=datetime.now(timezone.utc).isoformat())
     evidence['reports']={peer.name:f'{peer.name}/report.json' for peer in peers}
     summary.write_text(json.dumps(evidence,ensure_ascii=False,indent=2)+'\n')
@@ -286,4 +309,5 @@ if __name__=='__main__':
     parser.add_argument('--compat',choices=['none','host','guest','both'],default='none',help='clients on wc3-compat.wasm')
     parser.add_argument('--host-browser',choices=['chromium','webkit','firefox'],default='chromium')
     parser.add_argument('--guest-browser',choices=['chromium','webkit','firefox'],default='chromium')
-    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution,args.compat,args.host_browser,args.guest_browser))
+    parser.add_argument('--late-guest',action='store_true',help='Launch the guest only after the host has created its Warcraft game')
+    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution,args.compat,args.host_browser,args.guest_browser,args.late_guest))

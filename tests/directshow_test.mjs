@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {WarcraftHost} from '../web/runtime/host.mjs';
+import {WarcraftHost,GuestFault} from '../web/runtime/host.mjs';
+import {WorkerVideo} from '../web/runtime/video-bridge.mjs';
 
-function fixture(){
+function fixture(service=null){
   let cursor=0x10000,position=0,notify;
   const requests=[];
-  const video={
+  const video=service||{
     create(listener){notify=listener;return 1;},
     load(id,path){requests.push({id,method:'load',path});return {width:800,height:368,duration:12,frameRate:24};},
     request(id,method,fields={}){requests.push({id,method,...fields});if(method==='seek')position=fields.position;return {position};},
@@ -33,7 +34,7 @@ function fixture(){
   assert.equal(create([guid('e436ebb3-524f-11ce-9f53-0020af0ba770'),0,1,iid('a9'),output]),0);
   const graph=h.u32(output);
   const query=part=>{assert.equal(call(graph,0,iid(part),output),0);return h.u32(output);};
-  return {h,call,graph,query,wide,guid,output,requests,ended:()=>notify('ended')};
+  return {h,call,graph,query,wide,guid,output,requests,video,ended:()=>notify('ended')};
 }
 
 test('DirectShow COM ABI loads real media metadata, forwards playback and returns double positions',()=>{
@@ -74,4 +75,59 @@ test('DirectShow completion signals its event and posts the guest notification e
   assert.equal(h.handles.get(handle).signal,false);
   assert.equal(call(events,8,output,output+4,output+8,0),0x80004004);
   call(events,2);call(graph,2);assert.equal(h.handles.has(handle),false);
+});
+
+test('A real video RPC timeout skips the cinematic and release does not wait again',async()=>{
+  const messages=[],video=new WorkerVideo({timeout:10,post:message=>messages.push(message),movies:new Map([
+    ['movies/introx.mpq',{downloadUrl:'/api/assets/intro.webm',frameRate:'24/1'}],
+  ])});
+  const {h,graph,call,query,wide,output}=fixture(video),control=query('b1'),events=query('c0');
+  assert.equal(call(graph,13,wide('Movies\\IntroX.mpq'),0),0,'A missing reply must not abort RenderFile');
+  assert.equal(Atomics.load(new Int32Array(messages[0].control),0),-2);
+  assert.equal(call(control,7),0);assert.equal(call(control,7),0);
+  await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(call(events,8,output,output+4,output+8,0),0);
+  assert.equal(h.u32(output),1,'The game receives EC_COMPLETE, like a skipped movie');
+  assert.equal(call(events,8,output,output+4,output+8,0),0x80004004,'Completion is not duplicated');
+  call(events,2);call(control,2);assert.equal(call(graph,2),0);
+  assert.equal(messages.at(-1).method,'destroy');
+  assert.equal(Atomics.load(new Int32Array(messages.at(-1).control),0),0,'Failed-load cleanup was sent without another blocking wait');
+  assert.equal(video.listeners.size,0);
+});
+
+test('Stopping or releasing a failed movie cancels deferred completion',async()=>{
+  for(const action of ['stop','release']){
+    const {graph,call,query,wide,output,video}=fixture(),control=query('b1'),events=query('c0');
+    video.load=()=>{throw new GuestFault('Video load: cannot decode',{videoOperation:'load',reason:'media'});};
+    assert.equal(call(graph,13,wide('Movies\\IntroX.mpq'),0),0);
+    assert.equal(call(events,7,output),0);
+    call(control,7);
+    if(action==='stop')call(control,9);
+    else{call(events,2);call(control,2);call(graph,2);}
+    await new Promise(resolve=>setTimeout(resolve,5));
+    if(action==='stop')assert.equal(call(events,8,output,output+4,output+8,0),0x80004004);
+  }
+});
+
+test('Missing media and malformed bridge replies remain actionable errors',()=>{
+  const {graph,call,wide,video}=fixture();
+  for(const message of ['Browser cinematic is missing; run tools/prepare_media.py','Invalid video response']){
+    video.load=()=>{throw new GuestFault(message);};
+    assert.throws(()=>call(graph,13,wide('Movies\\IntroX.mpq'),0),error=>error.message===message);
+  }
+});
+
+test('startup intro completes without any media RPC; the same movie remains playable after the menu',async()=>{
+  const messages=[],video=new WorkerVideo({skipIntro:true,post:m=>messages.push(m)});
+  const {h,graph,call,query,wide,output}=fixture(video),control=query('b1'),events=query('c0');
+  call(graph,13,wide('Movies\\TutorialIn.mpq'),0);call(control,7);
+  await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(call(events,8,output,output+4,output+8,0),0);assert.equal(h.u32(output),1);
+  call(events,2);call(control,2);call(graph,2);
+  assert.equal(messages.length,0,'no load/configure/destroy request for the omitted intro');
+  video.skipIntro=false;
+  assert.throws(()=>video.load(2,'Movies\\TutorialIn.mpq'),/cinematic is missing/,'campaign/tutorial is not silently skipped');
+  video.movies.set('movies/tutorialin.mpq',{downloadUrl:'/api/assets/tutorial',frameRate:'25/1'});
+  video.request=(id,method)=>{messages.push(method);return {duration:2,width:640,height:480};};
+  assert.equal(video.load(2,'Movies\\TutorialIn.mpq').duration,2);assert.deepEqual(messages,['load']);
 });

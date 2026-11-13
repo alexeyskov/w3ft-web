@@ -1,6 +1,6 @@
 PYTHON ?= .venv/bin/python
 
-.PHONY: setup prepare inspect maps media locale-en geoip boot-set serve test lift-smoke lift-runtime runtime runtime-probe
+.PHONY: setup prepare inspect maps media locale-en geoip boot-set download-plan serve test lift-smoke lift-runtime runtime runtime-probe
 # Archive created from your own licensed English installation; never downloaded.
 ENGLISH_ARCHIVE ?= resources/Warcraft_III_en.zip
 setup:
@@ -61,6 +61,10 @@ runtime:
 # the launcher downloads it before a launch, with progress. Needs Playwright.
 boot-set:
 	$(PYTHON) tools/record_boot_set.py
+	$(PYTHON) tools/make_download_plan.py
+
+download-plan:
+	$(PYTHON) tools/make_download_plan.py
 
 runtime-probe:
 	node tools/run_runtime.mjs

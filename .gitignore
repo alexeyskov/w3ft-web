@@ -8,6 +8,31 @@ out/
 test-results/
 .env
 .w3ft-admin-*
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Website and admin UI; keep the browser runtime sources versioned.
+/web/*
+!/web/runtime/
+
+# Admin authentication, monitoring, activity and issue reports.
+/server/admin.py
+/server/admin_auth.py
+/server/activity.py
+/server/issues.py
+/server/metrics.py
+/server/sessions.py
+
+# Website and admin integration/unit tests.
+/tests/browser_smoke.py
+/tests/admin_browser.py
+/tests/issues_browser.py
+/tests/test_admin.py
+/tests/test_activity.py
+/tests/test_issues.py
+/tests/test_metrics.py
+/tests/test_sessions.py
 
 # Game files and generated game code, even outside resources/ and var/.
 *.[eE][xX][eE]

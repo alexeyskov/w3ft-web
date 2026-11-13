@@ -18,6 +18,11 @@ export class FileOverlay extends Map {
 // Warcraft's screenshots (Print Screen, screenshot.mjs) belong to the player,
 // not to the saves: each finished one leaves the guest filesystem for the page.
 export const isScreenshot=path=>/^screenshots\//i.test(path);
+export const REGISTRY_FILE='__w3ft__/registry.json';
+export function restoreRegistry(host){
+  const data=host.virtualFiles.get(REGISTRY_FILE);
+  if(data&&!host.registry?.restore(data))host.log?.('Saved game settings are invalid; using defaults.');
+}
 const openForWriting=host=>new Set([...host.handles.values()].filter(item=>item.kind==='file'&&item.writing).map(item=>item.key));
 
 export function takeScreenshots(host){
@@ -28,6 +33,12 @@ export function takeScreenshots(host){
 }
 
 export function saveSnapshot(host,{full=false}={}){
+  if(host.registry?.dirty){
+    const data=host.registry.encode();
+    if(data)host.virtualFiles.set(REGISTRY_FILE,data);
+    else host.log?.('Game settings exceed the snapshot limit; retaining the previous settings.');
+    host.registry.dirty=false;
+  }
   // MPQ saves are written in multiple calls. A timer or runtime stop must not
   // overwrite the last good IndexedDB save with an unfinished open file.
   const writing=openForWriting(host),saved=path=>!isScreenshot(path);

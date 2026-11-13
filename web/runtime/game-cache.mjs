@@ -1,23 +1,25 @@
 // Game data on this device. The runtime reads game files in 256 KiB blocks;
 // blocks are kept in the origin private file system (OPFS) as they are read,
-// or all at once by "Preload". Each file version is one OPFS file; index.json
-// records which blocks it holds. The runtime worker reads them synchronously
+// by the background scheduler, or all at once by "Preload". Each file version
+// is one OPFS file; index.json records which blocks it holds. The worker reads them synchronously
 // (FileSystemSyncAccessHandle). One holder at a time (Web Lock): a second tab
-// with a game, or a preload, works over the network instead.
+// with a game works over the network; manual Preload cannot start until the game closes.
 export const BLOCK = 256 * 1024;
 const DIRECTORY = 'game-data', INDEX = 'index.json', LOCK = 'wc3-game-data';
 
 export const cacheKey = (kind, id, version) => `${kind}-${String(id).slice(0, 32)}-${String(version).slice(0, 16)}`.replace(/[^A-Za-z0-9_-]/g, '_');
 const family = key => key.split('-').slice(0, 2).join('-');
 
-// Game files of one language: archives, binaries and maps. Cinematics stream
-// through <video> elements and are not cached.
+// Original AVI/MPQ movies duplicate the prepared browser movies. Startup
+// intros are deliberately omitted; campaign movies can be kept on disk.
+export const startupMovie = path => /(?:^|[\\/])(?:introx?|tutorialin)\.(?:webm|mp4|mpq|avi)$/i.test(path);
+export const cacheableAsset = file => file.version && !/^movies[\\/]/i.test(file.path) && !startupMovie(file.path);
 export function cacheEntries(assets, maps = []) {
   const entries = [];
   for (const file of assets) {
-    if (file.version && !/^(webmedia|movies)\//i.test(file.path)) entries.push({key:cacheKey('a', file.id, file.version), size:file.size, url:file.downloadUrl});
+    if (cacheableAsset(file)) entries.push({key:cacheKey('a', file.id, file.version), size:file.size, url:file.downloadUrl, label:file.path, version:file.version});
   }
-  for (const map of maps) if (map.sha256) entries.push({key:cacheKey('m', map.id, map.sha256), size:map.size, url:map.downloadUrl});
+  for (const map of maps) if (map.sha256) entries.push({key:cacheKey('m', map.id, map.sha256), size:map.size, url:map.downloadUrl, label:`${map.path.toLowerCase().endsWith('.w3n')?'Campaigns':'Maps'}/${map.path}`, version:map.sha256});
   return entries;
 }
 export function blockCount(size) { return Math.ceil(size / BLOCK); }
@@ -132,10 +134,10 @@ export class GameDataCache {
     // Storage of a file opens asynchronously on its first block; blocks read
     // meanwhile are written once it is open.
     if (!file.handle) { if (file.pending.length < 16) file.pending.push([block, data.slice()]); void this._handle(file); return false; }
-    try { file.handle.write(data, {at:block * BLOCK}); }
+    try { if (file.handle.write(data, {at:block * BLOCK}) !== data.length) throw new Error('Incomplete cache write'); }
     catch (error) { this.log(`Game data cache write failed: ${error.message}`); return false; }
     file.bits[block >> 3] |= 1 << (block & 7);
-    this.index[key] = {size:file.entry.size, blocks:encode(file.bits)};
+    file.dirty = true;
     this.flushTimer ??= setTimeout(() => this.flush(), 2000);
     return true;
   }
@@ -159,11 +161,27 @@ export class GameDataCache {
     return blocks;
   }
   async prepare(key) { return this._handle(this.files.get(key)); }
+  cachedBytes(key) { const file=this.files.get(key); return file?cachedBytes(file.entry.size,file.bits):0; }
+  async snapshot(key) {
+    const file=this.files.get(key);
+    if (!file?.handle || this.missing(key).length) return null;
+    file.handle.flush();
+    return (await this.directory.getFileHandle(key)).getFile();
+  }
   flush() {
     clearTimeout(this.flushTimer); this.flushTimer = null;
     if (this.closed || !this.indexHandle) return;
-    const bytes = new TextEncoder().encode(JSON.stringify({schemaVersion:1, files:this.index}));
-    try { this.indexHandle.truncate(0); this.indexHandle.write(bytes, {at:0}); this.indexHandle.flush(); }
+    try {
+      // Commit data before advertising its bits. A cancelled background fetch
+      // only advertises complete, flushed blocks, never a partial response.
+      for (const [key,file] of this.files) if (file.dirty) {
+        file.handle.flush();
+        this.index[key]={size:file.entry.size,blocks:encode(file.bits)};
+        file.dirty=false;
+      }
+      const bytes = new TextEncoder().encode(JSON.stringify({schemaVersion:1, files:this.index}));
+      this.indexHandle.write(bytes, {at:0}); this.indexHandle.truncate(bytes.length); this.indexHandle.flush();
+    }
     catch (error) { this.log(`Game data index write failed: ${error.message}`); }
   }
   close() {

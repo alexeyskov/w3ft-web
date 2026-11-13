@@ -22,6 +22,7 @@ const CONTROL_BYTES=64, FRAMES_SUBMITTED=0, FRAMES_COMPLETED=1, CHUNK_USERS=2;
 // Registry table: low 16 bits deferred opcode, or flags for synchronous imports.
 const ORDERED=0x80000000, RESETS_CLIENT_STATE=0x40000000, RESETS_UNPACK_STATE=0x20000000;
 export const GRAPHICS_FLUSH=0xffffffff;
+export const GRAPHICS_NATIVE_FLUSH=0xfffffffe;
 export const GRAPHICS_STREAM_BYTES=CONTROL_BYTES+CHUNKS*CHUNK_BYTES;
 const STATE=1, DRAW_ELEMENTS=2, DRAW_ARRAYS=3, TEX_IMAGE=4, TEX_SUB_IMAGE=5, DELETE_TEXTURES=6, SWAP=7;
 const F32=0x1406, U8=0x1401, U16=0x1403, U32=0x1405;
@@ -70,6 +71,18 @@ add('glDrawElements',4,DRAW_ELEMENTS);add('glDrawArrays',3,DRAW_ARRAYS);
 add('glTexImage2D',9,TEX_IMAGE);add('glTexSubImage2D',9,TEX_SUB_IMAGE);add('glDeleteTextures',2,DELETE_TEXTURES);
 add('wglSwapLayerBuffers',2,SWAP,{result:1});add('SwapBuffers',1,SWAP,{dll:'gdi32.dll',result:1});
 
+// The native recorder owns only STATE calls without worker-side mirrors.
+// Keep array layout, texture unpack state, queries and frame pacing in JS.
+const mirroredState=new Set(['glVertexPointer','glColorPointer','glTexCoordPointer','glNormalPointer',
+  'glEnableClientState','glDisableClientState','glClientActiveTexture','glClientActiveTextureARB','glPixelStorei']);
+const vectorRules=new Map([['glLightfv',128],['glMaterialfv',129],['glFogfv',130],['glFogiv',130],
+  ['glLightModelfv',131],['glTexParameterfv',132],['glTexParameteriv',132],['glTexGenfv',133]]);
+function nativeDescriptor(op){
+  if(!op||op.kind!==STATE||mirroredState.has(op.name))return 0;
+  const rule=op.pointer<0?0:vectorRules.get(op.name)??op.bytes([]);
+  return (0xa5000000|(rule<<16)|((op.pointer+1)<<8)|op.argc)>>>0;
+}
+
 // Broker side: owns the opcode table and executes submitted chunks in order.
 export class GraphicsBatchRegistry {
   constructor(host,{onError=null,sliceMs=4,doorbell=null,vsync=false,maxFps=0}={}){
@@ -101,6 +114,7 @@ export class GraphicsBatchRegistry {
     // whoever calls it (a worker import or guest code run by the broker).
     if(code&&!handler.unsupported)handler.graphics=true;
     Atomics.store(this.table,id,code);
+    this.host.exports?.wc3_bind_graphics_import?.(id,code===opcode?nativeDescriptor(op):0);
   }
   _stream(buffer){
     let stream=this.streams.get(buffer);
@@ -215,10 +229,9 @@ export class GraphicsBatchRegistry {
     const length=words[w],id=words[w+1],returnAddress=words[w+2],op=operations[Atomics.load(this.table,id)],handler=h.thunks[id],cpu=owner.cpu;
     entry.offset=at+length;
     const name=handler.key??=handler.dll+'!'+handler.name,previous=h.currentCPU,started=h.hostTimings?performance.now():0;
-    h.calls.set(name,(h.calls.get(name)||0)+1);this.commands++;
-    h.recordCall(name,h.threadContexts.get(cpu)?.id||owner.id||1,returnAddress);
+    h.recordImport(id,h.threadContexts.get(cpu)?.id||owner.id||1,returnAddress);this.commands++;
     h.currentCPU=cpu;
-    let args;
+    let args;h.enterImportViews();
     try{
       if(op.kind===STATE||op.kind===SWAP){
         // One argument array per count, a new one if a handler nests a record.
@@ -245,6 +258,7 @@ export class GraphicsBatchRegistry {
       }
     }catch(error){h.lastFaultCPU=cpu;error.details={...error.details,import:name,...(args?{arguments:Array.from(args)}:{}),returnAddress,graphicsBatch:true};throw error;}
     finally{
+      h.leaveImportViews();
       h.currentCPU=previous;
       if(h.hostTimings){const elapsed=performance.now()-started,timing=h.hostTimings.get(name)||{count:0,totalMs:0,maxMs:0};timing.count++;timing.totalMs+=elapsed;timing.maxMs=Math.max(timing.maxMs,elapsed);h.hostTimings.set(name,timing);}
     }
@@ -321,6 +335,27 @@ export class GraphicsCommandQueue {
   // Pending records travel with every synchronous import; the broker queues
   // them before the import runs and executes them before graphics handlers.
   syncPoint(){return this._segment();}
+  appendNative(pointer,size){
+    const h=this.host;
+    if(!Number.isInteger(pointer)||pointer<=0||!Number.isInteger(size)||size<0||size>32768||size%4)throw fault('Invalid native graphics staging range');
+    if(!size)return;
+    h.refreshViews();
+    if(pointer+size>h.bytes.byteLength)throw fault('Native graphics staging range exceeds memory');
+    const view=h.view;let count=0;
+    // Verify the entire native segment before enqueueing anything. No mirrors
+    // are updated here, so accepting an array/pixel-store record would be wrong.
+    for(let at=pointer;at<pointer+size;){
+      if(at+16>pointer+size)throw fault('Truncated native graphics state');
+      const length=view.getUint32(at,true),id=view.getUint32(at+4,true),argc=view.getUint32(at+12,true);
+      const code=id<THUNKS?Atomics.load(this.table,id):0,op=operations[code];
+      if(!nativeDescriptor(op)||argc!==op.argc||length<16+argc*4||length%4||at+length>pointer+size)throw fault('Invalid native graphics state');
+      const expected=16+argc*4+(op.pointer<0?0:4+align4(view.getUint32(at+16+argc*4,true)));
+      if(length!==expected)throw fault('Invalid native graphics vector size');
+      at+=length;count++;
+    }
+    const at=this._reserve(size);
+    this.bytes.set(h.bytes.subarray(pointer,pointer+size),at);this.records+=count-1;
+  }
   // Mirrors the broker's context resets after a successful WGL call.
   afterSync(id,cpu){
     const code=id<THUNKS?Atomics.load(this.table,id):0;

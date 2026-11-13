@@ -21,7 +21,7 @@ export function createFilterGraph(h,classId,outer,iid,output){
   if(outer)return 0x80040110;
   if(!h.video)return 0x80040154;
   const graph={refs:0,interfaces:new Map(),events:[],loaded:false,state:0,owner:0,drain:0,visible:false,autoShow:true,style:0,styleEx:0,
-    rect:[0,0,0,0],notifyWindow:0,notifyMessage:0,notifyData:0,notifyFlags:0,volume:0,balance:0,rate:1,stopTime:0,preroll:0};
+    rect:[0,0,0,0],notifyWindow:0,notifyMessage:0,notifyData:0,notifyFlags:0,volume:0,balance:0,rate:1,stopTime:0,preroll:0,playToken:0};
   const onVideoEvent=(event,error)=>{
     if(event==='ended')graph.events.push([1,0,0]);
     else if(event==='error'){graph.events.push([3,0x80004005,0]);h.log(`Video playback: ${error}`);}
@@ -44,13 +44,14 @@ export function createFilterGraph(h,classId,outer,iid,output){
     const rect=graph.rect[2]&&graph.rect[3]?graph.rect:[0,0,...viewport];
     request('configure',{visible:graph.visible,rect,viewport});
   };
-  // A cinematic the network lost (the page tried three times) plays for no
+  // A cinematic the browser cannot load within its budget plays for no
   // time and ends, as if the player skipped it: Warcraft does not survive a
   // failed RenderFile. A movie never prepared on the server stays a fault.
   const load=path=>{
-    try{graph.metadata=h.video.load(graph.id,path);}
+    ++graph.playToken;graph.failed=false;
+    try{graph.metadata=h.video.load(graph.id,path);graph.failed=!!graph.metadata.skipped;}
     catch(error){
-      if(!/^Video load:/.test(error.message))throw error;
+      if(!(error.details?.videoOperation==='load'&&['media','timeout'].includes(error.details.reason))&&!/^Video load:/.test(error.message))throw error;
       h.log(`Cinematic skipped: ${error.message}`);
       graph.failed=true;graph.metadata={width:640,height:480,duration:0,frameRate:25};
     }
@@ -59,7 +60,8 @@ export function createFilterGraph(h,classId,outer,iid,output){
   };
   const media=(method,state)=>{
     if(!graph.loaded)return 0x80040227;
-    if(graph.failed){graph.state=state;if(method==='play')setTimeout(()=>onVideoEvent('ended'),0);return 0;}
+    const token=++graph.playToken;
+    if(graph.failed){graph.state=state;if(method==='play')setTimeout(()=>{if(graph.refs&&graph.playToken===token)onVideoEvent('ended');},0);return 0;}
     request(method,{autoShow:graph.autoShow});graph.state=state;
     if(method==='play'&&graph.autoShow)graph.visible=true;return 0;
   };
@@ -70,7 +72,7 @@ export function createFilterGraph(h,classId,outer,iid,output){
   };
   const release=()=>{
     if(graph.refs>0)graph.refs--;
-    if(!graph.refs){h.video.release(graph.id);for(const item of graph.interfaces.values()){h.free(h.u32(item));h.free(item);}graph.interfaces.clear();if(graph.eventHandle)h.handles.delete(graph.eventHandle);}
+    if(!graph.refs){++graph.playToken;h.video.release(graph.id);for(const item of graph.interfaces.values()){h.free(h.u32(item));h.free(item);}graph.interfaces.clear();if(graph.eventHandle)h.handles.delete(graph.eventHandle);}
     return graph.refs;
   };
   const unknown=[['QueryInterface',3,([self,guid,out])=>query(readGUID(h,guid),out)],['AddRef',1,()=>++graph.refs],['Release',1,release]];

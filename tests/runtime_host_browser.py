@@ -31,12 +31,13 @@ with sync_playwright() as p:
       if(discarded.join(',')!=='0,0,0,255')throw new Error('alpha test pixel '+discarded);
       if(renderer.errorChecks!==1)throw Error('ordinary draws/state changes must not synchronously poll GPU errors');
       renderer.swapBuffers();
-      if(renderer.errorChecks!==2)throw Error('SwapBuffers must check deferred backend errors');
-      // A real backend error is still reported, before presenting a good frame.
+      if(renderer.errorChecks!==1)throw Error('ordinary presentation must not synchronously poll GPU errors');
+      // Initialization/readback checks and opt-in per-operation checks remain.
       gl.bindTexture(0xdead,null);renderer.viewport(0,0,32,32);
-      let deferredError='';try{renderer.swapBuffers();}catch(error){deferredError=error.message;}
-      if(!deferredError.includes('WebGL error 0x500')||!deferredError.includes('viewport'))throw Error('missing backend error '+deferredError);
-      if(renderer.frames!==1)throw Error('failed presentation must not count as a successful frame');
+      renderer.swapBuffers();
+      if(renderer.errorChecks!==1)throw Error('default renderer unexpectedly polled the GPU');
+      let deferredError='';try{renderer._check('readback',true);}catch(error){deferredError=error.message;}
+      if(!deferredError.includes('WebGL error 0x500'))throw Error('missing explicit backend error '+deferredError);
       renderer.debugChecks=true;let immediateError='';
       try{renderer.cullFace(0xdead);}catch(error){immediateError=error.message;}
       if(!immediateError.includes('cullFace'))throw Error('debug checks must retain operation-level diagnostics');

@@ -79,10 +79,14 @@ def summarize_trace(path, frames):
     threads.sort(key=lambda thread: -thread['categoriesMs'].get('wasm', 0))
     if threads:
         threads[0]['role'] = 'main guest thread'
-    for thread in threads[1:]:
-        if thread['categoriesMs'].get('idle', 0) > 0:
-            thread['role'] = 'broker (WebGL, Win32)'
-            break
+    # The page is also mostly idle JS, and profile order is nondeterministic.
+    # Among non-guest threads the graphics broker does the most JS work.
+    brokers = [thread for thread in threads[1:] if thread['categoriesMs'].get('idle', 0) > 0]
+    if brokers:
+        broker = max(brokers, key=lambda thread: thread['categoriesMs'].get('js', 0))
+        broker['role'] = 'broker (WebGL, Win32)'
+        threads.remove(broker)
+        threads.insert(1, broker)
     return threads
 
 
@@ -112,6 +116,7 @@ def main(args):
         try:
             page.set_default_timeout(args.timeout * 1000)
             page.goto(args.url)
+            result['runtime'] = page.evaluate("async()=> (await (await fetch('/api/status')).json()).runtime")
             result['renderer'] = page.evaluate('''()=>{const gl=document.createElement('canvas').getContext('webgl2'),
               e=gl.getExtension('WEBGL_debug_renderer_info');return gl.getParameter(e?e.UNMASKED_RENDERER_WEBGL:gl.RENDERER);}''')
             print(json.dumps({'renderer': result['renderer']}), flush=True)
@@ -151,8 +156,12 @@ def main(args):
                     start = frames()
                     page.mouse.move(*action['click'])
                     wait(f'probe.frame.frames>={start + 2}')
+                    # Rendering can exceed 180 FPS while the menu processes
+                    # input less often. A two-frame press can be missed.
+                    page.wait_for_timeout(50)
                     page.mouse.down()
                     wait(f'probe.frame.frames>={start + 4}')
+                    page.wait_for_timeout(100)
                     page.mouse.up()
                 start = frames()
                 wait(f'probe.frame.frames>={start + action.get("frames", 3)}')
@@ -182,11 +191,18 @@ def main(args):
             def trace(name):
                 if not args.trace:
                     return
-                start = frames()
                 browser.start_tracing(page=page, path=str(output / name), categories=['disabled-by-default-v8.cpu_profiler', 'v8.execute', 'toplevel'])
+                # Starting/stopping Chrome's profiler and writing its JSON can
+                # take seconds while the game keeps running. Count frames only
+                # during the sampled interval, not during trace serialization.
+                start = frames()
+                started = time.monotonic()
                 page.wait_for_timeout(args.trace * 1000)
+                count = frames() - start
+                elapsed = time.monotonic() - started
                 browser.stop_tracing()
-                summary = summarize_trace(output / name, frames() - start)
+                result.setdefault('traceWindows', {})[name] = {'frames': count, 'seconds': round(elapsed, 3)}
+                summary = summarize_trace(output / name, count)
                 result.setdefault('cpu', {})[name] = summary
                 for thread in summary[:2]:
                     print(json.dumps({'trace': name, 'role': thread.get('role'), 'busyMsPerFrame': thread['busyMsPerFrame'],
@@ -200,15 +216,12 @@ def main(args):
             if args.scene in ('save', 'both'):
                 if not saves:
                     raise SystemExit('--saves is required for the save scene')
-                # Submenus become clickable after a variable delay; a missed
-                # click ends on Cancel in the main menu, so verify and retry.
-                for attempt in range(4):
-                    for action in SAVE_ACTIONS:
-                        act({**action, 'delay': action.get('delay', 0) * (1 + attempt)})
-                    if in_game():
-                        break
-                    print(json.dumps({'retry': attempt + 1}), flush=True)
-                else:
+                # Keep evidence of each menu transition. Repeating the whole
+                # sequence blindly after a missed click can hit Exit instead.
+                for index, action in enumerate(SAVE_ACTIONS):
+                    act(action)
+                    page.screenshot(path=str(output / f'load-step-{index + 1}.png'))
+                if not in_game():
                     raise RuntimeError('The save did not load through the menu')
                 page.screenshot(path=str(output / 'save-scene.png'))
                 for _ in range(args.repeats):
@@ -226,6 +239,7 @@ def main(args):
             result['failure'] = str(error)
             page.screenshot(path=str(output / 'failure.png'))
             result['log'] = page.evaluate('window.probe?.log?.slice(-20)')
+            result['report'] = page.evaluate('window.probe?.report')
             raise
         finally:
             (output / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=1) + '\n')

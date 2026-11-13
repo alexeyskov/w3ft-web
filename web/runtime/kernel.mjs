@@ -2,6 +2,7 @@
 // Operations requiring a guest thread scheduler or a missing renderer fail
 // explicitly instead of reporting a successful operation that never happened.
 import {GuestFault, GuestExit} from './host.mjs';
+import {GameRegistry} from './game-registry.mjs';
 import {ThreadServices} from './thread-services.mjs';
 import {createFilterGraph} from './directshow.mjs';
 import {GAME_RESOLUTIONS} from './launch-settings.mjs';
@@ -1120,6 +1121,24 @@ function installWindows(h, {user, gdi, error, fail, writeText, inputString}) {
   user('GetWindowThreadProcessId', 2, ([id, process]) => { const item=window(id);if(!item)return 0;if(process)h.w32(process,1);return item.threadId||1; });
   user('GetClientRect', 2, ([id, output]) => { const item = window(id); if (!item) return 0; [0,0,item.width,item.height].forEach((value, i) => h.w32(output + i * 4, value)); return 1; });
   user('GetWindowRect', 2, ([id, output]) => { const item = window(id); if (!item) return 0; [item.x,item.y,item.x+item.width,item.y+item.height].forEach((value, i) => h.w32(output + i * 4, value)); return 1; });
+  user('GetWindowPlacement',2,([id,output])=>{
+    const item=window(id);if(!item)return error(1400);
+    if(!output||h.u32(output)!==44)return error(87);
+    h.zero(output,44);h.w32(output,44);h.w32(output+4,item.placementFlags||0);
+    h.w32(output+8,!item.visible?0:item.minimized?2:item.maximized?3:1);
+    [...(item.minPosition||[-1,-1]),...(item.maxPosition||[-1,-1]),item.x,item.y,item.x+item.width,item.y+item.height]
+      .forEach((value,index)=>h.w32(output+12+index*4,value));
+    return 1;
+  });
+  user('SetWindowPlacement',2,([id,input])=>{
+    const item=window(id);if(!item)return error(1400);
+    if(!input||h.u32(input)!==44)return error(87);
+    const flags=h.u32(input+4),command=h.u32(input+8),[left,top,right,bottom]=Array.from({length:4},(_,i)=>h.i32(input+28+i*4));
+    if(flags&~7||command>11||right<left||bottom<top)return error(87);
+    item.placementFlags=flags&3;item.minPosition=[h.i32(input+12),h.i32(input+16)];item.maxPosition=[h.i32(input+20),h.i32(input+24)];
+    item.x=left;item.y=top;item.width=right-left;item.height=bottom-top;positionChanged(id);
+    h.handlers.get('user32.dll!ShowWindow').fn([id,command]);return 1;
+  });
   for (const [name, sign] of [['ClientToScreen', 1], ['ScreenToClient', -1]]) user(name, 2, ([id, point]) => { const item = window(id); if (!item) return 0; h.w32(point, h.i32(point) + sign * item.x); h.w32(point + 4, h.i32(point + 4) + sign * item.y); return 1; });
   user('SetWindowPos',7,([id,after,x,y,width,height,flags])=>{
     const item=window(id);if(!item)return 0;
@@ -1296,7 +1315,7 @@ function installWindows(h, {user, gdi, error, fail, writeText, inputString}) {
 function installRegistry(h, {adv, error, writeText, inputString, textBytes}) {
   const roots = new Map([[0x80000000,'classes'],[0x80000001,'user'],[0x80000002,'machine'],[0x80000003,'users'],[0x80000005,'config']]);
   const keys = new Map([...roots.values()].map(name => [name,new Map()]));
-  const clean = value => value.replaceAll('/','\\').replace(/^\\+|\\+$/g,'').toLowerCase();
+  const clean = value => value.replaceAll('/','\\').replace(/\\+/g,'\\').replace(/^\\|\\$/g,'').toLowerCase();
   const keyPath = (id, subkey = '') => { const root = roots.get(id) || h.getHandle(id,'registry')?.path; return root === undefined ? null : root + (subkey ? '\\' + clean(subkey) : ''); };
   const create = path => { const parts = path.split('\\'); for (let i = 1; i <= parts.length; i++) { const key = parts.slice(0,i).join('\\'); if (!keys.has(key)) keys.set(key,new Map()); } return keys.get(path); };
   for (const root of ['user','machine']) {
@@ -1306,6 +1325,9 @@ function installRegistry(h, {adv, error, writeText, inputString, textBytes}) {
     // localization's font with Cyrillic letters, tools/prepare_fonts.py).
     if (h.allowLocalFiles) game.set('allow local files', {type: 4, data: Uint8Array.of(1, 0, 0, 0)});
     const video = create(root + '\\software\\blizzard entertainment\\warcraft iii\\video');
+    // Warcraft opens these groups once and keeps their handles. Missing
+    // groups leave settings such as String/userlocal unwritable all session.
+    for(const group of ['sound','gameplay','string','map','misc'])create(root+'\\software\\blizzard entertainment\\warcraft iii\\'+group);
     // Launcher graphics settings are the values Warcraft would have saved
     // from its own Video options; unset values keep game.dll defaults.
     for (const [name, value] of [['reswidth', h.resolution.width], ['resheight', h.resolution.height], ['colordepth', 32], ...Object.entries(h.graphicsSettings || {})]) {
@@ -1313,9 +1335,10 @@ function installRegistry(h, {adv, error, writeText, inputString, textBytes}) {
       video.set(name, {type: 4, data});
     }
   }
+  h.registry=new GameRegistry(keys,create);
   for (const [suffix,wide] of [['A',false],['W',true]]) {
     adv(`RegOpenKeyEx${suffix}`,5,([id,name,options,access,output]) => { const path = keyPath(id,inputString(name,wide)); if (path === null) return 6; if (!keys.has(path)) return 2; h.w32(output,h.handle({kind:'registry',path})); return 0; });
-    adv(`RegCreateKeyEx${suffix}`,9,([id,name,reserved,className,options,access,security,output,disposition]) => { const path = keyPath(id,inputString(name,wide)); if (path === null) return 6; const existed = keys.has(path); create(path); h.w32(output,h.handle({kind:'registry',path})); if (disposition) h.w32(disposition,existed?2:1); return 0; });
+    adv(`RegCreateKeyEx${suffix}`,9,([id,name,reserved,className,options,access,security,output,disposition]) => { const path = keyPath(id,inputString(name,wide)); if (path === null) return 6; const existed = keys.has(path); create(path); if(!existed)h.registry.changed(path); h.w32(output,h.handle({kind:'registry',path})); if (disposition) h.w32(disposition,existed?2:1); return 0; });
     adv(`RegQueryValueEx${suffix}`,6,([id,name,reserved,type,output,length]) => {
       const path = keyPath(id), values = keys.get(path); if (!values) return 6;
       const value = values.get(inputString(name,wide).toLowerCase()); if (!value) return 2;
@@ -1334,14 +1357,15 @@ function installRegistry(h, {adv, error, writeText, inputString, textBytes}) {
         else { const raw=value.data, terminator=raw.indexOf(0); value.string=new TextDecoder('windows-1252').decode(terminator<0?raw:raw.subarray(0,terminator)); }
       }
       const valueName = inputString(name,wide).toLowerCase(), path = keyPath(id); values.set(valueName,value);
+      h.registry.changed(path,valueName);
       // OK in the game's Video options writes gamma; windowed Warcraft does not
       // apply it itself (see platform.mjs). The launcher keeps changed options.
       if (path === 'user\\software\\blizzard entertainment\\warcraft iii\\video' && valueName === 'gamma' && type === 4 && length === 4 && h.u32(data) <= 100) h.setGammaOption?.(h.u32(data));
       h.onRegistryWrite?.(path, valueName, value);
       return 0;
     });
-    adv(`RegDeleteValue${suffix}`,2,([id,name]) => { const values=keys.get(keyPath(id)); if(!values)return 6; return values.delete(inputString(name,wide).toLowerCase())?0:2; });
-    adv(`RegDeleteKey${suffix}`,2,([id,name]) => { const path=keyPath(id,inputString(name,wide)); if(!keys.has(path))return 2; if([...keys.keys()].some(key=>key.startsWith(path+'\\')))return 5; keys.delete(path);return 0; });
+    adv(`RegDeleteValue${suffix}`,2,([id,name]) => { const path=keyPath(id),values=keys.get(path); if(!values)return 6; const valueName=inputString(name,wide).toLowerCase(); if(!values.delete(valueName))return 2; h.registry.changed(path,valueName); return 0; });
+    adv(`RegDeleteKey${suffix}`,2,([id,name]) => { const path=keyPath(id,inputString(name,wide)); if(!keys.has(path))return 2; if([...keys.keys()].some(key=>key.startsWith(path+'\\')))return 5; keys.delete(path);h.registry.changed(path);return 0; });
     adv(`RegEnumKeyEx${suffix}`,8,([id,index,output,length,reserved,className,classLength,lastWrite]) => {
       const path=keyPath(id); if(!keys.has(path))return 6;
       const children=[...keys.keys()].filter(key=>key.startsWith(path+'\\')&&!key.slice(path.length+1).includes('\\')).map(key=>key.slice(path.length+1)).sort();

@@ -2,15 +2,15 @@
 
 Wire: client binary [destination:u8, payload...]; destination 0 broadcasts.
 Server binary [source:u8, payload...]. Peer IDs are assigned by the server.
+Destination 255 carries heartbeats and match status for the server only.
 JSON control messages never carry game traffic. A WC3 Winsock shim must implement
 socket addressing, listen/connect/accept and UDP over this reliable transport.
 
 Rooms are Garena-style lobbies of up to 200 players; one Warcraft match still
-holds 12. Every game language has shared lobbies 1–2 that always exist. "Play"
-without a lobby connects to /api/relay/auto?language=xx, which seats the player
-in the first shared lobby of that language with a free seat, in numeric order,
-and opens the next one when all are full. Created lobbies have no language:
-the same Warcraft version plays across localizations.
+holds 12. Public lobbies 1–4 always exist and are shared by every game language.
+"Play" without a lobby connects to /api/relay/auto, which seats the player in
+the first public lobby with a free seat, in numeric order, and opens temporary
+overflow lobbies when all existing public lobbies are full.
 """
 from __future__ import annotations
 
@@ -25,25 +25,31 @@ from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 
+from .matches import MatchTracker
+
+HEARTBEAT = 255  # no peer has this ID: old servers forward such a frame to nobody
+
 
 @dataclass
 class Room:
     peers: dict[int, web.WebSocketResponse] = field(default_factory=dict)
+    matches: MatchTracker = field(default_factory=MatchTracker)
     name: str | None = None
     created_at: float = field(default_factory=time.monotonic)
     capacity: int = 200
     shared: int = 0  # number of a shared lobby, 0 for created lobbies and codes
-    language: str | None = None  # game language of a shared lobby
     permanent: bool = False
+    empty_since: float | None = None
 
 
 class Relay:
-    def __init__(self, max_rooms: int = 256, capacity: int = 200, shared_lobbies: int = 2,
-                 languages: tuple[str, ...] = ("en", "ru"), default_language: str = "ru",
-                 empty_lobby_ttl: float = 120, heartbeat: float = 10):
+    def __init__(self, max_rooms: int = 256, capacity: int = 200, shared_lobbies: int = 4,
+                 empty_lobby_ttl: float = 120, heartbeat: float = 10, silence_timeout: float = 45):
         # Peer IDs are one byte, 0 is broadcast: at most 254 peers per room.
         if not 1 <= capacity <= 254:
             raise ValueError("Room capacity must be 1–254")
+        if not 1 <= shared_lobbies <= max_rooms:
+            raise ValueError("The room limit must accommodate the permanent public lobbies")
         self.rooms: dict[str, Room] = {}
         self.max_rooms = max_rooms
         self.capacity = capacity
@@ -51,32 +57,29 @@ class Relay:
         # A player whose page vanished without closing the connection (crash,
         # sleep, lost network) misses a ping and frees the seat within 1.5×.
         self.heartbeat = heartbeat
+        # A page that crashed or froze while its browser kept the connection
+        # (the browser's network process answers pings) is closed after this
+        # long without a frame, if it sends heartbeats and is in a Warcraft
+        # game. Otherwise the others wait for it with no end: a guest's
+        # "Waiting for host" offers only Disconnect.
+        self.silence_timeout = silence_timeout
         self.pending_announcements: set[asyncio.Task] = set()
         self.presence_tokens: dict[str, web.WebSocketResponse] = {}
         self.on_change = None
-        # Listing order of language groups, as on the site: Latin-script names
-        # A–Z (English), then Cyrillic А–Я (Русский). Players without a
-        # language join the base installation's language.
-        self.languages = tuple(languages)
-        self.default_language = default_language if default_language in self.languages else self.languages[0]
-        for language in self.languages:
-            for number in range(1, shared_lobbies + 1):
-                self.rooms[self.shared_key(language, number)] = self.shared_room(language, number, permanent=True)
+        for number in range(1, shared_lobbies + 1):
+            self.rooms[self.shared_key(number)] = self.shared_room(number, permanent=True)
 
     @staticmethod
-    def shared_key(language, number):
-        return f"shared-{language}-{number}"
+    def shared_key(number):
+        return f"shared-{number}"
 
-    def shared_room(self, language, number, permanent=False):
-        return Room(name=f"{language.upper()} lobby {number}", capacity=self.capacity, shared=number,
-                    language=language, permanent=permanent)
+    def shared_room(self, number, permanent=False):
+        return Room(name=f"Public lobby {number}", capacity=self.capacity, shared=number, permanent=permanent)
 
-    def assign_shared(self, language):
+    def assign_shared(self):
         # Synchronous with the caller's seat reservation: concurrent players
         # cannot both take the last free seat of a lobby.
-        if language not in self.languages:
-            raise web.HTTPBadRequest(text="Unknown lobby language")
-        shared = sorted((room.shared, key) for key, room in self.rooms.items() if room.shared and room.language == language)
+        shared = sorted((room.shared, key) for key, room in self.rooms.items() if room.shared)
         for _, key in shared:
             if len(self.rooms[key].peers) < self.rooms[key].capacity:
                 return key
@@ -84,8 +87,8 @@ class Relay:
             raise web.HTTPServiceUnavailable(text="Room limit reached")
         used = {number for number, _ in shared}
         number = next(n for n in itertools.count(1) if n not in used)
-        self.rooms[self.shared_key(language, number)] = self.shared_room(language, number)
-        return self.shared_key(language, number)
+        self.rooms[self.shared_key(number)] = self.shared_room(number)
+        return self.shared_key(number)
 
     @staticmethod
     def check_origin(request):
@@ -99,7 +102,8 @@ class Relay:
         now = time.monotonic()
         changed = False
         for key, room in list(self.rooms.items()):
-            if not room.peers and not room.permanent and now - room.created_at >= self.empty_lobby_ttl:
+            idle_since = room.empty_since if room.empty_since is not None else room.created_at
+            if not room.peers and not room.permanent and now - idle_since >= self.empty_lobby_ttl:
                 self.rooms.pop(key)
                 changed = True
         if changed:
@@ -113,6 +117,29 @@ class Relay:
         socket = self.presence_tokens.get(token)
         return socket is not None and socket.prepared and not socket.closed
 
+    def game_count(self):
+        return sum(room.matches.count for room in self.rooms.values())
+
+    def prune_matches(self):
+        now = time.monotonic()
+        changed = False
+        for room in list(self.rooms.values()):
+            changed = room.matches.expire(now) or changed
+        if changed:
+            self.changed()
+
+    async def lifecycle(self, app):
+        async def expire_matches():
+            while True:
+                await asyncio.sleep(10)
+                self.prune_matches()
+        task = asyncio.create_task(expire_matches())
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def disconnect_presence(self, token):
         socket = self.presence_tokens.get(token)
         if socket is not None:
@@ -122,16 +149,15 @@ class Relay:
         info = {"id": key, "name": room.name, "players": len(room.peers), "maxPlayers": room.capacity}
         if room.shared:
             info["shared"] = room.shared
-            info["language"] = room.language
+            info["temporary"] = not room.permanent
         return info
 
     def lobby_snapshot(self):
         # Ad-hoc room codes remain private and are never published here.
-        # Shared lobbies first, by language and number; then created ones.
-        order = {language: index for index, language in enumerate(self.languages)}
+        # Public lobbies first, in numeric order; then created ones.
         rooms = sorted(((key, room) for key, room in self.rooms.items() if room.name is not None),
-                       key=lambda item: (0, order.get(item[1].language, 0), item[1].shared, 0.0) if item[1].shared
-                       else (1, 0, 0, item[1].created_at))
+                       key=lambda item: (0, item[1].shared, 0.0) if item[1].shared
+                       else (1, 0, item[1].created_at))
         lobbies = [self.lobby_info(key, room) for key, room in rooms]
         private_players = sum(len(room.peers) for room in self.rooms.values() if room.name is None)
         return {"lobbies": lobbies, "maxPlayers": self.capacity, "privatePlayers": private_players}
@@ -184,9 +210,14 @@ class Relay:
         key = request.match_info["room"]
         self.prune_empty_lobbies()
         if key == "auto":
-            key = self.assign_shared(request.query.get("language", self.default_language))
+            # Older launchers may still send ?language=ru/en. All use one pool.
+            key = self.assign_shared()
+        elif legacy := re.fullmatch(r"shared-(?:en|ru)-([1-9]\d{0,8})", key):
+            key = self.shared_key(int(legacy[1]))
         elif not re.fullmatch(r"[a-zA-Z0-9_-]{8,64}", key):
             raise web.HTTPBadRequest(text="Room code must contain 8–64 letters, digits, underscores or hyphens")
+        if key.startswith("shared-") and key not in self.rooms:
+            raise web.HTTPNotFound(text="Public lobby no longer exists")
         if request.query.get("lobby") == "1" and (key not in self.rooms or self.rooms[key].name is None):
             raise web.HTTPNotFound(text="Lobby no longer exists")
         if key not in self.rooms and len(self.rooms) >= self.max_rooms:
@@ -197,11 +228,14 @@ class Relay:
         peer_id = next(i for i in range(1, room.capacity + 1) if i not in room.peers)
         socket = web.WebSocketResponse(max_msg_size=65536, heartbeat=self.heartbeat, receive_timeout=90)
         # Reserve before the first await, so concurrent upgrades cannot share an ID.
+        room.empty_since = None
         room.peers[peer_id] = socket
         token = secrets.token_urlsafe(18)
         while token in self.presence_tokens:
             token = secrets.token_urlsafe(18)
         self.presence_tokens[token] = socket
+        state = {"seen": time.monotonic(), "beats": False}
+        watchdog = None
         try:
             await socket.prepare(request)
             self.changed()
@@ -211,6 +245,7 @@ class Relay:
                                             "peers": sorted(room.peers),
                                             "lobby": self.lobby_info(key, room)})
             await self.announce(room)
+            watchdog = asyncio.create_task(self.watch_silence(socket, room, peer_id, state))
             window_start, count, total = time.monotonic(), 0, 0
             async for message in socket:
                 now = time.monotonic()
@@ -222,13 +257,25 @@ class Relay:
                     await socket.close(code=1008, message=b"Rate limit")
                     break
                 if message.type == WSMsgType.BINARY:
+                    state["seen"] = now
                     if len(message.data) < 2:
                         await socket.close(code=1008, message=b"Missing destination or payload")
                         break
                     destination = message.data[0]
+                    if destination == HEARTBEAT:
+                        state["beats"] = True
+                        # New launchers report a hosted map here even with no
+                        # guests (a LAN game against AI). Never forward this.
+                        if room.matches.observe(peer_id, destination, memoryview(message.data)[1:], now):
+                            self.changed()
+                        continue
                     packet = bytes([peer_id]) + message.data[1:]
                     targets = [p for i, p in room.peers.items()
                                if i != peer_id and destination in (0, i) and p.prepared]
+                    # Observe the original stream without changing or delaying
+                    # its bytes. GONE also matters when no other peer remains.
+                    if (targets or destination == 0) and room.matches.observe(peer_id, destination, memoryview(message.data)[1:], now):
+                        self.changed()
                     await asyncio.gather(*(self.send(p, packet=packet) for p in targets))
                 elif message.type == WSMsgType.TEXT:
                     await socket.close(code=1003, message=b"Game transport accepts binary frames only")
@@ -236,10 +283,18 @@ class Relay:
                 elif message.type == WSMsgType.ERROR:
                     break
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             self.presence_tokens.pop(token, None)
             room.peers.pop(peer_id, None)
+            room.matches.disconnect(peer_id)
             if not room.peers and not room.permanent:
-                self.rooms.pop(key, None)
+                if room.shared or room.name is not None:
+                    # Give the last visitor time to reconnect to a named lobby
+                    # after a lost socket or a fresh game launch.
+                    room.empty_since = time.monotonic()
+                else:
+                    self.rooms.pop(key, None)
             self.changed()
             if room.peers:
                 # A disconnected HTTP request may be cancelled while this
@@ -250,6 +305,16 @@ class Relay:
                 announcement.add_done_callback(self.pending_announcements.discard)
                 await asyncio.shield(announcement)
         return socket
+
+    async def watch_silence(self, socket, room, peer_id, state):
+        # Any frame, game data or heartbeat, proves the page runs. Pages
+        # without heartbeats (older launchers) are never closed for silence.
+        while not socket.closed:
+            await asyncio.sleep(max(.05, self.silence_timeout / 3))
+            if (state["beats"] and time.monotonic() - state["seen"] > self.silence_timeout
+                    and room.matches.in_game(peer_id)):
+                await socket.close(code=4000, message=b"Page stopped responding")
+                return
 
     async def shutdown(self, app):
         peers = [p for r in self.rooms.values() for p in r.peers.values()]

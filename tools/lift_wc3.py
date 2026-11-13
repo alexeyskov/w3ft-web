@@ -21,10 +21,12 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR = ROOT / "vendor" / "nfsu2"
-# Even an inherited NFS build environment must not alter this experiment.
+# Even an inherited NFS build environment must not alter this target.
+# Register locals are applied by build_runtime after its recursion pass;
+# enabling upstream LREGS here would hide the virtual self-call patterns.
 LIFT_ENV = {
     "FTOL2INL": "0", "INLINE_LIST": "", "INLINE": "0", "OVERRIDE": "",
-    "HOOKS": "", "FLAGABI": "", "FLAGOPT": "0", "JTSWITCH": "0",
+    "HOOKS": "", "FLAGABI": "", "FLAGOPT": "1", "JTSWITCH": "0",
     "LREGS": "0", "X87OPT": "0", "X87PC": "1", "RETEIP": "1",
     "WATCH": "0", "COVERAGE": "0",
 }
@@ -34,6 +36,58 @@ RUNTIME_DECLARATIONS = (
     "void cpuid_shim(CPU *);\n"
     "uint64_t rdtsc_shim(void);\n"
 )
+
+
+def flag_liveness(vendor, blocks, addrs, in_text):
+    """Conservative upstream def/use rules, with an uncapped worklist.
+
+    The original pass stops after 64 scans. Large, non-address-ordered CFGs
+    may need more iterations; incomplete liveness can omit a required flag.
+    Only six bits per block can change, so this monotone worklist terminates.
+    """
+    successors, predecessors, uses = {}, {a: set() for a in addrs}, {}
+    for address in addrs:
+        instructions = blocks[address]
+        successors[address] = set()
+        uses[address] = [(i.address, *vendor._flag_defuse(i)) for i in instructions]
+        if not instructions:
+            successors[address].add(None)
+            continue
+        last = instructions[-1]; name = last.mnemonic
+        conditional = (name.startswith('j') and name[1:] in vendor.CC) or name in (
+            'jecxz', 'jcxz', 'loop', 'loope', 'loopz', 'loopne', 'loopnz')
+        if name == 'jmp' or conditional:
+            operand = last.operands[0] if last.operands else None
+            target = operand.imm if operand is not None and operand.type == vendor.X86_OP_IMM else None
+            successors[address].add(target if target in blocks else None)
+            if conditional:
+                next_address = last.address + last.size
+                successors[address].add(next_address if next_address in blocks else None)
+        elif name in ('ret', 'retf', 'iret', 'iretd'):
+            successors[address].add(None)
+        else:
+            next_address = last.address + last.size
+            successors[address].add(next_address if next_address in blocks else None)
+        for target in successors[address]:
+            if target is not None:
+                predecessors[target].add(address)
+    live = {a: 0 for a in addrs}; after = {}
+    pending = collections.deque(reversed(addrs)); queued = set(addrs)
+    while pending:
+        address = pending.popleft(); queued.remove(address)
+        current = 0
+        for target in successors[address]:
+            current |= vendor.F_ALL if target is None else live[target]
+        for instruction, defined, used in reversed(uses[address]):
+            # Overlapping decoded blocks can contain the same instruction.
+            # Its emitted copies use one mask, so retain every successor's use.
+            after[instruction] = after.get(instruction, 0) | current
+            current = (current & ~defined) | used
+        if current != live[address]:
+            live[address] = current
+            for previous in predecessors[address] - queued:
+                pending.append(previous); queued.add(previous)
+    return after
 
 
 @contextlib.contextmanager
@@ -53,6 +107,7 @@ def isolated_lifter():
         module._retpast = lambda: set()
         module._FTOL2INL = False
         module._ABI = None
+        module.flag_liveness = lambda blocks, addrs, in_text: flag_liveness(module, blocks, addrs, in_text)
         yield module
     finally:
         sys.path[:] = old_path

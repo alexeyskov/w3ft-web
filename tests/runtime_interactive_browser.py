@@ -50,7 +50,7 @@ def main(url, timeout, actions=None, interactive=False, profile=None, room=None,
               canvas.style='position:fixed;inset:0;width:1024px;height:768px;z-index:10;background:black';
               document.body.append(canvas);
               window.probe={log:[],report:null,intro:null,frame:null,snapshots:[],measurements:[]};
-              window.session=await module.runDiagnostics({canvas,wasmUrl:status.runtime.wasmUrl,saves:probeSaves,transport:window.probeTransport,
+              window.session=await module.runDiagnostics({canvas,wasmUrl:status.runtime.wasmUrl,saves:probeSaves,transport:window.probeTransport,skipIntro:false,
                 audioEnabled:true,captureGraphics:true,graphicsDebugChecks,batchGraphics,legacyClampToEdge,nativeTextureShader,timeout:unlimited?0:timeout,dispatchBudget:unlimited?0:1000000000,onStatus:message=>probe.log.push(message),onReport:report=>probe.report=report,
                 onFrame:frame=>probe.frame={...frame,rendererFrame:frame.frames,frames:(probe.frame?.frames||0)+1},
                 onSnapshot:snapshot=>{probe.snapshots.push(snapshot);if(probe.snapshots.length>8)probe.snapshots.shift();}});

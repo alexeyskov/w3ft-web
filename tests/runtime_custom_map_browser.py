@@ -83,8 +83,6 @@ def main(args):
                 page.mouse.down(); frames(2); page.mouse.up()
                 frames(10); page.wait_for_timeout(2000)
 
-            wait('[...document.querySelectorAll("video")].some(v=>v.currentTime>2)')
-            page.locator('#game-probe').press('Escape')
             wait('!document.querySelector("video") && probe.frame?.frames>=10')
             page.wait_for_timeout(3000)
             click(875, 180)  # Single player, fresh profile.

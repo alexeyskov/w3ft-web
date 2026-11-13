@@ -2,15 +2,22 @@ import {GuestFault,GuestExit,GuestThreadExit} from './host.mjs';
 import {serveGuestCall,GuestCallbackBroker,pulseGuestCall} from './thread-rpc.mjs';
 import {GraphicsBatchRegistry,GRAPHICS_FLUSH} from './graphics-batch.mjs';
 
+// The C stack of a guest thread's WASM instance (__stack_pointer), not the
+// guest's x86 stack. Lifted code keeps its values in WASM locals: after
+// loading a large custom map (COT RPG) every thread had used 12 bytes of it.
+// It was 16 MiB per thread; iOS counts grown WASM memory, so 12 threads took
+// about 190 MiB of a page's 2 GiB.
+export const NATIVE_STACK=2*1024*1024;
+
 // All Win32 objects belong to this broker. Guest instructions execute in
 // separate workers over one shared WASM memory; pending HLE waits release the
 // broker event loop so other guest threads can signal them.
 export class GuestThreadScheduler {
-  constructor(engine,{workerFactory=()=>new Worker(new URL('./thread-worker.mjs',import.meta.url),{type:'module'}),log=()=>{},maxThreads=16,budget=10000000,timeout=60000,batchGraphics=true,vsync=false,maxFps=0}={}) {
+  constructor(engine,{workerFactory=()=>new Worker(new URL('./thread-worker.mjs',import.meta.url),{type:'module'}),log=()=>{},maxThreads=16,budget=10000000,timeout=60000,batchGraphics=true,nativeGraphics=false,vsync=false,maxFps=0}={}) {
     this.engine=engine;this.host=engine.host;this.exports=engine.instance.exports;
     this.workerFactory=workerFactory;this.log=log;this.maxThreads=maxThreads;this.budget=budget;
     this.threads=new Map();this.retired=[];this.nextId=2;this.stopped=false;
-    this.timeout=timeout;
+    this.timeout=timeout;this.nativeGraphics=nativeGraphics;
     this.callbacks=new GuestCallbackBroker();
     this.host.scheduler=this;
     this.rpcCount=0;
@@ -26,15 +33,15 @@ export class GuestThreadScheduler {
   }
   descriptor(item) {
     const tlsSize=Number(this.exports.__tls_size.value),tlsAlign=Number(this.exports.__tls_align.value);
-    const stack=this.native(item,16*1024*1024,16),tls=this.native(item,tlsSize,Math.max(16,tlsAlign)),args=this.native(item,4);
+    const stack=this.native(item,NATIVE_STACK,16),tls=this.native(item,tlsSize,Math.max(16,tlsAlign)),args=this.native(item,4);
     this.host.view.setUint32(args,item.arg>>>0,true);
     const descriptors=this.host.thunks.map(({dll,name,argc,convention})=>({dll,name,argc,convention}));
     item.localImports={descriptors,counters:new SharedArrayBuffer(descriptors.length*4)};
     return {module:this.engine.compiledModule,memory:this.host.memory,cpu:item.cpu,entry:item.entry,
-      argPointer:args,argCount:item.id===1?0:1,nativeStackTop:stack+16*1024*1024,tlsBase:tls,
+      argPointer:args,argCount:item.id===1?0:1,nativeStackTop:stack+NATIVE_STACK,tlsBase:tls,
       threadId:item.id,clockOrigin:performance.timeOrigin,guestBase:this.host.base,permissionsBase:this.host.permissionsBase,
       processStarted:this.host.started,localImports:item.localImports,
-      graphicsBatch:this.host.graphicsBatchRegistry?.buffer,doorbell:this.doorbell.buffer,
+      graphicsBatch:this.host.graphicsBatchRegistry?.buffer,nativeGraphics:this.nativeGraphics,doorbell:this.doorbell.buffer,
       threadState:this.host.threadContexts.get(item.cpu).buffer,tlsSlots:this.host.tlsSlots.buffer};
   }
   create(entry,arg,flags=0,stackSize=0) {
@@ -113,7 +120,7 @@ export class GuestThreadScheduler {
       item.worker?.terminate();item.worker=null;
       if(item.localImports){
         const counts=new Uint32Array(item.localImports.counters);
-        item.localImports.descriptors.forEach(({dll,name},i)=>{const n=Atomics.load(counts,i);if(n){const key=dll+'!'+name;this.host.calls.set(key,(this.host.calls.get(key)||0)+n);}});
+        item.localImports.descriptors.forEach(({dll,name},i)=>{const n=Atomics.load(counts,i);if(n)this.host.addCallCount(dll+'!'+name,n);});
         item.localImports=null;
       }
       this.threads.delete(item.id);this.release(item);this.host.notifyThreadState?.(item);

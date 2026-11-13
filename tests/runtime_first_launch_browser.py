@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""First and second launch of the original game through the site's Play button.
+"""Real first/repeat launch: no startup movie, automatic cache population.
 
-A fresh Chromium profile: before the game starts, the launcher downloads what
-it reads up to the main menu (var/runtime/boot-<language>.json, make boot-set)
-with a progress bar; the intro cinematic then plays from this device, and the
-main menu opens right after it is skipped, without game data from the server.
-The second launch in the same profile downloads almost nothing.
-Needs the packaged runtime, the recorded set and a running server.
+Needs packaged runtime and recorded boot sets. Uses a clean persistent browser
+profile and a local server; checks both startup and the in-session downloader.
 """
 import argparse
 import asyncio
@@ -14,107 +10,81 @@ import json
 from pathlib import Path
 import tempfile
 import time
-
 from playwright.async_api import async_playwright
 
-PROGRESS = '''() => {
-  window.loadingSeen = [];
-  // Registered after the site's own listener: the loading screen is already drawn.
-  window.addEventListener('warcraft-session-progress', event => loadingSeen.push({...event.detail, at: performance.now(),
-    bar: !document.getElementById('game-loading-bar').hidden, text: document.getElementById('game-loading-detail').textContent}));
-}'''
 
-
-async def launch(page, output, label, timeout):
-    """Play → loading screen → cinematic → skip → main menu. Returns timings and traffic."""
-    traffic = {'data': 0}
-
-    def count(request):
-        if '/api/assets/' in request.url or '/api/maps/' in request.url:
-            asyncio.ensure_future(add(request))
-
-    async def add(request):
-        try:
-            sizes = await request.sizes()
-            traffic['data'] += sizes['responseBodySize']
-        except Exception:
-            pass
-
-    async def until(expression, seconds=timeout):
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if await page.evaluate(f'() => !!({expression})'):
-                return
-            assert await page.evaluate('document.body.dataset.phase') != 'error', await page.locator('#launch-message').inner_text()
-            await asyncio.sleep(0.2)
-        await page.screenshot(path=str(output / f'{label}-timeout.png'))
+async def launch(page,output,label,timeout,intros):
+    requested=[]
+    def record(request):requested.append(request.url)
+    page.on('request',record)
+    await page.evaluate('''()=>{
+      window.loadingSeen=[];window.cacheSeen=[];window.finalReport=null;
+      addEventListener('warcraft-session-progress',e=>loadingSeen.push({...e.detail,at:performance.now()}));
+      addEventListener('warcraft-cache-progress',e=>cacheSeen.push({...e.detail,at:performance.now()}));
+      addEventListener('warcraft-report',e=>window.finalReport=e.detail);
+    }''')
+    async def until(expression,seconds=timeout):
+        deadline=time.monotonic()+seconds
+        while time.monotonic()<deadline:
+            assert await page.evaluate('document.body.dataset.phase')!='error',await page.locator('#launch-message').inner_text()
+            if await page.evaluate(f'!!({expression})'):return
+            await asyncio.sleep(.1)
+        await page.screenshot(path=str(output/f'{label}-timeout.png'))
         raise TimeoutError(expression)
-
-    await page.evaluate(PROGRESS)
-    started = time.monotonic()
+    began=time.monotonic()
     await page.locator('#launch').click()
-    await until('loadingSeen.some(p => p.phase === "download") && loadingSeen.at(-1).phase === "starting"', timeout)
-    await until('[...document.querySelectorAll("#game-stage video")].some(v => v.currentTime > 1)')
-    prepared = time.monotonic() - started
-    source = await page.evaluate('[...document.querySelectorAll("#game-stage video")].map(v => v.currentSrc)[0]')
-    page.on('request', count)
-    await page.keyboard.press('Escape')
-    skipped = time.monotonic()
-    await until('!document.querySelector("#game-stage video") && +document.getElementById("diagnostic-canvas").dataset.frames > 0', 120)
-    frames = int(await page.evaluate('document.getElementById("diagnostic-canvas").dataset.frames'))
-    await until(f'+document.getElementById("diagnostic-canvas").dataset.frames > {frames + 30}', 120)
-    menu = time.monotonic() - skipped
-    await asyncio.sleep(2)
-    await page.screenshot(path=str(output / f'{label}-menu.png'))
-    page.remove_listener('request', count)
-    downloads = [p for p in await page.evaluate('loadingSeen') if p['phase'] == 'download' and p['total'] > 0]
-    bar_visible = bool(downloads) and all(p['bar'] for p in downloads)
+    await until('+document.getElementById("diagnostic-canvas").dataset.frames>20')
+    menu=time.monotonic()-began
+    assert await page.locator('video').count()==0,'startup intro must not play'
+    await until('cacheSeen.length>0')
+    await until('cacheSeen.at(-1).cached>cacheSeen[0].cached || cacheSeen.at(-1).state==="complete"',60)
+    before=await page.evaluate('cacheSeen[0]');after=await page.evaluate('cacheSeen.at(-1)')
+    assert await page.locator('#background-download-toggle').count()==0,'no player controls for automatic downloads'
+    await page.screenshot(path=str(output/f'{label}-menu.png'))
+    assert not any(url.endswith(path) for url in requested for path in intros),'intro bytes downloaded'
+    downloads=await page.evaluate('loadingSeen.filter(p=>p.phase==="download"&&p.total>0)')
+    if downloads:assert downloads[-1]['done']==downloads[-1]['total'],downloads[-1]
     await page.locator('#stop-diagnostic').dispatch_event('click')
-    await until('!document.getElementById("launch").disabled', 60)
-    return {'progressTexts': [downloads[0]['text'], downloads[-1]['text']] if downloads else [], 'secondsToCinematic': round(prepared, 1), 'secondsMenuAfterSkip': round(menu, 1), 'barVisible': bar_visible,
-            'cinematicSource': source.split(':')[0], 'downloadTotalMB': round(downloads[-1]['total'] / 1048576, 1) if downloads else 0,
-            'downloadReached': round(downloads[-1]['done'] / downloads[-1]['total'], 3) if downloads else None,
-            'gameDataAfterSkipMB': round(traffic['data'] / 1048576, 2)}
+    await until('!document.getElementById("launch").disabled',60)
+    assert await page.evaluate('''(finalReport.error?.message==='Guest process stopped') ||
+      (finalReport.stage==='guest-exited' && finalReport.exitCode===0 && finalReport.error===null)''')
+    (output/f'{label}.log').write_text(await page.evaluate('localStorage.getItem("wc3-last-log")'))
+    page.remove_listener('request',record)
+    return {'secondsToMenu':round(menu,2),'startupMB':round(downloads[-1]['total']/1048576,2) if downloads else 0,
+            'backgroundAddedMB':round((after['cached']-before['cached'])/1048576,2),'backgroundPhase':after['phase']}
 
 
-async def main(url, output, timeout, language):
-    output.mkdir(parents=True, exist_ok=True)
-    async with async_playwright() as playwright:
-        # A fresh profile on disk, like a player's browser: its HTTP cache keeps
-        # the WebAssembly module between launches.
-        profile = tempfile.TemporaryDirectory()
-        context = await playwright.chromium.launch_persistent_context(profile.name, viewport={'width': 1280, 'height': 900}, locale='ru-RU',
-            args=['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--autoplay-policy=no-user-gesture-required'])
-        try:
-            page = context.pages[0] if context.pages else await context.new_page()
-            errors = []
-            page.on('pageerror', lambda error: errors.append(str(error)))
-            await page.goto(url)
-            await page.wait_for_selector('#launch:not([disabled])', timeout=timeout * 1000)
-            # A window, not fullscreen: Escape must reach the game, not leave fullscreen.
-            await page.evaluate("language => { const s = JSON.parse(localStorage.getItem('wc3-launch-settings') || '{}'); s.fullscreen = false; localStorage.setItem('wc3-launch-settings', JSON.stringify(s)); localStorage.setItem('wc3-language', language); }", language)
-            await page.reload()
-            await page.wait_for_selector('#launch:not([disabled])', timeout=timeout * 1000)
-            first = await launch(page, output, 'first', timeout)
-            second = await launch(page, output, 'second', timeout)
-            print(json.dumps({'first': first, 'second': second}), flush=True)
-            assert first['barVisible'] and first['downloadReached'] == 1, first
-            assert first['cinematicSource'] == 'blob', 'The intro cinematic must play from this device'
-            assert first['gameDataAfterSkipMB'] < 1, f'The main menu still downloaded game data: {first}'
-            assert first['secondsMenuAfterSkip'] < 5, first
-            assert second['downloadTotalMB'] < 1, f'The second launch downloaded again: {second}'
-            assert second['cinematicSource'] == 'blob' and second['gameDataAfterSkipMB'] < 1, second
-            assert not errors, errors
-        finally:
-            await context.close()
-            profile.cleanup()
+async def main(url,output,timeout,language):
+    output.mkdir(parents=True,exist_ok=True)
+    async with async_playwright() as p:
+        with tempfile.TemporaryDirectory(prefix='wc3-launch-') as profile:
+            context=await p.chromium.launch_persistent_context(profile,viewport={'width':1280,'height':900},
+                args=['--use-angle=swiftshader','--enable-unsafe-swiftshader','--autoplay-policy=no-user-gesture-required'])
+            try:
+                page=context.pages[0];errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
+                await page.goto(url)
+                await page.evaluate('''language=>{
+                  localStorage.setItem('wc3-language',language);
+                  localStorage.setItem('wc3-launch-settings',JSON.stringify({fullscreen:false}));
+                }''',language)
+                await page.reload();await page.wait_for_selector('#launch:not([disabled])',timeout=timeout*1000)
+                intros=await page.evaluate(r'''async language=>(await (await fetch('/api/assets?language='+language)).json()).files
+                  .filter(f=>/^(Movies\/|WebMedia\/(?:IntroX?|TutorialIn)\.)/i.test(f.path)).map(f=>f.downloadUrl)''',language)
+                first=await launch(page,output,'first',timeout,intros)
+                second=await launch(page,output,'second',timeout,intros)
+                assert first['startupMB']>0,first
+                assert second['startupMB']<1,second
+                assert not errors,errors
+                result={'language':language,'first':first,'second':second}
+                (output/'report.json').write_text(json.dumps(result,indent=2)+'\n')
+                print(json.dumps(result),flush=True)
+            finally:await context.close()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--url', default='http://127.0.0.1:8080')
-    parser.add_argument('--output', type=Path, default=Path('var/reports/first-launch'))
-    parser.add_argument('--timeout', type=int, default=300)
-    parser.add_argument('--language', default='ru', help='page and game language')
-    args = parser.parse_args()
-    asyncio.run(main(args.url, args.output, args.timeout, args.language))
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--url',default='http://127.0.0.1:8080')
+    parser.add_argument('--output',type=Path,default=Path('var/reports/first-launch'))
+    parser.add_argument('--timeout',type=int,default=300)
+    parser.add_argument('--language',default='ru')
+    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.language))

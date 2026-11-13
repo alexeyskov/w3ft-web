@@ -4,6 +4,7 @@ import {installPlatform} from './platform.mjs';
 import {FileOverlay} from './persistence.mjs';
 import {TlsSlots,threadContext} from './thread-state.mjs';
 import {gameResolution,gameGraphics} from './launch-settings.mjs';
+import {bindNativeImport} from './native-imports.mjs';
 
 export class GuestFault extends Error {
   constructor(message, details = {}) { super(message); this.name = 'GuestFault'; this.details = details; }
@@ -32,9 +33,11 @@ export class WarcraftHost {
     this.handles = new Map(); this.nextHandle = 0x100; this.allocations = new Map(); this.freeBlocks = [];
     this.defaultContext = threadContext(1); this.threadContexts = new Map();
     this.tlsSlots = new TlsSlots(tlsSlots); this.events = []; this.moduleNames = new Map();
-    this.calls = new Map(); this.operations = []; this.started = clock(); this.virtualFiles = new FileOverlay();
+    this.extraCalls = new Map(); this.importCounts = new Float64Array(1024);
+    this.operations = []; this.started = clock(); this.virtualFiles = new FileOverlay();
     // Last 64 imports, kept without allocating a record for every call.
-    this.historyNames = new Array(64); this.historyThreads = new Uint32Array(64); this.historyReturns = new Uint32Array(64); this.historyCount = 0;
+    this.historyIds = new Uint32Array(64); this.historyThreads = new Uint32Array(64); this.historyReturns = new Uint32Array(64); this.historyCount = 0;
+    this._viewDepth = 0;
     this._attach(memory.buffer);
     installKernel(this); installCRT(this); installPlatform(this);
   }
@@ -53,16 +56,39 @@ export class WarcraftHost {
   // Views are cached per buffer object. Shared memory returns a new buffer
   // object after growth (also by another thread), which refreshes them.
   _attach(buffer) { this._buffer = buffer; this._length = buffer.byteLength; this._view = new DataView(buffer); this._bytes = new Uint8Array(buffer); this._i32 = new Int32Array(buffer, 0, Math.floor(buffer.byteLength / 4)); }
-  get bytes() { const buffer = this.memory.buffer; if (buffer !== this._buffer) this._attach(buffer); return this._bytes; }
-  get view() { const buffer = this.memory.buffer; if (buffer !== this._buffer) this._attach(buffer); return this._view; }
-  get history() {
-    const count = Math.min(this.historyCount, 64), first = this.historyCount - count, result = new Array(count);
-    for (let i = 0; i < count; i++) { const slot = (first + i) & 63; result[i] = {name: this.historyNames[slot], threadId: this.historyThreads[slot], returnAddress: this.historyReturns[slot]}; }
+  refreshViews() { const buffer = this.memory.buffer; if (buffer !== this._buffer) this._attach(buffer); }
+  enterImportViews() { if (!this._viewDepth) this.refreshViews(); this._viewDepth++; }
+  leaveImportViews() { this._viewDepth--; }
+  // Shared buffers keep their old range valid after memory.grow. Within a
+  // synchronous import check() refreshes only if it needs the enlarged range.
+  // Unshared test runtimes can detach old views, so retain the safe slow path.
+  get bytes() { if (!this._viewDepth || !(this._buffer instanceof SharedArrayBuffer)) this.refreshViews(); return this._bytes; }
+  get view() { if (!this._viewDepth || !(this._buffer instanceof SharedArrayBuffer)) this.refreshViews(); return this._view; }
+  importName(id) { const h=this.thunks[id]; return h ? h.key ??= `${h.dll}!${h.name}` : 'undefined!undefined'; }
+  get calls() {
+    const result = new Map(this.extraCalls);
+    const pointer=this.exports?.wc3_native_counts_pointer?.()>>>0;
+    const native=pointer?new Uint32Array(this.bytes.buffer,pointer,65536):null;
+    for(let id=0;id<Math.min(this.thunks.length,this.importCounts.length);id++){
+      const count=this.importCounts[id]+(native?Atomics.load(native,id):0);if(count){const name=this.importName(id);result.set(name,(result.get(name)||0)+count);}
+    }
+    if(native)for(let id=this.importCounts.length;id<this.thunks.length;id++){
+      const count=Atomics.load(native,id);if(count){const name=this.importName(id);result.set(name,(result.get(name)||0)+count);}
+    }
     return result;
   }
-  recordCall(name, threadId, returnAddress) {
+  addCallCount(name,count) { this.extraCalls.set(name,(this.extraCalls.get(name)||0)+count); }
+  get history() {
+    const count = Math.min(this.historyCount, 64), first = this.historyCount - count, result = new Array(count);
+    for (let i = 0; i < count; i++) { const slot = (first + i) & 63; result[i] = {name: this.importName(this.historyIds[slot]), threadId: this.historyThreads[slot], returnAddress: this.historyReturns[slot]}; }
+    return result;
+  }
+  recordImport(id, threadId, returnAddress) {
+    if(id>=65536)throw new GuestFault('Import thunk limit');
+    if(id>=this.importCounts.length){const next=new Float64Array(Math.min(65536,Math.max(id+1,this.importCounts.length*2)));next.set(this.importCounts);this.importCounts=next;}
+    this.importCounts[id]++;
     const slot = this.historyCount++ & 63;
-    this.historyNames[slot] = name; this.historyThreads[slot] = threadId; this.historyReturns[slot] = returnAddress;
+    this.historyIds[slot] = id; this.historyThreads[slot] = threadId; this.historyReturns[slot] = returnAddress;
   }
   get threadContext() { return this.threadContexts.get(this.currentCPU) || this.defaultContext; }
   get threadId() { return this.threadContext.id; }
@@ -134,7 +160,7 @@ export class WarcraftHost {
     if (value === null) return fn(0);
     const data = new TextEncoder().encode(value + '\0'); const p = this.exports.malloc(data.length) >>> 0;
     if (!p) throw new GuestFault('Host allocation failed');
-    this.bytes.set(data, p); try { return fn(p); } finally { this.exports.free(p); }
+    this.refreshViews();this._bytes.set(data, p); try { return fn(p); } finally { this.exports.free(p); }
   }
   alloc(size) { return this.allocate(size,16); }
   heapStats(){
@@ -191,6 +217,7 @@ export class WarcraftHost {
     const id = this.thunks.length;
     if (id >= 65536) throw new GuestFault('Import thunk limit');
     this.thunks.push(this.handlers.get(key) || {dll: library, name: name ?? '#' + ordinal, argc: 0, unsupported: true});
+    bindNativeImport(this,id,this.thunks[id]);
     this.graphicsBatchRegistry?.register(id,this.thunks[id]);
     this.thunkKeys.set(key, id);
     return 0xf1000000 + id * 16;
@@ -198,12 +225,16 @@ export class WarcraftHost {
   // call: an object to fill instead of a new one, for a caller that finishes
   // the import before any other runs (invoke); invokeAsync awaits, so it does not.
   beginImport(id, cpuPointer, call = null) {
+    this.enterImportViews();
+    try { return this._beginImport(id,cpuPointer,call); }
+    finally { this.leaveImportViews(); }
+  }
+  _beginImport(id, cpuPointer, call = null) {
     const handler = this.thunks[id]; cpuPointer >>>= 0;
     const esp = this.view.getUint32(cpuPointer + 16, true);
     const name = handler ? handler.key ??= `${handler.dll}!${handler.name}` : 'undefined!undefined';
-    this.calls.set(name, (this.calls.get(name) || 0) + 1);
     const returnAddress = this.u32(esp), threadContext = this.threadContexts.get(cpuPointer);
-    this.recordCall(name, threadContext?.id || 1, returnAddress);
+    this.recordImport(id, threadContext?.id || 1, returnAddress);
     if (!handler || handler.unsupported) throw new GuestFault(`Unsupported Win32 import: ${name}`, {history: this.history,arguments:Array.from({length:12},(_,i)=>this.u32(esp+4+i*4))});
     // One permission check covers the whole stdcall argument block.
     const argc = handler.argc, args = new Array(argc);
@@ -234,7 +265,7 @@ export class WarcraftHost {
   finishImport(cpuPointer,{handler,esp,operation,context,returnAddress},result) {
     if(operation){operation.result=(result??0)>>>0;operation.lastError=context.lastError;}
     // Calls may grow memory: the view getter refreshes after a callback or wait.
-    const view = this.view; cpuPointer >>>= 0;
+    this.refreshViews();const view = this._view; cpuPointer >>>= 0;
     view.setUint32(cpuPointer, (result ?? 0) >>> 0, true);
     view.setUint32(cpuPointer + 32, returnAddress ?? this.u32(esp), true);
     view.setUint32(cpuPointer + 16, esp + 4 + (handler.convention === 'stdcall' ? handler.argc * 4 : 0), true);
@@ -278,6 +309,7 @@ export class WarcraftHost {
   call(address, args = []) {
     const p = this.exports.malloc(Math.max(4, args.length * 4)) >>> 0;
     if(!p)throw new GuestFault('Host callback allocation failed');
+    this.refreshViews();
     for (let i = 0; i < args.length; i++) this.view.setUint32(p + i * 4, args[i] >>> 0, true);
     const mayWait=this.importMayWait;this.importMayWait=false;
     try { return this.guestOperation(cpu=>cpu&&this.exports.wc3_call_context?

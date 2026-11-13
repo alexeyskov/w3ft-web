@@ -3,7 +3,7 @@
 
 Chromium emulates a phone held sideways (touch input, pointer: coarse). The
 site's Play button launches the packaged runtime; after that only taps and
-the device keyboard are used: a tap skips the intro cinematic, a tap opens
+the device keyboard are used: startup skips the intro, a tap opens
 Local Area Network, a tap selects the player name field and the on-screen
 keyboard types a name; taps then start a match against the computer, where a
 two-finger drag scrolls the camera and a pinch zooms. Each step is checked on
@@ -116,9 +116,7 @@ async def main(url, output, timeout):
             await page.goto(url)
             await until('!document.getElementById("launch").disabled')
             await page.locator('#launch').tap()
-            await until('[...document.querySelectorAll("#game-stage video")].some(v => v.currentTime > 2)')
             assert await page.locator('#touch-controls').is_visible()
-            await tap(0.5, 0.5)  # a tap skips the cinematic, as a click does
             await until('!document.querySelector("#game-stage video") && +document.getElementById("diagnostic-canvas").dataset.frames > 30', 60)
             await asyncio.sleep(3)  # the menu slides in
             menu = await picture('touch-menu')

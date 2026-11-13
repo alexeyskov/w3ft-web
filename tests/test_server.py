@@ -106,15 +106,23 @@ class ClientDisconnectTests(unittest.IsolatedAsyncioTestCase):
             (root / 'game').mkdir()
             (root / 'maps').mkdir()
             (root / 'game' / 'movie.webm').write_bytes(bytes(32 * 1024 * 1024))
-            runner = web.AppRunner(create_app(game_dir=root / 'game', maps_dir=root / 'maps', runtime_dir=root / 'runtime',
-                                              report_path=root / 'report.json'), handler_cancellation=False)
+            finished = asyncio.Event()
+            @web.middleware
+            async def download_lifecycle(request, handler):
+                try:
+                    return await handler(request)
+                finally:
+                    finished.set()
+            app = create_app(game_dir=root / 'game', maps_dir=root / 'maps', runtime_dir=root / 'runtime',
+                             report_path=root / 'report.json')
+            app.middlewares.append(download_lifecycle)
+            runner = web.AppRunner(app, handler_cancellation=False)
             await runner.setup()
             site = web.TCPSite(runner, '127.0.0.1', 0)
             await site.start()
             try:
                 host, port = runner.addresses[0][:2]
                 url = asset_entries(root / 'game')[0]['downloadUrl']
-                idle = len(asyncio.all_tasks())  # this test and the server's own background tasks
                 with self.assertNoLogs('aiohttp.server', level='ERROR'):
                     reader, writer = await asyncio.open_connection(host, port)
                     writer.write(f'GET {url} HTTP/1.1\r\nHost: test\r\nRange: bytes=0-\r\n\r\n'.encode())
@@ -122,11 +130,9 @@ class ClientDisconnectTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(b' 206 ', await reader.readline())
                     await reader.read(65536)
                     writer.transport.abort()
-                    for _ in range(300):
-                        await asyncio.sleep(0.01)
-                        if len(asyncio.all_tasks()) == idle:
-                            break
-                    self.assertEqual(len(asyncio.all_tasks()), idle, 'the dropped download is still being served')
+                    # Observe this handler, not unrelated periodic history
+                    # writes which can start or finish while the download runs.
+                    await asyncio.wait_for(finished.wait(), timeout=3)
             finally:
                 await runner.cleanup()
 
@@ -314,28 +320,28 @@ class ServerTests(AioHTTPTestCase):
     async def test_presence_counts_pages_running_games_and_lan_games(self):
         self.app[STATE]['presence'].broadcast_interval = 0.01
         first = await self.client.ws_connect('/api/presence')
-        await self.presence(first, {'online': 1, 'playing': 0, 'lan': 0})
+        await self.presence(first, {'online': 1, 'playing': 0, 'lan': 0, 'lanGames': 0})
         second = await self.client.ws_connect('/api/presence')
         seat = await self.client.ws_connect('/api/relay/auto')
         welcome = await seat.receive_json()
         await second.send_json({'playing': True, 'lan': True, 'presenceToken': welcome['presenceToken']})
         await first.send_json({'playing': True})
-        await self.presence(first, {'online': 2, 'playing': 2, 'lan': 1})
+        await self.presence(first, {'online': 2, 'playing': 2, 'lan': 1, 'lanGames': 0})
         status = await (await self.client.get('/api/status')).json()
-        self.assertEqual(status['presence'], {'online': 2, 'playing': 2, 'lan': 1})
+        self.assertEqual(status['presence'], {'online': 2, 'playing': 2, 'lan': 1, 'lanGames': 0})
         # A LAN flag without a running game is not a LAN game.
         await second.send_json({'playing': False, 'lan': True})
-        await self.presence(first, {'online': 2, 'playing': 1, 'lan': 0})
+        await self.presence(first, {'online': 2, 'playing': 1, 'lan': 0, 'lanGames': 0})
         await second.close()
-        await self.presence(first, {'online': 1, 'playing': 1, 'lan': 0})
+        await self.presence(first, {'online': 1, 'playing': 1, 'lan': 0, 'lanGames': 0})
         await first.send_str('{"playing": "yes"}')
         self.assertEqual((await first.receive(timeout=3)).type, WSMsgType.CLOSE)
         self.assertEqual(first.close_code, 1008)
         for _ in range(100):
-            if self.app[STATE]['presence'].counts() == {'online': 0, 'playing': 0, 'lan': 0}:
+            if self.app[STATE]['presence'].counts() == {'online': 0, 'playing': 0, 'lan': 0, 'lanGames': 0}:
                 break
             await asyncio.sleep(0.01)
-        self.assertEqual(self.app[STATE]['presence'].counts(), {'online': 0, 'playing': 0, 'lan': 0})
+        self.assertEqual(self.app[STATE]['presence'].counts(), {'online': 0, 'playing': 0, 'lan': 0, 'lanGames': 0})
         await seat.close()
         with self.assertRaises(WSServerHandshakeError) as error:
             await self.client.ws_connect('/api/presence', headers={'Origin': 'https://other.example'})
@@ -345,21 +351,21 @@ class ServerTests(AioHTTPTestCase):
         presence = self.app[STATE]['presence']
         presence.broadcast_interval = 0.01
         page = await self.client.ws_connect('/api/presence')
-        await self.presence(page, {'online': 1, 'playing': 0, 'lan': 0})
+        await self.presence(page, {'online': 1, 'playing': 0, 'lan': 0, 'lanGames': 0})
         # A stale client flag must not create a LAN player in empty lobbies.
         await page.send_json({'playing': True, 'lan': True})
-        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 0})
+        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 0, 'lanGames': 0})
 
         seat = await self.client.ws_connect('/api/relay/auto?language=en')
         welcome = await seat.receive_json()
         token = welcome['presenceToken']
         await page.send_json({'playing': True, 'lan': True, 'presenceToken': token})
-        message = await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1})
+        message = await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1, 'lanGames': 0})
         self.assertEqual(next(l['players'] for l in message['lobbies'] if l['id'] == welcome['room']), 1)
 
         # The page stays alive and never clears its flag: only the relay closes.
         await seat.close()
-        message = await self.presence(page, {'online': 1, 'playing': 1, 'lan': 0})
+        message = await self.presence(page, {'online': 1, 'playing': 1, 'lan': 0, 'lanGames': 0})
         self.assertTrue(all(l['players'] == 0 for l in message['lobbies']))
         replacement = await self.client.ws_connect('/api/relay/auto?language=en')
         new_welcome = await replacement.receive_json()
@@ -368,13 +374,13 @@ class ServerTests(AioHTTPTestCase):
         self.assertEqual((await (await self.client.get('/api/status')).json())['presence']['lan'], 0,
                          'Reusing a peer slot must not revive the old page LAN flag')
         await page.send_json({'playing': True, 'lan': True, 'presenceToken': new_welcome['presenceToken']})
-        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1})
+        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1, 'lanGames': 0})
         await asyncio.gather(replacement.close(), page.close())
 
     async def test_live_lobby_snapshots_include_private_totals_without_codes(self):
         self.app[STATE]['presence'].broadcast_interval = 0.01
         page = await self.client.ws_connect('/api/presence')
-        idle = {'online': 1, 'playing': 0, 'lan': 0}
+        idle = {'online': 1, 'playing': 0, 'lan': 0, 'lanGames': 0}
         await self.presence(page, idle)
         lobby = await (await self.client.post('/api/lobbies', json={'name': 'Live lobby'})).json()
         await self.presence(page, idle, lambda m: any(l['id'] == lobby['id'] for l in m['lobbies']))
@@ -382,7 +388,7 @@ class ServerTests(AioHTTPTestCase):
         await seat.receive_json()
         await self.presence(page, idle, lambda m: any(l['id'] == lobby['id'] and l['players'] == 1 for l in m['lobbies']))
         await seat.close()
-        await self.presence(page, idle, lambda m: all(l['id'] != lobby['id'] for l in m['lobbies']))
+        await self.presence(page, idle, lambda m: any(l['id'] == lobby['id'] and l['players'] == 0 for l in m['lobbies']))
 
         private = await self.client.ws_connect('/api/relay/secret-room-code')
         welcome = await private.receive_json()
@@ -394,12 +400,12 @@ class ServerTests(AioHTTPTestCase):
         self.assertTrue(all(l['players'] == 0 for l in listing['lobbies']))
         state = {'playing': True, 'lan': True, 'presenceToken': welcome['presenceToken']}
         await page.send_json(state)
-        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1})
+        await self.presence(page, {'online': 1, 'playing': 1, 'lan': 1, 'lanGames': 0})
         duplicate = await self.client.ws_connect('/api/presence')
         await duplicate.send_json(state)
-        await self.presence(page, {'online': 2, 'playing': 2, 'lan': 1})
+        await self.presence(page, {'online': 2, 'playing': 2, 'lan': 1, 'lanGames': 0})
         await private.close()
-        await self.presence(page, {'online': 2, 'playing': 2, 'lan': 0}, lambda m: m['privatePlayers'] == 0)
+        await self.presence(page, {'online': 2, 'playing': 2, 'lan': 0, 'lanGames': 0}, lambda m: m['privatePlayers'] == 0)
         await asyncio.gather(duplicate.close(), page.close())
 
     async def test_vanished_pages_free_lobby_seats_and_counts(self):
@@ -413,18 +419,18 @@ class ServerTests(AioHTTPTestCase):
         page = await self.client.ws_connect('/api/presence', autoping=False)
         await page.send_json({'playing': True, 'lan': True, 'presenceToken': welcome['presenceToken']})
         for _ in range(100):
-            if relay.rooms['shared-en-1'].peers and presence.counts() == {'online': 1, 'playing': 1, 'lan': 1}:
+            if relay.rooms['shared-1'].peers and presence.counts() == {'online': 1, 'playing': 1, 'lan': 1, 'lanGames': 0}:
                 break
             await asyncio.sleep(0.01)
-        self.assertEqual(len(relay.rooms['shared-en-1'].peers), 1)
-        self.assertEqual(presence.counts(), {'online': 1, 'playing': 1, 'lan': 1})
+        self.assertEqual(len(relay.rooms['shared-1'].peers), 1)
+        self.assertEqual(presence.counts(), {'online': 1, 'playing': 1, 'lan': 1, 'lanGames': 0})
         # Neither connection reads or answers pings from here on.
         for _ in range(300):
-            if not relay.rooms['shared-en-1'].peers and presence.counts()['online'] == 0:
+            if not relay.rooms['shared-1'].peers and presence.counts()['online'] == 0:
                 break
             await asyncio.sleep(0.01)
-        self.assertEqual(len(relay.rooms['shared-en-1'].peers), 0, 'the lobby seat was not freed')
-        self.assertEqual(presence.counts(), {'online': 0, 'playing': 0, 'lan': 0})
+        self.assertEqual(len(relay.rooms['shared-1'].peers), 0, 'the lobby seat was not freed')
+        self.assertEqual(presence.counts(), {'online': 0, 'playing': 0, 'lan': 0, 'lanGames': 0})
         await asyncio.gather(seat.close(), page.close())
 
     async def test_concurrent_connections_receive_distinct_ids(self):
@@ -463,6 +469,17 @@ class ServerTests(AioHTTPTestCase):
         listing = await (await self.client.get('/api/lobbies')).json()
         self.assertEqual(self.created(listing)[0]['players'], 1)
         await second.close()
+        self.assertEqual(self.created(await (await self.client.get('/api/lobbies')).json()), [{**lobby, 'players': 0}])
+        # A lost connection must not delete the last visitor's selection before
+        # the launcher can rejoin it. Reconnection gets a fresh presence token.
+        rejoined = await self.client.ws_connect(route)
+        again = await rejoined.receive_json(timeout=2)
+        self.assertEqual(again['room'], lobby['id'])
+        self.assertNotEqual(again['presenceToken'], welcome['presenceToken'])
+        await rejoined.close()
+        relay = self.app[STATE]['relay']
+        await self.wait_until(lambda: relay.rooms[lobby['id']].empty_since is not None)
+        relay.rooms[lobby['id']].empty_since -= relay.empty_lobby_ttl + 1
         self.assertEqual(self.created(await (await self.client.get('/api/lobbies')).json()), [])
         with self.assertRaises(WSServerHandshakeError) as error:
             await self.client.ws_connect(route)
@@ -486,41 +503,32 @@ class ServerTests(AioHTTPTestCase):
         for room in relay.rooms.values():
             room.capacity = 2
         listing = await (await self.client.get('/api/lobbies')).json()
-        # Two shared lobbies per language; English is listed first.
-        self.assertEqual([(l['id'], l['language'], l['shared'], l['players'], l['maxPlayers']) for l in listing['lobbies']],
-                         [(f'shared-{language}-{n}', language, n, 0, 2) for language in ('en', 'ru') for n in (1, 2)])
-        # Without a language Play joins the base installation's (Russian) lobbies.
-        seats = [await self.auto() for _ in range(5)]
-        self.assertEqual([room for _, room in seats], ['shared-ru-1'] * 2 + ['shared-ru-2'] * 2 + ['shared-ru-3'])
+        self.assertEqual([(l['id'], l['shared'], l['players'], l['maxPlayers'], l['temporary']) for l in listing['lobbies']],
+                         [(f'shared-{n}', n, 0, 2, False) for n in range(1, 5)])
+        self.assertTrue(all('language' not in lobby for lobby in listing['lobbies']))
+        # Old language query parameters and new language-free clients all fill
+        # the same four permanent lobbies before temporary lobby 5 opens.
+        seats = [await self.auto(language) for language in (None, 'en', 'ru', 'xx', None, 'ru', 'en', None, 'en')]
+        self.assertEqual([room for _, room in seats], [f'shared-{n}' for n in range(1, 5) for _ in range(2)] + ['shared-5'])
         listing = await (await self.client.get('/api/lobbies')).json()
-        self.assertEqual([(l['language'], l['shared'], l['players']) for l in listing['lobbies']],
-                         [('en', 1, 0), ('en', 2, 0), ('ru', 1, 2), ('ru', 2, 2), ('ru', 3, 1)])
-        # Each language fills its own shared lobbies.
-        english, room = await self.auto('en')
-        self.assertEqual(room, 'shared-en-1')
-        await english.close()
-        with self.assertRaises(WSServerHandshakeError) as error:
-            await self.client.ws_connect('/api/relay/auto?language=xx')
-        self.assertEqual(error.exception.status, 400)
+        self.assertEqual([(l['shared'], l['players'], l['temporary']) for l in listing['lobbies']],
+                         [(n, 2, False) for n in range(1, 5)] + [(5, 1, True)])
         # A freed seat in the first lobby is taken before any later lobby.
         await seats[0][0].close()
         socket, room = await self.auto()
-        self.assertEqual(room, 'shared-ru-1')
-        # Overflow lobbies close when empty; lobbies 1–2 stay.
-        await seats[4][0].close()
-        for _ in range(100):
-            if 'shared-ru-3' not in relay.rooms:
-                break
-            await asyncio.sleep(0.01)
-        self.assertNotIn('shared-ru-3', relay.rooms)
-        await asyncio.gather(socket.close(), *(s.close() for s, _ in seats[1:4]))
-        for _ in range(100):
-            if all(not relay.rooms[f'shared-ru-{n}'].peers for n in (1, 2)):
-                break
-            await asyncio.sleep(0.01)
+        self.assertEqual(room, 'shared-1')
+        # An emptied overflow lobby remains reusable for its idle TTL, then
+        # expires; the four permanent lobbies stay even when empty.
+        await seats[8][0].close()
+        await self.wait_until(lambda: relay.rooms['shared-5'].empty_since is not None)
+        self.assertIn('shared-5', relay.rooms)
+        relay.rooms['shared-5'].empty_since -= relay.empty_lobby_ttl + 1
+        await self.client.get('/api/lobbies')
+        self.assertNotIn('shared-5', relay.rooms)
+        await asyncio.gather(socket.close(), *(s.close() for s, _ in seats[1:8]))
+        await self.wait_until(lambda: all(not relay.rooms[f'shared-{n}'].peers for n in range(1, 5)))
         listing = await (await self.client.get('/api/lobbies')).json()
-        self.assertEqual([(l['language'], l['shared'], l['players']) for l in listing['lobbies']],
-                         [(language, n, 0) for language in ('en', 'ru') for n in (1, 2)])
+        self.assertEqual([(l['shared'], l['players']) for l in listing['lobbies']], [(n, 0) for n in range(1, 5)])
 
     async def wait_until(self, condition):
         for _ in range(200):
@@ -529,30 +537,85 @@ class ServerTests(AioHTTPTestCase):
             await asyncio.sleep(0.01)
         self.fail('Condition not reached')
 
+    async def test_public_lobby_defaults_legacy_aliases_and_reserved_codes(self):
+        listing = await (await self.client.get('/api/lobbies')).json()
+        self.assertEqual([(item['id'], item['maxPlayers']) for item in listing['lobbies']],
+                         [(f'shared-{number}', 200) for number in range(1, 5)])
+        for old_code in ('shared-en-1', 'shared-ru-1'):
+            socket = await self.client.ws_connect(f'/api/relay/{old_code}?lobby=1')
+            welcome = await socket.receive_json(timeout=2)
+            self.assertEqual(welcome['room'], 'shared-1')
+            self.assertNotIn('language', welcome['lobby'])
+            await socket.close()
+        for absent in ('shared-5', 'shared-en-5', 'shared-ru-99', 'shared-fr-1'):
+            with self.assertRaises(WSServerHandshakeError) as error:
+                await self.client.ws_connect('/api/relay/' + absent)
+            self.assertEqual(error.exception.status, 404)
+            self.assertNotIn(absent, self.app[STATE]['relay'].rooms)
+
+    async def test_concurrent_auto_connections_fill_one_shared_pool_without_overflowing(self):
+        relay = self.app[STATE]['relay']
+        relay.capacity = 2
+        for room in relay.rooms.values():
+            room.capacity = 2
+        seats = await asyncio.gather(*(self.auto(('ru', 'en', None)[i % 3]) for i in range(12)))
+        listing = await (await self.client.get('/api/lobbies')).json()
+        self.assertEqual([(item['shared'], item['players']) for item in listing['lobbies']],
+                         [(number, 2) for number in range(1, 7)])
+        self.assertTrue(all(set(room.peers) == {1, 2} for room in relay.rooms.values()))
+        await asyncio.gather(*(socket.close() for socket, _ in seats))
+
+    async def test_public_overflow_respects_the_total_room_limit(self):
+        relay = self.app[STATE]['relay']
+        relay.max_rooms = 4
+        relay.capacity = 1
+        for room in relay.rooms.values():
+            room.capacity = 1
+        seats = [await self.auto() for _ in range(4)]
+        with self.assertRaises(WSServerHandshakeError) as error:
+            await self.client.ws_connect('/api/relay/auto')
+        self.assertEqual(error.exception.status, 503)
+        self.assertEqual(len(relay.rooms), 4)
+        await asyncio.gather(*(socket.close() for socket, _ in seats))
+
     async def test_overflow_lobbies_are_reused_before_another_opens(self):
         relay = self.app[STATE]['relay']
         relay.capacity = 2
         for room in relay.rooms.values():
             room.capacity = 2
-        # Initial lobbies 1–2 full: players fill overflow lobby 3 before lobby 4 opens.
-        seats = [await self.auto('en') for _ in range(7)]
+        # Initial lobbies 1–4 full: fill overflow lobbies in order too.
+        seats = [await self.auto('en') for _ in range(13)]
         self.assertEqual([room for _, room in seats],
-                         ['shared-en-1'] * 2 + ['shared-en-2'] * 2 + ['shared-en-3'] * 2 + ['shared-en-4'])
-        # The last player leaving closes an overflow lobby; the others stay.
-        await asyncio.gather(seats[4][0].close(), seats[5][0].close(), seats[0][0].close())
-        await self.wait_until(lambda: 'shared-en-3' not in relay.rooms and len(relay.rooms['shared-en-1'].peers) == 1)
-        self.assertIn('shared-en-4', relay.rooms)
+                         [f'shared-{n}' for n in range(1, 7) for _ in range(2)] + ['shared-7'])
+        await asyncio.gather(seats[8][0].close(), seats[9][0].close(), seats[0][0].close())
+        await self.wait_until(lambda: relay.rooms['shared-5'].empty_since is not None and len(relay.rooms['shared-1'].peers) == 1)
+        # Reuse a newly empty temporary lobby before opening another one.
+        reused, room = await self.auto('ru')
+        self.assertEqual(room, 'shared-1')
+        reused_overflow, room = await self.auto('ru')
+        self.assertEqual(room, 'shared-5')
+        await asyncio.gather(reused.close(), reused_overflow.close())
+        await self.wait_until(lambda: relay.rooms['shared-5'].empty_since is not None and len(relay.rooms['shared-1'].peers) == 1)
+        relay.rooms['shared-5'].empty_since -= relay.empty_lobby_ttl + 1
+        await self.client.get('/api/lobbies')
+        self.assertNotIn('shared-5', relay.rooms)
+        self.assertIn('shared-7', relay.rooms)
         # A free seat in an initial lobby, then in an open overflow lobby, and
         # only then a new lobby.
         later = [await self.auto('en') for _ in range(4)]
-        self.assertEqual([room for _, room in later], ['shared-en-1', 'shared-en-4', 'shared-en-3', 'shared-en-3'])
+        self.assertEqual([room for _, room in later], ['shared-1', 'shared-7', 'shared-5', 'shared-5'])
         # Lobbies created by players are never filled by Play.
         response = await self.client.post('/api/lobbies', json={'name': 'Friends'})
         self.assertEqual(response.status, 201)
         socket, room = await self.auto('en')
-        self.assertEqual(room, 'shared-en-5')
-        await asyncio.gather(socket.close(), *(s.close() for s, _ in seats[1:4] + seats[6:] + later))
-        await self.wait_until(lambda: sorted(k for k in relay.rooms if k.startswith('shared-en')) == ['shared-en-1', 'shared-en-2'])
+        self.assertEqual(room, 'shared-8')
+        await asyncio.gather(socket.close(), *(s.close() for s, _ in seats[1:8] + seats[10:] + later))
+        await self.wait_until(lambda: all(not room.peers for room in relay.rooms.values() if room.shared))
+        for room in relay.rooms.values():
+            if room.shared and not room.permanent:
+                room.empty_since -= relay.empty_lobby_ttl + 1
+        listing = await (await self.client.get('/api/lobbies')).json()
+        self.assertEqual([lobby['shared'] for lobby in listing['lobbies'] if lobby.get('shared')], list(range(1, 5)))
 
     async def test_default_page_language_follows_the_country(self):
         geo = self.app[STATE]['geo']
@@ -614,8 +677,7 @@ class ServerTests(AioHTTPTestCase):
             room.created_at -= relay.empty_lobby_ttl + 1
         listing = await (await self.client.get('/api/lobbies')).json()
         self.assertEqual([item['id'] for item in self.created(listing)], [first['id']])
-        self.assertEqual([(item['language'], item['shared']) for item in listing['lobbies'][:4]],
-                         [('en', 1), ('en', 2), ('ru', 1), ('ru', 2)], 'shared lobbies never expire')
+        self.assertEqual([item['shared'] for item in listing['lobbies'][:4]], list(range(1, 5)), 'permanent public lobbies never expire')
         with self.assertRaises(WSServerHandshakeError) as error:
             await self.client.ws_connect('/api/relay/' + second['id'] + '?lobby=1')
         self.assertEqual(error.exception.status, 404)

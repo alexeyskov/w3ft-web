@@ -2,12 +2,13 @@
 """Record what the game reads up to its main menu, for each game language.
 
 The launcher downloads this set before a launch, with progress (client.mjs
-prepareGame), so the main menu opens right after the intro cinematic instead
-of loading block by block from the server. A fresh Chromium profile runs the
+prepareGame), so the main menu opens without loading block by block from the
+server. Startup intros and background caching are disabled while recording.
+A fresh Chromium profile runs the
 packaged runtime to the main menu with the launcher's default settings; the
-game data stored on the way (game-cache.mjs) and the cinematic that played
+game data stored on the way (game-cache.mjs)
 are written to var/runtime/boot-<language>.json: files read whole (the
-executables), the 256 KiB blocks read from the archives and the cinematic.
+executables) and the 256 KiB blocks read from the archives.
 Map headers come with the map catalog and are not part of the set.
 
 Needs the packaged runtime (make runtime) and Playwright with Chromium. The
@@ -49,7 +50,7 @@ BOOT = r'''async ({language, resolution, graphicsSettings}) => {
   document.body.append(canvas);
   window.probe = {frames: 0, report: null};
   window.session = await module.runDiagnostics({canvas, wasmUrl: status.runtime.wasmUrl, resolution, graphicsSettings, language,
-    audioEnabled: false, timeout: 0, dispatchBudget: 0,
+    audioEnabled: false, timeout: 0, dispatchBudget: 0, backgroundCache: false, skipIntro: true,
     onReport: report => probe.report = report, onFrame: frame => probe.frames = frame.frames});
 }'''
 INDEX = r'''async () => {
@@ -93,8 +94,6 @@ async def record(browser, url, language, timeout):
             await asyncio.sleep(0.25)
         raise TimeoutError(f"{language}: {expression}")
 
-    await until('[...document.querySelectorAll("video")].some(video => video.currentTime > 2)', timeout)
-    await page.keyboard.press("Escape")
     await until('!document.querySelector("video") && probe.frames > 30', timeout)
     menu = time.monotonic() - started
     await asyncio.sleep(10)  # the menu settles; it reads nothing more
@@ -118,7 +117,7 @@ def manifest(language, index, media, assets):
         blocks = [block for block in range(count) if block >> 3 < len(bits) and bits[block >> 3] >> (block & 7) & 1]
         if not blocks:
             continue
-        entry = {"path": asset["path"], "size": asset["size"]}
+        entry = {"path": asset["path"], "size": asset["size"], "version": asset["version"]}
         if len(blocks) == count:
             entry["whole"] = True
         else:

@@ -32,7 +32,7 @@ SETUP = """async ({language='en'}={}) => {
 
 
 @contextmanager
-def fixture_server(clip):
+def fixture_server(clip, setup=SETUP):
     # A real HTTP origin: WebKit does not expose SharedArrayBuffer on pages
     # fulfilled by Playwright routing, even with COOP/COEP response headers.
     class Handler(BaseHTTPRequestHandler):
@@ -65,7 +65,7 @@ def fixture_server(clip):
                 script = """try {
                   const result=await (%s)({language:new URLSearchParams(location.search).get('language')||'en'});
                   await fetch('/autoplay-result',{method:'POST',body:JSON.stringify(result)});
-                }catch(error){await fetch('/autoplay-result',{method:'POST',body:JSON.stringify({error:String(error)})});}""" % SETUP
+                }catch(error){await fetch('/autoplay-result',{method:'POST',body:JSON.stringify({error:String(error)})});}""" % setup
                 self.send('<section><canvas width="640" height="480"></canvas></section><script type="module">' + script + '</script>')
 
         def do_POST(self):

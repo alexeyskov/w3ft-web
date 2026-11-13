@@ -61,7 +61,9 @@ class TrampolineWasmTests(unittest.TestCase):
                        *(ROOT / path for path in ("runtime/cpu.c", "runtime/pe.c", "runtime/runtime.c"))]
             for variant in ("standard", "compat"):
                 source = out / f"{variant}.c"
-                source.write_text(builder.trampoline_source(fixture)[0] if variant == "compat" else fixture)
+                localized, count = builder.local_register_source(fixture)
+                self.assertEqual(count, 10)
+                source.write_text(builder.trampoline_source(localized)[0] if variant == "compat" else localized)
                 compiled = subprocess.run([str(compiler), *builder.variant_flags(variant), *link, *map(str, runtime),
                                            str(source), "-lm", "-o", str(out / f"{variant}.wasm")],
                                           capture_output=True, text=True)

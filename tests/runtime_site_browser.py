@@ -11,13 +11,15 @@ acceptance test.
 run its compatible build, wc3-compat.wasm.
 --autoplay-denied play/skip rejects cinematic autoplay like iPhone until a
 trusted tap on the prompt; the original game must still reach its menu.
+--video-load-stalled never provides video metadata, including from a cached
+Blob. The real game must skip the cinematic and reach its working menu.
 """
 import argparse
 import json
 import struct
 import time
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 # The page's tail-call probe fails, as in a browser without them; every other
 # module validates as usual.
@@ -29,7 +31,7 @@ NO_TAIL_CALLS = """{
 }"""
 
 
-def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_calls=True,autoplay_denied=None):
+def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_calls=True,autoplay_denied=None,video_load_stalled=False):
     output.mkdir(parents=True,exist_ok=True)
     with sync_playwright() as p:
         # Each engine's way to allow sound and video without a user gesture.
@@ -37,7 +39,26 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_call
         elif engine=='firefox':browser=p.firefox.launch(firefox_user_prefs={'media.autoplay.default':0,'media.autoplay.blocking_policy':0})
         else:browser=p.webkit.launch()
         page=browser.new_page(viewport={'width':1440,'height':1100},accept_downloads=True,has_touch=bool(autoplay_denied))
+        held_routes=[]
+        if autoplay_denied or video_load_stalled:
+            page.add_init_script('''{
+              const OriginalWorker=Worker;
+              window.Worker=class extends OriginalWorker {
+                postMessage(message,...rest){
+                  if(message?.type==='start'&&message.options)message.options.skipIntro=false;
+                  return super.postMessage(message,...rest);
+                }
+              };
+            }''')
         if not tail_calls:page.add_init_script(NO_TAIL_CALLS)
+        if video_load_stalled:
+            page.route('**/__qa/stalled-video',lambda route:held_routes.append(route))
+            page.add_init_script("""{
+              const source=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');
+              Object.defineProperty(HTMLMediaElement.prototype,'src',{...source,set(value){
+                source.set.call(this,this.tagName==='VIDEO'?new URL('/__qa/stalled-video',location.href).href:value);
+              }});
+            }""")
         if autoplay_denied:
             page.add_init_script("""{
               const play=HTMLMediaElement.prototype.play,allowed=new WeakSet();
@@ -89,14 +110,19 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_call
                 page.wait_for_timeout(1000)
                 print(json.dumps({'cinematic':page.evaluate("({denials:cinematicDenials, inputs:cinematicInputs.slice(-16), commands:cinematicCommands.slice(-24), focus:cinematicFocus.slice(-12), prompt:!!document.querySelector('.cinematic-prompt'), videos:[...document.querySelectorAll('video')].map(v=>({time:v.currentTime,duration:v.duration,paused:v.paused,ready:v.readyState,error:v.error?.message})), log:(localStorage.getItem('wc3-last-log')||'').split('\\n').slice(-12)})")}),flush=True)
                 if autoplay_denied=='play':assert page.locator('video').count(),'Playing the cinematic unexpectedly skipped it'
-            if autoplay_denied!='skip':
+            if video_load_stalled:
+                wait("siteReport||(localStorage.getItem('wc3-last-log')||'').includes('Cinematic skipped:')")
+                assert 'Video load timed out' not in page.evaluate("JSON.stringify(siteReport||{})")
+            elif autoplay_denied=='play':
                 wait("siteReport||[...document.querySelectorAll('video')].some(v=>v.currentTime>3)")
+            else:
+                wait("siteReport||Number(document.getElementById('diagnostic-canvas').dataset.frames)>10")
             assert not page.evaluate('siteReport'),'Runtime stopped during startup'
             module='wc3.wasm' if tail_calls else 'wc3-compat.wasm'
             assert f'WASM {module} compiled' in page.evaluate("localStorage.getItem('wc3-last-log')||''"),f'{module} was not the module compiled'
             assert page.evaluate("document.fullscreenElement?.id === 'game-view'"),'Play did not enter fullscreen'
             assert page.evaluate("[...document.querySelectorAll('video')].filter(v=>v.currentTime>3).every(v=>document.fullscreenElement.contains(v))"),'Cinematic is outside the fullscreen game'
-            if autoplay_denied!='skip':
+            if autoplay_denied=='play':
                 assert page.evaluate("[...document.querySelectorAll('video')].filter(v=>v.currentTime>3).every(v=>v.muted)") == mute,'Cinematic audio ignored the launch setting'
             # Fullscreen belongs to the game: no toolbar and no system cursor.
             assert page.evaluate("getComputedStyle(document.querySelector('.game-toolbar')).display")=='none','Toolbar is visible in fullscreen'
@@ -105,7 +131,7 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_call
             # passes short presses to the game); headless has no browser UI.
             page.evaluate('document.exitFullscreen()')
             wait('document.fullscreenElement === null')
-            if autoplay_denied!='skip':page.locator('#diagnostic-canvas').press('Escape')
+            if autoplay_denied=='play':page.locator('#diagnostic-canvas').press('Escape')
             wait("siteReport||!document.querySelector('video')")
             wait("siteReport||Number(document.getElementById('diagnostic-canvas').dataset.frames)>=10")
             assert not page.evaluate('siteReport'),'Runtime stopped before original menu'
@@ -145,21 +171,27 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_call
             wait('!!siteReport')
             report=page.evaluate('siteReport')
             (output/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+            (output/'game.log').write_text(page.evaluate("localStorage.getItem('wc3-last-log')||''"))
             assert report.get('wasmExecuted') is True and report.get('profileVerified') is True,report
             assert report.get('graphics',{}).get('frames',0)>=10,report
             assert report['graphics']['width']==width and report['graphics']['height']==height,'Native renderer ignored the selected resolution'
-            assert report.get('error',{}).get('message')=='Guest process stopped',report
+            assert ((report.get('error') or {}).get('message')=='Guest process stopped' or
+                    report.get('stage')=='guest-exited' and report.get('exitCode')==0 and report.get('error') is None),report
             wait("!document.getElementById('launch').disabled")
             saved=page.evaluate("async()=>{const {SaveStore}=await import('/src/storage.mjs');return (await new SaveStore().list()).map(file=>file.path)}")
             assert not [path for path in saved if path.lower().startswith('screenshots/')],saved
             assert not errors,errors
             print(json.dumps({'wasm':module,'wasmExecuted':report['wasmExecuted'],'frames':report['graphics']['frames'],'calls':sum(report['calls'].values()),'resolution':resolution,'mute':mute,
-                              'screenshot':shot.suggested_filename,'autoplayDenied':autoplay_denied,'errors':errors}))
+                              'screenshot':shot.suggested_filename,'autoplayDenied':autoplay_denied,'videoLoadStalled':video_load_stalled,'errors':errors}))
         except Exception:
             (output/'failure.log').write_text(page.evaluate("localStorage.getItem('wc3-last-log')||''"))
             page.screenshot(path=str(output/'failure.png'))
             raise
-        finally:browser.close()
+        finally:
+            for route in held_routes:
+                try:route.abort()
+                except PlaywrightError:pass
+            browser.close()
 
 
 if __name__=='__main__':
@@ -171,4 +203,5 @@ if __name__=='__main__':
     parser.add_argument('--browser',choices=['chromium','firefox','webkit'],default='chromium')
     parser.add_argument('--no-tail-calls',action='store_true',help='a browser without WebAssembly tail calls: the compatible build')
     parser.add_argument('--autoplay-denied',choices=['play','skip'],help='simulate autoplay denial, then use the cinematic prompt')
-    args=parser.parse_args();main(args.url,args.output,args.resolution,args.mute,args.browser,not args.no_tail_calls,args.autoplay_denied)
+    parser.add_argument('--video-load-stalled',action='store_true',help='simulate a cinematic that never loads metadata')
+    args=parser.parse_args();main(args.url,args.output,args.resolution,args.mute,args.browser,not args.no_tail_calls,args.autoplay_denied,args.video_load_stalled)

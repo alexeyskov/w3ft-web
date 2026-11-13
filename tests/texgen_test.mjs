@@ -15,6 +15,18 @@ test('normal transform is inverse-transpose and inverse handles translated rotat
   near(mat4Multiply(r._matrix(),mat4Inverse(r._matrix())),mat4Identity());
   r.loadIdentity();r.scale(2,3,4);near(normalMatrix(r._matrix()),[.5,0,0,0,1/3,0,0,0,.25]);
 });
+test('a singular modelview uses the identity inverse, as Mesa does, instead of failing the draw',()=>{
+  // A 20-minute LAN match stopped on a model scaled to zero on one axis.
+  const r=renderer();r.translate(3,-2,7);r.scale(0,1,1);
+  assert.deepEqual(Array.from(normalMatrix(r._matrix())),[1,0,0,0,1,0,0,0,1]);
+  r.loadIdentity();r.scale(1e-200,1e-200,1e-200); // zero in float: also singular
+  assert.deepEqual(Array.from(normalMatrix(r._matrix())),[1,0,0,0,1,0,0,0,1]);
+  r.loadIdentity();r.scale(1e-20,2,4); // tiny but invertible: the true inverse
+  const tiny=normalMatrix(r._matrix());
+  assert.ok(Math.abs(tiny[0]/1e20-1)<1e-5);near([tiny[4],tiny[8]],[.5,.25]);
+  r.loadIdentity();r.scale(0,0,0);r.texGenfv(GL.T,GL.EYE_PLANE,[0,1,0,0]);
+  assert.deepEqual(r.texgen[1].eyePlane,[0,1,0,0]);
+});
 test('object and eye planes capture their coordinate systems independently',()=>{
   const r=renderer(),a={positions:new Float32Array([2,3,4])};
   r.enable(GL.TEXTURE_GEN_S);r.enable(GL.TEXTURE_GEN_T);

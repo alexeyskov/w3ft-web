@@ -92,6 +92,8 @@ class SelfCallTests(unittest.TestCase):
                         text, _ = builder.inline_virtual_wrappers(text, callees)
                         text, count = builder.self_call_source(text)
                         self.assertGreaterEqual(count, 1)
+                        text, _ = builder.local_register_source(text)
+                        self.assertIn('uint32_t wc3_self_depth = 0;', text)
                     if variant == 'compat':
                         text, _ = builder.trampoline_source(text)
                     source = out / (variant + '.c')

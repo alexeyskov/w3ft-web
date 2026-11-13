@@ -20,7 +20,7 @@ export const CHUNK = 256 * 1024;
 export const MAX_WINDOW = 4;
 const STREAM_IDLE_MS = 30000;
 
-export function sourceFiles(entries, disk = null, {log = () => {}, now = () => performance.now(),
+export function sourceFiles(entries, disk = null, {log = () => {}, now = () => performance.now(), downloads = null,
   request = rangeBlock, requestAsync = rangeBlockAsync, fetch: fetcher = (...args) => fetch(...args)} = {}) {
   const files = new Map(entries.map(e => [e.path.replaceAll('\\', '/').toLowerCase(), e]));
   const cache = new Map(), pending = new Map(), recent = new Map();
@@ -77,6 +77,7 @@ export function sourceFiles(entries, disk = null, {log = () => {}, now = () => p
     // A map's first bytes come with the catalog: the startup read of every
     // map's HM3W header (124 bytes) needs no 256 KiB block of each map.
     if (file.header && offset + length <= file.header.length) return file.header.slice(offset, offset + length);
+    if(length)downloads?.hint?.(file);
     const out = new Uint8Array(length);
     for (let done = 0; done < length;) {
       const start = Math.floor((offset + done) / CHUNK) * CHUNK, key = file.downloadUrl + ':' + start;
@@ -85,9 +86,12 @@ export function sourceFiles(entries, disk = null, {log = () => {}, now = () => p
       if (!block && file.cacheKey) block = disk?.read(file.cacheKey, start / CHUNK);
       if (!block) {
         const began = now();
-        block = request(file.downloadUrl, start, Math.min(start + CHUNK, file.size), {label: file.path, onRetry: log});
-        network.requests++; network.blocks++; network.bytes += block.length; store(file, start, block);
-        waited(file, now() - began, true);
+        const release=downloads?.demand(file,start/CHUNK);
+        try {
+          block = request(file.downloadUrl, start, Math.min(start + CHUNK, file.size), {label: file.path, onRetry: log});
+          network.requests++; network.blocks++; network.bytes += block.length; store(file, start, block);
+          waited(file, now() - began, true);
+        } finally { release?.(); }
       }
       remember(key, block);
       const begin = offset + done - start, n = Math.min(block.length - begin, length - done);
@@ -99,6 +103,7 @@ export function sourceFiles(entries, disk = null, {log = () => {}, now = () => p
   // Blocks first .. first+count-1 in one request, each ready when its bytes
   // are here. On any trouble the rest come block by block, with retries.
   const fetchSpan = (file, first, count) => {
+    const release=downloads?.demand(file,first);
     const entries = Array.from({length: count}, (_, i) => {
       const start = (first + i) * CHUNK, key = file.downloadUrl + ':' + start;
       let resolve, reject;
@@ -119,7 +124,11 @@ export function sourceFiles(entries, disk = null, {log = () => {}, now = () => p
     };
     network.requests++;
     stream(file, entries, finish).catch(() => { for (const entry of entries) if (!entry.done) alone(entry); });
-    return entries.map(entry => entry.promise);
+    const promises=entries.map(entry => entry.promise);
+    // Includes adaptive read-ahead: the background must not compete with the
+    // tail of a foreground stream after its first block reached the guest.
+    void Promise.allSettled(promises).then(()=>release?.());
+    return promises;
   };
   const stream = async (file, entries, finish) => {
     const start = entries[0].start, end = Math.min(entries.at(-1).start + CHUNK, file.size);
@@ -155,6 +164,7 @@ export function sourceFiles(entries, disk = null, {log = () => {}, now = () => p
   const readFileLater = (path, offset = 0, length = undefined, {stood = false} = {}) => {
     const file = canonical(path); length = span(file, offset, length);
     if (!length || (file.header && offset + length <= file.header.length)) return null;
+    downloads?.hint?.(file);
     const first = Math.floor(offset / CHUNK), last = Math.floor((offset + length - 1) / CHUNK);
     const blocks = new Map(), waits = [], missing = [];
     for (let index = first; index <= last; index++) {

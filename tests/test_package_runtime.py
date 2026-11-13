@@ -36,6 +36,20 @@ class CompatPackageTests(unittest.TestCase):
     def test_no_compat_build_packages_without_it(self):
         self.assertIsNone(package.compat_build(self.target, self.build))
 
+    def test_build_identity_covers_host_modules_and_both_wasm_builds(self):
+        host = self.target / 'client.mjs'
+        host.write_text('export const value=1;')
+        first = package.runtime_build_id(self.build, [host])
+        self.assertEqual(first, package.runtime_build_id(self.build, [host]))
+        host.write_text('export const value=2;')
+        self.assertNotEqual(first, package.runtime_build_id(self.build, [host]))
+        host.write_text('export const value=1;')
+        self.assertNotEqual(first, package.runtime_build_id({**self.build, 'sha256':'e'*64}, [host]))
+        compat = metadata('compat', self.wasm)
+        other = package.runtime_build_id(self.build, [host], compat)
+        self.assertNotEqual(first, other)
+        self.assertNotEqual(other, package.runtime_build_id(self.build, [host], {**compat, 'sha256':'f'*64}))
+
     def test_a_build_from_the_same_code_is_listed(self):
         self.write()
         self.assertEqual(package.compat_build(self.target, self.build), "wc3-compat.wasm")
@@ -46,6 +60,9 @@ class CompatPackageTests(unittest.TestCase):
                         {"modules": [{"name": "game", "sha256": "f" * 64}]},
                         {"memory": {"layout": "compact"}},
                         {"configuration": {"version": "clang 23", "self_calls": 1}},
+                        {"configuration": {"version": "clang 23", "local_registers": True}},
+                        {"configuration": {"version": "clang 23", "local_register_version": 1}},
+                        {"configuration": {"version": "clang 23", "local_register_source": "e" * 64}},
                         {"features": ["+atomics", "+tail-call"]},
                         {"sha256": "0" * 64}):
             with self.subTest(changes=list(changes)):

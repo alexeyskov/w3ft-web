@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -32,9 +33,11 @@ MEMORY_LAYOUTS = {
                "heap_limit": 0x50000000, "main_stack_top": 0x07fff000, "maximum_pages": 65536},
     "compact": {"guest_capacity": 0x1fff0000, "guest_window": 0x20000000, "heap_base": 0x04000000,
                 "heap_limit": 0x1fff0000, "main_stack_top": 0x01fff000, "maximum_pages": 16384},
+    "growing": {"guest_capacity": 0x7fff0000, "guest_window": 0x80000000, "heap_base": 0x04000000,
+                "heap_limit": 0x7fff0000, "main_stack_top": 0x01fff000, "maximum_pages": 65536},
 }
 FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", "-matomics", "-mbulk-memory", "-mtail-call",
-         "-O1", "-fno-delete-null-pointer-checks", "-std=c11",
+         "-O2", "-fno-delete-null-pointer-checks", "-std=c11",
          "-Wno-parentheses-equality"]
 VARIANTS = {
     "standard": {"artifact": "wc3.wasm", "metadata": "build.json", "objects": "objects", "link_log": "link.log"},
@@ -43,14 +46,55 @@ VARIANTS = {
 }
 TRAMPOLINE_VERSION = 1
 SELF_CALL_VERSION = 2
+LOCAL_REGS_VERSION = 2
 # A call statement of its own: at the start of a line or after ; { }.
 DIRECT_CALL = re.compile(r"(?:^|(?<=[;{}]))[ \t]*sub_[0-9a-f]{8}\(c\);", re.M)
 CALL_LIKE = re.compile(r"\bsub_[0-9a-f]{8}\(")
-DEFINITION = re.compile(r"^void sub_[0-9a-f]{8}\(CPU \*restrict c\) \{$", re.M)
+DEFINITION = re.compile(r"^void sub_[0-9a-f]{8}\(CPU \*restrict c\) \{(?: LR_ENTER;)?$", re.M)
 FUNCTION_BODY = re.compile(r"(^void sub_([0-9a-f]{8})\(CPU \*restrict c\) \{\n)(.*?)(^\})", re.M | re.S)
 INDIRECT_CALL = re.compile(r"\{ uint32_t _ct = ([^;\n]+); PUSH32\((0x[0-9a-f]+u)\); DISPATCH_CALL\(c, _ct\); \}")
 GUEST_RETURN = re.compile(r"(POP32\(c->eip\);(?: c->esp \+= [0-9]+u;)? )return;")
 DIRECT_GUEST_CALL = re.compile(r"PUSH32\((0x[0-9a-f]+u)\); sub_([0-9a-f]{8})\(c\);")
+_local_spec = importlib.util.spec_from_file_location("wc3_local_regs", ROOT / "tools/local_regs.py")
+_local_regs = importlib.util.module_from_spec(_local_spec)
+_local_spec.loader.exec_module(_local_regs)
+
+
+def local_register_source(text):
+    """Cache registers within eligible functions after self-recursion lowering.
+
+    A self-call loop deliberately shares CPU state across virtual frames;
+    keeping locals there would change that ABI. Its labels (and inlined
+    wrappers) are also outside the register pass's CFG. Leave them intact.
+    Unknown CPU helpers likewise stay conservative. RG_ is scoped to each
+    transformed function so optimized and protected functions can coexist.
+    """
+    if 'WC3_LREGS' in text or 'LR_ENTER' in text:
+        return text, 0
+    count = 0
+
+    def rewrite(match):
+        nonlocal count
+        source = match.group(0)
+        if 'wc3_self_' in source or 'wc3_inline_' in source:
+            return source
+        helpers = set(re.findall(r'\b([A-Za-z_][A-Za-z_0-9]*)\(c\s*[,)]', source))
+        known = {'DISPATCH_CALL', 'DISPATCH_TAIL', 'dispatch_indirect', 'cpuid_shim',
+                 'eflags_get', 'eflags_set', 'fcompare', 'fsw_get', 'unsupported_insn'}
+        if any(name not in known and not re.fullmatch(r'sub_[0-9a-f]{8}', name) for name in helpers):
+            return source
+        # Indexed aliases to the CPU register union cannot be rewritten by
+        # field name. Generated shards currently use the named fields only.
+        if re.search(r'\bc->r\[', source):
+            return source
+        converted = _local_regs.transform(source)
+        if 'LR_ENTER' not in converted:
+            return source
+        count += 1
+        return ('#undef RG_\n#define RG_(x) _r_##x\n' + converted +
+                '\n#undef RG_\n#define RG_(x) c->x\n')
+
+    return FUNCTION_BODY.sub(rewrite, text), count
 
 
 def virtual_callees(sources):
@@ -285,7 +329,7 @@ def registry_source(modules):
 
 def memory_layout(name, modules):
     layout = dict(MEMORY_LAYOUTS[name])
-    if name == "compact":
+    if name in ("compact", "growing"):
         reserved = [(0, 0x10000), (0x00c00000, 0x00c20000),
                     (layout['main_stack_top'] - 0x100000, layout['main_stack_top'] + 0x1000),
                     (layout['heap_base'], layout['guest_capacity'])]
@@ -296,7 +340,7 @@ def memory_layout(name, modules):
                 raise ValueError('Regenerate modules with make lift-runtime: image_size is required for the compact layout')
             end = start + size
             if start < 0x10000 or end > layout['guest_capacity'] or any(start < high and low < end for low, high in reserved):
-                raise ValueError(f"{module['name']} does not fit the compact layout; regenerate with make lift-runtime")
+                raise ValueError(f"{module['name']} does not fit the {name} layout; regenerate with make lift-runtime")
             reserved.append((start, end))
     return layout
 
@@ -320,11 +364,16 @@ def build(args):
     original_header_hashes = {str(path): digest(path) for path in headers}
     header_key = json.dumps(original_header_hashes, sort_keys=True)
     flags = variant_flags(variant) + (["-DWC3_STRICT_MEMORY=1"] if getattr(args, "strict_memory", False) else [])
+    if layout_name == 'growing':
+        flags += ['-DWC3_GROWING_GUEST=1']
     flags += [f"-D{name}=0x{layout[key]:x}u" for name, key in (
         ('WC3_GUEST_WINDOW', 'guest_window'), ('WC3_HEAP_BASE', 'heap_base'),
         ('WC3_HEAP_LIMIT', 'heap_limit'), ('WC3_MAIN_STACK_TOP', 'main_stack_top'))]
     configuration = {"compiler": str(compiler), "version": version, "flags": flags,
-                     "self_calls": SELF_CALL_VERSION}
+                     "self_calls": SELF_CALL_VERSION,
+                     "local_registers": not getattr(args, 'no_local_registers', False),
+                     "local_register_version": LOCAL_REGS_VERSION,
+                     "local_register_source": digest(ROOT / 'tools/local_regs.py')}
     if variant != "standard":
         configuration.update(variant=variant, trampoline=TRAMPOLINE_VERSION)
     configuration_key = json.dumps(configuration, sort_keys=True)
@@ -336,9 +385,12 @@ def build(args):
         source_hash = digest(source)
         include_hash = digest(include / "decls.h") if include else ""
         text = None
+        transforms = {'local_register_functions': 0, 'self_call_loops': 0, 'inlined_wrappers': 0}
         if include:
-            text, _ = inline_virtual_wrappers(source.read_text(), callees)
-            text, _ = self_call_source(text)
+            text, transforms['inlined_wrappers'] = inline_virtual_wrappers(source.read_text(), callees)
+            text, transforms['self_call_loops'] = self_call_source(text)
+            if configuration['local_registers']:
+                text, transforms['local_register_functions'] = local_register_source(text)
             if variant == "compat":
                 text, _ = trampoline_source(text, str(source))
         # An inlined visitor can live in another shard. Hash the actual input
@@ -346,7 +398,7 @@ def build(args):
         compiled_hash = hashlib.sha256(text.encode()).hexdigest() if text is not None else source_hash
         key = hashlib.sha256((source_hash + compiled_hash + include_hash + header_key + configuration_key).encode()).hexdigest()
         if object_path.exists() and hash_path.exists() and hash_path.read_text().strip() == key:
-            return {"path": object_path, "cached": True, "source": str(source), "sha256": source_hash}
+            return {"path": object_path, "cached": True, "source": str(source), "sha256": source_hash, **transforms}
         temporary = object_path.with_suffix(".tmp.o")
         command = [str(compiler), *flags, "-I" + str(ROOT / "runtime")]
         if include:
@@ -363,7 +415,7 @@ def build(args):
             raise RuntimeError(f"Compile failed: {source}\n{process.stderr[-6000:]}")
         temporary.replace(object_path)
         hash_path.write_text(key + "\n")
-        return {"path": object_path, "cached": False, "source": str(source), "sha256": source_hash}
+        return {"path": object_path, "cached": False, "source": str(source), "sha256": source_hash, **transforms}
 
     jobs = [(source, module["name"], module["folder"])
             for module in modules for source in module["sources"]]
@@ -437,6 +489,8 @@ def build(args):
                      "unsupported_instructions": module["report"]["unsupported_instructions"]}
                     for module in modules],
         "sources": [{key: value for key, value in item.items() if key not in ("path", "cached")} for item in objects],
+        "optimizations": {key: sum(item[key] for item in objects) for key in (
+            'local_register_functions', 'self_call_loops', 'inlined_wrappers')},
         "strict_memory": bool(getattr(args, "strict_memory", False)),
         "wasm_built": True, "playable": False, "campaign_verified": False, "multiplayer_verified": False,
         "elapsed_seconds": round(time.monotonic() - started, 2),
@@ -454,8 +508,10 @@ def main():
     parser.add_argument("--objects-only", action="store_true")
     parser.add_argument("--variant", choices=sorted(VARIANTS), default="standard",
                         help="compat: wc3-compat.wasm for engines without WebAssembly tail calls")
-    parser.add_argument("--memory-layout", choices=sorted(MEMORY_LAYOUTS), default="compact",
-                        help="compact: relocated DLLs in a 512 MiB guest window; legacy: original DLL bases")
+    parser.add_argument("--memory-layout", choices=sorted(MEMORY_LAYOUTS), default="growing",
+                        help="growing: demand-grown 2 GiB window; compact: fixed 512 MiB; legacy: original DLL bases")
+    parser.add_argument('--no-local-registers', action='store_true',
+                        help='Disable register caching for compiler A/B comparisons')
     parser.add_argument("--strict-memory", action="store_true",
                         help="Diagnostic build: guest accesses also check page permissions (slower)")
     args = parser.parse_args()

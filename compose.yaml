@@ -4,9 +4,29 @@ services:
     init: true
     environment:
       WC3_ADMIN_PASSWORD_HASH: ${WC3_ADMIN_PASSWORD_HASH:-}
+      WC3_HOST_NET_DEV: /run/host-net-dev
+      WC3_ISSUES_DIR: /app/var/issues
+      WC3_ACTIVITY_DIR: /app/var/activity
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
+      - issue_data:/app/var/issues
+      - activity_data:/app/var/activity
+      # Launcher files can be updated without restarting active LAN sessions.
+      - type: bind
+        source: ./web
+        target: /app/web
+        read_only: true
+        bind:
+          create_host_path: false
+      # Linux VPS network counters, including Caddy's traffic. No host PID
+      # namespace, Docker socket or privileged container access is required.
+      - type: bind
+        source: /proc/1/net/dev
+        target: /run/host-net-dev
+        read_only: true
+        bind:
+          create_host_path: false
       - ./var/game:/app/var/game:ro
       - ./var/locales:/app/var/locales:ro
       - ./var/geoip:/app/var/geoip:ro
@@ -34,5 +54,7 @@ services:
       - web
     restart: unless-stopped
 volumes:
+  issue_data:
+  activity_data:
   caddy_data:
   caddy_config:

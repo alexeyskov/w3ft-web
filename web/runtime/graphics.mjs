@@ -25,8 +25,11 @@ export class GraphicsError extends Error {
   constructor(operation,message){super(`OpenGL ${operation}: ${message}`);this.name='GraphicsError';this.operation=operation;}
 }
 const unsupported=(operation,value)=>{throw new GraphicsError(operation,`unsupported value ${value} (0x${Number(value).toString(16)})`);};
-const finite=(operation,values)=>{if(!values.every(Number.isFinite))throw new GraphicsError(operation,'finite numeric values required');};
+const finite=(operation,values)=>{for(let i=0;i<values.length;i++)if(!Number.isFinite(values[i]))throw new GraphicsError(operation,'finite numeric values required');};
+const sameComponents=(a,b,count)=>{for(let i=0;i<count;i++)if(a[i]!==b[i])return false;return true;};
+const copyComponents=(destination,source,count)=>{for(let i=0;i<count;i++)destination[i]=source[i];};
 export function mat4Identity(){return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);}
+const IDENTITY4=mat4Identity();
 export function mat4Multiply(a,b){
   if(a.length!==16||b.length!==16)throw new GraphicsError('matrix','16 components required');
   const result=new Float32Array(16);
@@ -37,10 +40,15 @@ export function transformVertex(matrix,vertex){
   if(matrix.length!==16||vertex.length!==4)throw new GraphicsError('transform','mat4 and vec4 required');
   return new Float32Array([0,1,2,3].map(row=>matrix[row]*vertex[0]+matrix[4+row]*vertex[1]+matrix[8+row]*vertex[2]+matrix[12+row]*vertex[3]));
 }
+// A singular modelview is valid OpenGL: Warcraft scales a model to zero on an
+// axis (an animation keyframe) and still draws it. Mesa then uses the
+// identity as the inverse (m_matrix.c, MAT_FLAG_SINGULAR) and goes on; so
+// does this, also when the inverse overflows float.
+const IDENTITY3=Object.freeze([1,0,0,0,1,0,0,0,1]);
 export function normalMatrix(m){
   const[a,b,c,d,e,f,g,h,i]=[m[0],m[4],m[8],m[1],m[5],m[9],m[2],m[6],m[10]],det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
-  if(!det)throw new GraphicsError('normal matrix','singular modelview');
-  return new Float32Array([e*i-f*h,c*h-b*i,b*f-c*e,f*g-d*i,a*i-c*g,c*d-a*f,d*h-e*g,b*g-a*h,a*e-b*d].map(v=>v/det));
+  const result=new Float32Array([e*i-f*h,c*h-b*i,b*f-c*e,f*g-d*i,a*i-c*g,c*d-a*f,d*h-e*g,b*g-a*h,a*e-b*d].map(v=>v/det));
+  return det&&result.every(Number.isFinite)?result:new Float32Array(IDENTITY3);
 }
 export function mat4Inverse(m){
   const rows=Array.from({length:4},(_,r)=>[m[r],m[4+r],m[8+r],m[12+r],...Array.from({length:4},(_,c)=>r===c?1:0)]);
@@ -52,6 +60,13 @@ export function mat4Inverse(m){
     for(let r=0;r<4;r++)if(r!==c){const factor=rows[r][c];rows[r]=rows[r].map((v,j)=>v-factor*rows[c][j]);}
   }
   return new Float32Array(Array.from({length:16},(_,i)=>rows[i%4][4+Math.floor(i/4)]));
+}
+// The inverse OpenGL keeps for the current modelview (eye planes): the
+// identity for a singular matrix, as for the normal matrix above.
+function modelviewInverse(m){
+  let inverse;
+  try{inverse=mat4Inverse(m);}catch(error){if(!(error instanceof GraphicsError))throw error;}
+  return inverse?.every(Number.isFinite)?inverse:mat4Identity();
 }
 const normalTransform=(m,v)=>[0,1,2].map(i=>m[i]*v[0]+m[3+i]*v[1]+m[6+i]*v[2]);
 const normalize=v=>{const length=Math.hypot(...v);return length?v.map(x=>x/length):[0,0,0];};
@@ -279,10 +294,10 @@ float ramp(float value,int channel){return texture(u_table,vec2((value*255.+.5)/
 void main(){vec4 c=texture(u_scene,v_uv);o_color=vec4(ramp(c.r,0),ramp(c.g,1),ramp(c.b,2),c.a);}`;
 
 export class FixedFunctionGL {
-  constructor(canvas,{context,debugChecks=false,legacyClampToEdge=false,nativeTextureShader=true}={}) {
+  constructor(canvas,{context,debugChecks=false,legacyClampToEdge=false,nativeTextureShader=true,streamingBuffers=false}={}) {
     this.gl=context||canvas?.getContext('webgl2',{alpha:false,antialias:false,depth:true,preserveDrawingBuffer:true});
     if(!this.gl)throw new GraphicsError('create','WebGL 2 is unavailable');
-    this.canvas=canvas;this.destroyed=false;this.mode=GL.MODELVIEW;this.draws=0;this.frames=0;
+    this.canvas=canvas;this.destroyed=false;this.mode=GL.MODELVIEW;this.draws=0;this.frames=0;this.perspectiveDraws=0;
     this.debugChecks=debugChecks;this.checkedOperations=new Set();this.errorChecks=0;
     // Some contemporary Windows drivers treated GL_CLAMP as CLAMP_TO_EDGE.
     // Warcraft's 16x16 fog tiles rely on that behavior: their last UV is
@@ -346,6 +361,8 @@ export class FixedFunctionGL {
     // single upload; attribute pointers select the original guest layouts.
     this.vao=gl.createVertexArray();this.buffers={vertex:gl.createBuffer(),index:gl.createBuffer()};
     gl.bindVertexArray(this.vao);gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,this.buffers.index);gl.bindBuffer(gl.ARRAY_BUFFER,this.buffers.vertex);
+    this.streamingBuffers=streamingBuffers;
+    this.vertexStream={capacity:0,offset:0,allocations:0};this.indexStream={capacity:0,offset:0,allocations:0};
     this.attributeState=ATTRIBUTES.map(()=>({enabled:false,pointer:null,constant:null}));this.uploadScratch=new Uint8Array(65536);this.lightData=new Float32Array(LIGHT_VECTORS*4);
     this.defaultTexture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,this.defaultTexture);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([255,255,255,255]));gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
     this.glBound[0]=this.defaultTexture;
@@ -363,19 +380,25 @@ export class FixedFunctionGL {
   _alive(){if(this.destroyed)throw new GraphicsError('call','renderer was destroyed');if(this.gl.isContextLost())throw new GraphicsError('call','WebGL context lost');if(this.backbuffer&&(this.bufferWidth!==this.canvas.width||this.bufferHeight!==this.canvas.height))this._resizeBackbuffer();}
   _check(operation,synchronize=false){
     // getError can flush the GPU command queue and wait for another process.
-    // Validate our API arguments immediately, then check backend errors at
-    // presentation/readback barriers. Debug mode retains per-operation checks.
-    this.checkedOperations.add(operation);
+    // Keep argument validation, initialization/readback checks and explicit
+    // guest glGetError. Only opt-in diagnostics poll on draws/presentation.
     if(!synchronize&&!this.debugChecks)return;
+    this.checkedOperations.add(operation);
     this.errorChecks++;const error=this.gl.getError(),operations=[...this.checkedOperations];this.checkedOperations.clear();
     if(error!==this.gl.NO_ERROR)throw new GraphicsError(operation,`WebGL error 0x${error.toString(16)} (since last check: ${operations.join(', ')})`);
   }
   _stack(){return this.mode===GL.TEXTURE&&this.textureUnits?this.textureUnits[this.activeUnit].matrix:this.matrices.get(this.mode);}
   _matrix(mode=this.mode){const stack=mode===GL.TEXTURE&&this.textureUnits?this.textureUnits[this.activeUnit].matrix:this.matrices.get(mode);return stack[stack.length-1];}
   matrixMode(mode){if(!this.matrices.has(mode))unsupported('matrixMode',mode);this.mode=mode;}
-  loadIdentity(){const stack=this._stack();stack[stack.length-1]=mat4Identity();}
-  loadMatrix(matrix){if(matrix?.length!==16)throw new GraphicsError('loadMatrix','16 components required');finite('loadMatrix',Array.from(matrix));this._stack()[this._stack().length-1]=new Float32Array(matrix);}
-  multMatrix(matrix){if(matrix?.length!==16)throw new GraphicsError('multMatrix','16 components required');finite('multMatrix',Array.from(matrix));this.loadMatrix(mat4Multiply(this._matrix(),matrix));}
+  loadIdentity(){const stack=this._stack();if(!sameComponents(stack[stack.length-1],IDENTITY4,16))stack[stack.length-1]=mat4Identity();}
+  loadMatrix(matrix){
+    if(matrix?.length!==16)throw new GraphicsError('loadMatrix','16 components required');finite('loadMatrix',matrix);
+    const stack=this._stack(),current=stack[stack.length-1];
+    // Preserve immutable matrix identity on repeated loads. Uniform and light
+    // transform caches then stay valid without allocating a matrix per call.
+    for(let i=0;i<16;i++)if(current[i]!==Math.fround(matrix[i])){stack[stack.length-1]=new Float32Array(matrix);return;}
+  }
+  multMatrix(matrix){if(matrix?.length!==16)throw new GraphicsError('multMatrix','16 components required');finite('multMatrix',matrix);this.loadMatrix(mat4Multiply(this._matrix(),matrix));}
   pushMatrix(){const stack=this._stack();if(stack.length>=32)throw new GraphicsError('pushMatrix','stack overflow');stack.push(this._matrix().slice());}
   popMatrix(){const stack=this._stack();if(stack.length===1)throw new GraphicsError('popMatrix','stack underflow');stack.pop();}
   translate(x,y,z){finite('translate',[x,y,z]);const m=mat4Identity();m[12]=x;m[13]=y;m[14]=z;this.multMatrix(m);}
@@ -419,15 +442,26 @@ export class FixedFunctionGL {
   }
   lightfv(light,parameter,values){
     const l=this.lighting.lights[light-GL.LIGHT0];if(!l)unsupported('light',light);
-    finite('light',Array.from(values));this.lightingVersion++;
+    finite('light',values);
     const property=materialProperty.get(parameter);
-    if(property&&property!=='emission'){if(values.length<4)throw new GraphicsError('light','four components required');l[property]=Array.from(values).slice(0,4);}
-    else if(parameter===GL.POSITION){if(values.length<4)throw new GraphicsError('light position','four components required');l.position=Array.from(transformVertex(this._matrix(GL.MODELVIEW),values));}
-    else if(parameter===GL.SPOT_DIRECTION){if(values.length<3)throw new GraphicsError('spot direction','three components required');l.direction=normalTransform(normalMatrix(this._matrix(GL.MODELVIEW)),values);}
-    else if(parameter===GL.SPOT_EXPONENT){if(values[0]<0||values[0]>128)throw new GraphicsError('spot exponent','outside [0,128]');l.exponent=values[0];}
-    else if(parameter===GL.SPOT_CUTOFF){if(values[0]!==180&&(values[0]<0||values[0]>90))throw new GraphicsError('spot cutoff','outside [0,90] or 180');l.cutoff=values[0];}
-    else if(parameter>=GL.CONSTANT_ATTENUATION&&parameter<=GL.QUADRATIC_ATTENUATION){if(values[0]<0)throw new GraphicsError('light attenuation','must be nonnegative');l.attenuation[parameter-GL.CONSTANT_ATTENUATION]=values[0];}
+    if(property&&property!=='emission'){
+      if(values.length<4)throw new GraphicsError('light','four components required');
+      if(sameComponents(l[property],values,4))return;copyComponents(l[property],values,4);
+    }else if(parameter===GL.POSITION||parameter===GL.SPOT_DIRECTION){
+      const position=parameter===GL.POSITION,count=position?4:3,key=position?'position':'direction',matrix=this._matrix(GL.MODELVIEW);
+      if(values.length<count)throw new GraphicsError('light',`${count} components required`);
+      const cache=l[key+'Call']??={matrix:null,values:new Float64Array(count)};
+      // These properties capture the modelview at the time of glLightfv.
+      // Identical guest vectors under a different modelview must be transformed.
+      if(cache.matrix===matrix&&sameComponents(cache.values,values,count))return;
+      const transformed=position?transformVertex(matrix,values):normalTransform(normalMatrix(matrix),values);
+      cache.matrix=matrix;copyComponents(cache.values,values,count);
+      if(sameComponents(l[key],transformed,count))return;copyComponents(l[key],transformed,count);
+    }else if(parameter===GL.SPOT_EXPONENT){if(values.length<1||values[0]<0||values[0]>128)throw new GraphicsError('spot exponent','outside [0,128]');if(l.exponent===values[0])return;l.exponent=values[0];}
+    else if(parameter===GL.SPOT_CUTOFF){if(values.length<1||(values[0]!==180&&(values[0]<0||values[0]>90)))throw new GraphicsError('spot cutoff','outside [0,90] or 180');if(l.cutoff===values[0])return;l.cutoff=values[0];}
+    else if(parameter>=GL.CONSTANT_ATTENUATION&&parameter<=GL.QUADRATIC_ATTENUATION){if(values.length<1||values[0]<0)throw new GraphicsError('light attenuation','must be nonnegative');const index=parameter-GL.CONSTANT_ATTENUATION;if(l.attenuation[index]===values[0])return;l.attenuation[index]=values[0];}
     else unsupported('light parameter',parameter);
+    this.lightingVersion++;
   }
   materialfv(face,parameter,values){
     if(this.immediate)throw new GraphicsError('material','material changes inside begin/end are not implemented');
@@ -523,7 +557,7 @@ export class FixedFunctionGL {
     }else if(parameter===GL.OBJECT_PLANE||parameter===GL.EYE_PLANE){
       if(values.length<4)throw new GraphicsError('texGen plane','four components required');
       if(parameter===GL.OBJECT_PLANE)state.objectPlane=Array.from(values).slice(0,4);
-      else{const inverse=mat4Inverse(this._matrix(GL.MODELVIEW));state.eyePlane=[0,1,2,3].map(i=>[0,1,2,3].reduce((sum,j)=>sum+inverse[i*4+j]*values[j],0));}
+      else{const inverse=modelviewInverse(this._matrix(GL.MODELVIEW));state.eyePlane=[0,1,2,3].map(i=>[0,1,2,3].reduce((sum,j)=>sum+inverse[i*4+j]*values[j],0));}
     }else unsupported('texGen parameter',parameter);
   }
   _generatedTexcoords(attributes,count,unit){
@@ -676,6 +710,21 @@ export class FixedFunctionGL {
     }
     gl.uniform4fv(this.uniforms.light,d);cache.lightingVersion=this.lightingVersion;
   }
+  _streamUpload(target,stream,view,byteLength=view.byteLength){
+    if(!byteLength)return 0;
+    const gl=this.gl,size=align4(byteLength);
+    // A ring helps some native drivers but regresses software WebGL. Keep the
+    // measured per-draw path by default; the benchmark can opt into streaming.
+    if(!this.streamingBuffers){gl.bufferData(target,view,gl.STREAM_DRAW,0,byteLength/view.BYTES_PER_ELEMENT);return 0;}
+    // Append while queued draws use earlier ranges. On wrap orphan the store
+    // before reuse: overwriting an in-flight range would make the GPU wait.
+    if(size>stream.capacity||stream.offset+size>stream.capacity){
+      stream.capacity=Math.max(stream.capacity,1048576,2**Math.ceil(Math.log2(size)));
+      gl.bufferData(target,stream.capacity,gl.STREAM_DRAW);stream.offset=0;stream.allocations++;
+    }
+    const offset=stream.offset;gl.bufferSubData(target,offset,view,0,byteLength/view.BYTES_PER_ELEMENT);
+    stream.offset+=size;return offset;
+  }
   // All client arrays of one draw share a single streaming upload. Raw guest
   // arrays keep their stride and component type; WebGL converts on the GPU.
   _uploadAttributes(attributes,vertexCount,generated){
@@ -704,17 +753,18 @@ export class FixedFunctionGL {
       if(!sources.has(plan.view)){sources.set(plan.view,total);total+=align4(plan.view.byteLength);}
     }
     // The vertex buffer stays bound to ARRAY_BUFFER; nothing else binds it.
-    if(sources.size===1){const [view]=sources.keys();gl.bufferData(gl.ARRAY_BUFFER,view,gl.STREAM_DRAW);}
+    let vertexOffset=0;
+    if(sources.size===1){const [view]=sources.keys();vertexOffset=this._streamUpload(gl.ARRAY_BUFFER,this.vertexStream,view);}
     else if(sources.size){
       if(this.uploadScratch.byteLength<total)this.uploadScratch=new Uint8Array(Math.max(total,this.uploadScratch.byteLength*2));
       for(const [view,offset] of sources)this.uploadScratch.set(view instanceof Uint8Array?view:new Uint8Array(view.buffer,view.byteOffset,view.byteLength),offset);
-      gl.bufferData(gl.ARRAY_BUFFER,this.uploadScratch,gl.STREAM_DRAW,0,total);
+      vertexOffset=this._streamUpload(gl.ARRAY_BUFFER,this.vertexStream,this.uploadScratch,total);
     }
     for(let index=0;index<ATTRIBUTES.length;index++){
       const plan=plans[index],state=this.attributeState[index],location=ATTRIBUTES[index].location;
       if(plan.view){
         if(!state.enabled){gl.enableVertexAttribArray(location);state.enabled=true;}
-        const offset=sources.get(plan.view)+plan.offset,p=state.pointer;
+        const offset=vertexOffset+sources.get(plan.view)+plan.offset,p=state.pointer;
         if(!p||p[0]!==plan.size||p[1]!==plan.type||p[2]!==plan.normalized||p[3]!==plan.stride||p[4]!==offset){
           gl.vertexAttribPointer(location,plan.size,plan.type,plan.normalized,plan.stride,offset);state.pointer=[plan.size,plan.type,plan.normalized,plan.stride,offset];
         }
@@ -788,16 +838,22 @@ export class FixedFunctionGL {
     this._uniform1i('flat',this.shading===GL.FLAT?1:0);
   }
   _drawMode(mode){if(!Number.isInteger(mode)||mode<0||mode>6)unsupported('draw mode',mode);}
-  drawArrays(mode,first,count,attributes){this._drawMode(mode);if(!Number.isInteger(first)||!Number.isInteger(count)||first<0||count<0)throw new GraphicsError('drawArrays','invalid range');this._prepare(attributes,first+count);this.gl.drawArrays(mode,first,count);this._check('drawArrays');this.draws++;this[this.nativeProgramActive?'nativeDraws':'borderDraws']++;}
+  drawArrays(mode,first,count,attributes){this._drawMode(mode);if(!Number.isInteger(first)||!Number.isInteger(count)||first<0||count<0)throw new GraphicsError('drawArrays','invalid range');this._prepare(attributes,first+count);this.gl.drawArrays(mode,first,count);this._check('drawArrays');this._recordDraw(count);}
+  _recordDraw(count){
+    this.draws++;this[this.nativeProgramActive?'nativeDraws':'borderDraws']++;
+    // Diagnostic evidence of a depth-tested 3D scene. It is not independently
+    // a match signal: the LAN observer also requires a host and a new replay.
+    if(count>0&&this.glCaps.get(GL.DEPTH_TEST)&&this._matrix(GL.PROJECTION)[15]===0)this.perspectiveDraws++;
+  }
   // vertexCount (largest index + 1) may be supplied by a caller that already
   // scanned the indices; indices may be views of shared guest memory.
   drawElements(mode,indices,attributes,vertexCount){
     this._drawMode(mode);if(!(indices instanceof Uint16Array)&&!(indices instanceof Uint32Array)&&!(indices instanceof Uint8Array))throw new GraphicsError('drawElements','unsigned integer indices required');
     if(vertexCount===undefined){let maximum=-1;for(let i=0;i<indices.length;i++)if(indices[i]>maximum)maximum=indices[i];vertexCount=maximum+1;}
     this._prepare(attributes,vertexCount);const gl=this.gl;
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,indices,gl.STREAM_DRAW);
-    gl.drawElements(mode,indices.length,indices instanceof Uint32Array?gl.UNSIGNED_INT:indices instanceof Uint16Array?gl.UNSIGNED_SHORT:gl.UNSIGNED_BYTE,0);
-    this._check('drawElements');this.draws++;this[this.nativeProgramActive?'nativeDraws':'borderDraws']++;
+    const offset=this._streamUpload(gl.ELEMENT_ARRAY_BUFFER,this.indexStream,indices);
+    gl.drawElements(mode,indices.length,indices instanceof Uint32Array?gl.UNSIGNED_INT:indices instanceof Uint16Array?gl.UNSIGNED_SHORT:gl.UNSIGNED_BYTE,offset);
+    this._check('drawElements');this._recordDraw(indices.length);
   }
   begin(mode){if(this.immediate)throw new GraphicsError('begin','nested begin');if(mode!==GL.QUADS)this._drawMode(mode);this.immediate={mode,positions:[],colors:[],texcoords:[],texcoords1:[],normals:[]};}
   vertex(x,y,z=0,w=1){if(!this.immediate)throw new GraphicsError('vertex','begin required');finite('vertex',[x,y,z,w]);this.immediate.positions.push(x,y,z,w);this.immediate.colors.push(...this.currentColor);this.immediate.texcoords.push(...this.textureUnits[0].currentTexcoord);this.immediate.texcoords1.push(...this.textureUnits[1].currentTexcoord);this.immediate.normals.push(...this.currentNormal);}
@@ -809,7 +865,7 @@ export class FixedFunctionGL {
     if(this.gamma?.active)this._presentGamma();
     else{gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,null);gl.blitFramebuffer(0,0,this.bufferWidth,this.bufferHeight,0,0,this.canvas.width,this.canvas.height,gl.COLOR_BUFFER_BIT,gl.NEAREST);}
     gl.bindFramebuffer(gl.FRAMEBUFFER,this.backbuffer);gl.readBuffer(readBuffer);if(scissor)gl.enable(gl.SCISSOR_TEST);
-    gl.flush();this._check('SwapBuffers',true);this.frames++;
+    gl.flush();this._check('SwapBuffers');this.frames++;
     return this.stats();
   }
   // Display gamma, applied to every presented pixel and never to the back
@@ -871,7 +927,7 @@ export class FixedFunctionGL {
     gl.bindVertexArray(this.vao);this.currentProgram=null;gl.activeTexture(gl.TEXTURE0+this.glActiveUnit);
     for(const cap of caps)gl.enable(cap);if(masked)gl.colorMask(...mask);gl.viewport(...this.glState.viewport);
   }
-  stats(){return{frames:this.frames,draws:this.draws,textures:this.textures.size,width:this.bufferWidth,height:this.bufferHeight,errorChecks:this.errorChecks,debugChecks:this.debugChecks,legacyClampToEdge:this.legacyClampToEdge,nativeTextureShader:this.nativeTextureShader,nativeDraws:this.nativeDraws,borderDraws:this.borderDraws};}
+  stats(){return{frames:this.frames,draws:this.draws,perspectiveDraws:this.perspectiveDraws,textures:this.textures.size,width:this.bufferWidth,height:this.bufferHeight,errorChecks:this.errorChecks,debugChecks:this.debugChecks,legacyClampToEdge:this.legacyClampToEdge,nativeTextureShader:this.nativeTextureShader,nativeDraws:this.nativeDraws,borderDraws:this.borderDraws};}
   unsupported(operation,...args){throw new GraphicsError(operation,`not implemented (${args.join(', ')})`);}
   destroy(){if(this.destroyed)return;for(const texture of this.textures.values())this.gl.deleteTexture(texture.handle);this.textures.clear();this.gl.deleteTexture(this.defaultTexture);for(const buffer of Object.values(this.buffers))this.gl.deleteBuffer(buffer);this.gl.deleteVertexArray(this.vao);this.gl.deleteProgram(this.borderProgram.program);if(this.nativeProgram)this.gl.deleteProgram(this.nativeProgram.program);this.gl.deleteFramebuffer(this.backbuffer);this.gl.deleteRenderbuffer(this.backColor);this.gl.deleteRenderbuffer(this.backDepth);const g=this.gamma;if(g){this.gl.deleteProgram(g.program);this.gl.deleteVertexArray(g.vao);this.gl.deleteTexture(g.table);if(g.scene)this.gl.deleteTexture(g.scene);this.gl.deleteFramebuffer(g.framebuffer);}this.destroyed=true;}
 }

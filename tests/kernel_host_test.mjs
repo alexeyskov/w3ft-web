@@ -233,6 +233,17 @@ const beforeMove=callbacks.length;
 user('SetWindowPos',[hwnd,0,40,50,0,0,0x15]);
 assert.ok(callbacks.slice(beforeMove).some(c=>c.args[1]===3&&c.args[3]===(50<<16|40)));
 assert.equal(callbacks.slice(beforeMove).some(c=>c.args[1]===5),false,'SWP_NOSIZE suppresses WM_SIZE');
+const placement=h.alloc(44);h.w32(placement,44);
+assert.equal(user('GetWindowPlacement',[hwnd,placement]),1);
+assert.equal(h.u32(placement+8),1);
+assert.deepEqual(Array.from({length:4},(_,i)=>h.i32(placement+28+i*4)),[40,50,1064,818]);
+h.w32(placement+28,30);h.w32(placement+32,45);h.w32(placement+36,1054);h.w32(placement+40,813);
+assert.equal(user('SetWindowPlacement',[hwnd,placement]),1);
+assert.equal(user('GetWindowPlacement',[hwnd,placement]),1);
+assert.deepEqual(Array.from({length:4},(_,i)=>h.i32(placement+28+i*4)),[30,45,1054,813]);
+h.w32(placement,0);assert.equal(user('GetWindowPlacement',[hwnd,placement]),0);assert.equal(h.lastError,87);
+h.w32(placement,44);assert.equal(user('SetWindowPlacement',[0,placement]),0);assert.equal(h.lastError,1400);
+user('SetWindowPos',[hwnd,0,40,50,0,0,0x15]);
 // A quick down/up may already be in the browser queue before the guest reads
 // either message. GetKeyState follows the removed message, not physical input.
 h.injectInput({type:'keydown',keyCode:65,text:'a'});h.injectInput({type:'keyup',keyCode:65});

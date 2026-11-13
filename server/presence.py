@@ -1,8 +1,9 @@
 """Anonymous live counts for the launcher page ("Playing now").
 
-Every open launcher page reports its game state. A LAN game also needs the
-opaque token of a live relay connection. Counts and public lobby occupancy are
-broadcast together, so a departed connection cannot leave a ghost LAN player.
+Every open launcher page reports its game state. The legacy LAN player count
+also needs the opaque token of a live relay connection. lanGames independently
+counts started matches observed in the game protocol. Counts and public lobby
+occupancy are broadcast together, so departures cannot leave ghost players.
 """
 from __future__ import annotations
 
@@ -43,10 +44,12 @@ class Presence:
         self.heartbeat = heartbeat  # a vanished page stops counting within 1.5×
         self.dirty = False
         self.broadcast_task: asyncio.Task | None = None
+        self.on_counts = None  # optional aggregate history, never client metadata
 
     def counts(self):
         return {"online": len(self.states),
                 "playing": sum(1 for playing, _ in self.states.values() if playing),
+                "lanGames": self.relay.game_count() if self.relay is not None else 0,
                 "lan": len({token for playing, token in self.states.values()
                             if playing and token and self.relay is not None and self.relay.has_presence_token(token)})}
 
@@ -96,6 +99,8 @@ class Presence:
 
     def changed(self):
         self.dirty = True
+        if self.on_counts is not None:
+            self.on_counts(self.counts())
         if self.broadcast_task is None or self.broadcast_task.done():
             self.broadcast_task = asyncio.create_task(self.broadcast())
 

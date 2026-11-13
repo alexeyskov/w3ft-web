@@ -121,7 +121,8 @@ export class VirtualWinsock extends EventTarget {
     backlog=Math.min(backlog,128);
     if(!['new','bound','listening'].includes(socket.state))fail(WSA.EINVAL,'Socket cannot listen in current state');
     if(!socket.localPort)this._bindEphemeral(socket);
-    socket.state='listening';socket.backlog=backlog;return 0;
+    socket.state='listening';socket.backlog=backlog;
+    this.dispatchEvent(new CustomEvent('listening',{detail:socket}));return 0;
   }
   accept(fd) {
     const socket=this._get(fd);
@@ -183,7 +184,8 @@ export class VirtualWinsock extends EventTarget {
     const {peer,port}=this._destination(destination);
     if(!peer&&!socket.broadcast)fail(WSA.EOPNOTSUPP,'Enable SO_BROADCAST before broadcasting');
     if(!socket.localPort)this._bindEphemeral(socket);
-    this._sendPacket(PACKET.UDP,socket,data,peer,port);return data.length;
+    this._sendPacket(PACKET.UDP,socket,data,peer,port);
+    this.dispatchEvent(new CustomEvent('datagramsent',{detail:{socket,data,destination:peer,port}}));return data.length;
   }
   recvfrom(fd,length,flags=0) {
     const socket=this._get(fd);this._recvArguments(length,flags);
@@ -241,7 +243,7 @@ export class VirtualWinsock extends EventTarget {
     const socket=this._get(fd);
     if(socket.type==='tcp'&&!socket.writeClosed&&socket.state==='connected'&&!this.disconnected){try{this._sendPacket(PACKET.FIN,socket,new Uint8Array());}catch{}}
     if(socket.state==='listening')for(const child of [...this.sockets.values()])if(child.parent===fd&&(child.state==='syn-received'||socket.pending.includes(child.fd))){try{this._sendPacket(PACKET.RST,child,new Uint8Array());}catch{}this.sockets.delete(child.fd);}
-    this.sockets.delete(fd);this.changed();return 0;
+    this.sockets.delete(fd);this.dispatchEvent(new CustomEvent('socketclosed',{detail:socket}));this.changed();return 0;
   }
   getsockname(fd) {const socket=this._get(fd);return{address:socket.localAddress,port:socket.localPort};}
   getpeername(fd) {const socket=this._get(fd);if(!socket.remotePeer||socket.state!=='connected')fail(WSA.ENOTCONN,'Socket is not connected');return{address:peerAddress(socket.remotePeer),port:socket.remotePort};}

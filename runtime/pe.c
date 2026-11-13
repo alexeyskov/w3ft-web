@@ -6,6 +6,9 @@
 #include <string.h>
 
 #define PE_IMPORT_LIMIT 1048576u
+#if defined(__wasm__) && WC3_GROWING_GUEST
+int wc3_ensure_guest(uint32_t end);
+#endif
 
 static int fail(char *error, size_t capacity, const char *format, ...) {
     if (error && capacity) {
@@ -209,6 +212,10 @@ int wc3_pe_load(Wc3Loader *loader, const char *name,
     if ((source <= destination && destination - source < length) ||
         (destination < source && source - destination < image_size))
         return fail(error, capacity, "PE source aliases destination memory");
+#if defined(__wasm__) && WC3_GROWING_GUEST
+    if (!wc3_ensure_guest(base + image_size))
+        return fail(error, capacity, "Unable to commit PE image memory");
+#endif
     memset(loader->memory + base, 0, image_size);
     memcpy(loader->memory + base, data, headers_size);
     for (uint32_t i = 0; i < sections; ++i) {
