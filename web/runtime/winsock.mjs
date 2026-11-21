@@ -52,6 +52,8 @@ export class VirtualWinsock extends EventTarget {
     // SOCKET values must not alias the broker's small Win32 HANDLE values.
     this.sockets=new Map(); this.nextFd=0x10000000; this.nextPort=49152; this.nextConnection=globalThis.crypto?.getRandomValues(new Uint32Array(1))[0]||1;
     this.lastError=0; this.disconnected=false; this.peers=null;
+    // Read-only observers of the bytes Warcraft takes from its TCP streams.
+    this.streamObservers=new Set();
     this.onPacket=event=>this._receive(event.detail);
     this.onDisconnect=()=>{this.disconnected=true;for(const socket of this.sockets.values()) if(socket.type==='tcp') socket.error=WSA.ENETDOWN;this.changed();};
     this.onPeers=event=>{
@@ -228,6 +230,7 @@ export class VirtualWinsock extends EventTarget {
       let remaining=result.length;
       while(remaining){const block=socket.chunks[0];if(block.length<=remaining){remaining-=block.length;socket.chunks.shift();}else{socket.chunks[0]=block.subarray(remaining);remaining=0;}}
       socket.queuedBytes-=result.length;
+      for(const observe of this.streamObservers)observe(socket,result);
     }
     return result;
   }

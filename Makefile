@@ -36,6 +36,8 @@ test:
 	$(PYTHON) -m unittest discover -s tests -v
 	node --check web/src/app.mjs
 	node --check web/src/storage.mjs
+	node --check web/src/map-store.mjs
+	node --check web/src/zip.mjs
 	node --check web/src/transport.mjs
 	node --check web/src/diagnostics.mjs
 	node --check web/src/presence.mjs

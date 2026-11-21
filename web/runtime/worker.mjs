@@ -2,11 +2,12 @@ import {createRuntime} from './engine.mjs';
 import {FixedFunctionGL} from './graphics.mjs';
 import {VirtualWinsock} from './winsock.mjs';
 import {LANMatchReporter} from './lan-match.mjs';
+import {MapOffers} from './map-offers.mjs';
 import {WorkerAudio} from './audio-bridge.mjs';
 import {createOfflineNetwork} from './network-local.mjs';
 import {GuestThreadScheduler} from './thread-scheduler.mjs';
 import {WorkerVideo} from './video-bridge.mjs';
-import {saveSnapshot,takeScreenshots,isScreenshot,restoreRegistry} from './persistence.mjs';
+import {saveSnapshot,takeScreenshots,isScreenshot,restoreRegistry,mapChanges,isUserMap,StoredFile,USER_MAPS} from './persistence.mjs';
 import {webkitCollectorNudge} from './webkit-gc.mjs';
 import {sourceFiles,describeNetwork} from './game-files.mjs';
 import {GRAPHICS_SETTINGS} from './launch-settings.mjs';
@@ -19,7 +20,7 @@ class WorkerTransport extends EventTarget {
   constructor(peerId) { super(); this.peerId=peerId; }
   send(destination,data) { const copy=data.slice();postMessage({type:'packet',destination,data:copy},[copy.buffer]); }
 }
-let transport,video,network,lanMatch,pendingPeers=null,disconnected=false,disk=null,gameFiles=null,downloads=null;
+let transport,video,network,lanMatch,mapOffers=null,pendingPeers=null,disconnected=false,disk=null,gameFiles=null,downloads=null;
 
 // The catalog's copy of a map's first bytes (base64), never longer than the map.
 function mapHeader(text,size){
@@ -46,6 +47,12 @@ async function compileWasm(url){
 }
 
 const sendScreenshots=engine=>{for(const {path,data} of takeScreenshots(engine.host))postMessage({type:'screenshot',path,data},[data.buffer]);};
+// Maps Warcraft finished writing (a LAN download) or deleted: to the map store.
+const sendMaps=engine=>{
+  const changes=mapChanges(engine.host,mapOffers?.sizes);
+  for(const file of changes.files)log(`Map saved in this browser: ${file.path} (${file.data.length} bytes)`);
+  if(changes.files.length||changes.deleted.length)postMessage({type:'map-changes',changes},changes.files.map(file=>file.data.buffer));
+};
 
 async function boot(options) {
   let error=null;
@@ -104,6 +111,7 @@ async function boot(options) {
     if(options.peerId)transport=new WorkerTransport(options.peerId);
     network=transport?new VirtualWinsock(transport):createOfflineNetwork();
     if(transport)lanMatch=new LANMatchReporter(network);
+    if(transport&&options.separateMaps)mapOffers=new MapOffers(network);
     if(transport){
       const peers=pendingPeers||options.peerIds;
       if(peers)transport.dispatchEvent(new CustomEvent('peers',{detail:peers}));
@@ -138,6 +146,11 @@ async function boot(options) {
     engine.host.strictFinish=!!options.strictFinish;
     // Screenshots never belong to the saves (persistence.mjs); old ones stay out.
     for(const file of options.savedFiles||[])if(!isScreenshot(file.path))engine.host.virtualFiles.set(file.path.toLowerCase(),new Uint8Array(file.data));
+    // The player's maps (the launcher's map store) join the server's in
+    // Warcraft's download folder; their bytes stay in browser storage.
+    const userMaps=(options.userMaps||[]).filter(map=>map?.data instanceof Blob&&isUserMap(USER_MAPS+map.path));
+    for(const map of userMaps)engine.host.virtualFiles.set((USER_MAPS+map.path).toLowerCase(),new StoredFile(map.data));
+    if(options.separateMaps)log(`Mounted ${userMaps.length} maps of this browser in Maps/Download`);
     restoreRegistry(engine.host);
     engine.host.virtualFiles.checkpoint();
     postMessage({type:'linked',modules:engine.modules});
@@ -148,8 +161,9 @@ async function boot(options) {
     // Every second: finished screenshots to the page, changed saves to storage.
     saveTimer=setInterval(()=>{
       sendScreenshots(engine);
+      if(options.separateMaps)sendMaps(engine);
       if(!options.persist)return;
-      const changes=saveSnapshot(engine.host);
+      const changes=saveSnapshot(engine.host,{separateMaps:!!options.separateMaps});
       if(changes.files.length||changes.deleted.length)postMessage({type:'save-changes',changes});
     },1000);
     scheduler=new GuestThreadScheduler(engine,{log,budget:options.budget??10000000,timeout:options.timeout??60000,batchGraphics:options.batchGraphics!==false,nativeGraphics:options.nativeGraphics===true,vsync:options.vsync!==false,maxFps:options.maxFps||0});
@@ -164,7 +178,7 @@ async function boot(options) {
   finally {
     clearInterval(monitor);clearInterval(saveTimer);clearInterval(nudgeTimer);clearTimeout(stopTimer);clearTimeout(quitTimer);clearTimeout(keyReleaseTimer);
     scheduler?.stop();
-    lanMatch?.destroy();network?.destroy();
+    lanMatch?.destroy();mapOffers?.destroy();network?.destroy();
     const report=engine?engine.report(error):{wasmExecuted:false,gameplayVerified:false,error:error?{type:error.name,message:error.message,details:error.details}:null};
     if(scheduler){
       report.threads=scheduler.report();report.calls=scheduler.calls();
@@ -180,9 +194,12 @@ async function boot(options) {
     const fromServer=gameFiles?.networkReport();
     if(fromServer?.blocks){report.gameData=fromServer;log(describeNetwork(fromServer));}
     if(engine)try{sendScreenshots(engine);}catch(caught){log(`Screenshot: ${caught.message}`);}
-    const snapshot=engine?saveSnapshot(engine.host,{full:true}):{files:[],deleted:[],deferred:[]};
+    const snapshot=engine?saveSnapshot(engine.host,{full:true,separateMaps:!!options.separateMaps}):{files:[],deleted:[],deferred:[]};
     if(snapshot.deferred.length)report.deferredSaveFiles=snapshot.deferred;
-    postMessage({type:'finished',report,savedFiles:snapshot.files,deletedFiles:snapshot.deleted});
+    const maps=engine&&options.separateMaps?mapChanges(engine.host,mapOffers?.sizes):{files:[],deleted:[]};
+    for(const path of engine&&options.separateMaps?engine.host.virtualFiles.dirty:[])
+      if(isUserMap(path)&&mapOffers?.sizes.has(path))log(`Interrupted map download not kept: ${path} (${engine.host.virtualFiles.get(path)?.length??0} of ${mapOffers.sizes.get(path)} bytes)`);
+    postMessage({type:'finished',report,savedFiles:snapshot.files,deletedFiles:snapshot.deleted,mapFiles:maps.files,deletedMaps:maps.deleted});
   }
 }
 

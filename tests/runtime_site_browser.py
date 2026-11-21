@@ -13,6 +13,8 @@ run its compatible build, wc3-compat.wasm.
 trusted tap on the prompt; the original game must still reach its menu.
 --video-load-stalled never provides video metadata, including from a cached
 Blob. The real game must skip the cinematic and reach its working menu.
+--user-map PATH uploads that map on the Maps tab first: the game must start with
+it mounted in Maps/Download from the browser's map store.
 """
 import argparse
 import json
@@ -31,7 +33,7 @@ NO_TAIL_CALLS = """{
 }"""
 
 
-def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_calls=True,autoplay_denied=None,video_load_stalled=False):
+def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_calls=True,autoplay_denied=None,video_load_stalled=False,user_map=None):
     output.mkdir(parents=True,exist_ok=True)
     with sync_playwright() as p:
         # Each engine's way to allow sound and video without a user gesture.
@@ -91,6 +93,10 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_call
             page.goto(url)
             page.evaluate("window.siteReport=null;addEventListener('warcraft-report',event=>window.siteReport=event.detail)")
             wait("!document.getElementById('launch').disabled")
+            if user_map:
+                page.locator('#tab-maps').click()
+                page.set_input_files('#import-maps',str(user_map))
+                wait("document.querySelectorAll('#map-list .map-row').length===1")
             page.locator('#tab-game').click()
             page.locator('#resolution').select_option(resolution)
             page.locator('#audio-enabled').set_checked(not mute)
@@ -120,6 +126,8 @@ def main(url,output,resolution='1024x768',mute=False,engine='chromium',tail_call
             assert not page.evaluate('siteReport'),'Runtime stopped during startup'
             module='wc3.wasm' if tail_calls else 'wc3-compat.wasm'
             assert f'WASM {module} compiled' in page.evaluate("localStorage.getItem('wc3-last-log')||''"),f'{module} was not the module compiled'
+            mounted='Mounted 1 maps of this browser in Maps/Download' if user_map else 'Mounted 0 maps of this browser in Maps/Download'
+            assert mounted in page.evaluate("localStorage.getItem('wc3-last-log')||''"),f'Missing in the log: {mounted}'
             assert page.evaluate("document.fullscreenElement?.id === 'game-view'"),'Play did not enter fullscreen'
             assert page.evaluate("[...document.querySelectorAll('video')].filter(v=>v.currentTime>3).every(v=>document.fullscreenElement.contains(v))"),'Cinematic is outside the fullscreen game'
             if autoplay_denied=='play':
@@ -204,4 +212,5 @@ if __name__=='__main__':
     parser.add_argument('--no-tail-calls',action='store_true',help='a browser without WebAssembly tail calls: the compatible build')
     parser.add_argument('--autoplay-denied',choices=['play','skip'],help='simulate autoplay denial, then use the cinematic prompt')
     parser.add_argument('--video-load-stalled',action='store_true',help='simulate a cinematic that never loads metadata')
-    args=parser.parse_args();main(args.url,args.output,args.resolution,args.mute,args.browser,not args.no_tail_calls,args.autoplay_denied,args.video_load_stalled)
+    parser.add_argument('--user-map',type=Path,help='upload this map on the Maps tab before Play')
+    args=parser.parse_args();main(args.url,args.output,args.resolution,args.mute,args.browser,not args.no_tail_calls,args.autoplay_denied,args.video_load_stalled,args.user_map)

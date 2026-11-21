@@ -8,23 +8,30 @@ This short regression does not establish long-session or all-map compatibility.
 --compat host|guest|both runs that client on wc3-compat.wasm, the build for
 browsers without WebAssembly tail calls: the lockstep match must stay in step.
 --host-browser / --guest-browser webkit or firefox run a client in another engine.
+--user-map PATH: the host plays that map from its browser's map store (Maps/Download,
+the site's Maps tab); the guest must download it through Warcraft and keep it in
+its own map store, byte for byte. Neither map goes to the server.
 """
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
 import re
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from playwright.async_api import async_playwright
 
 # Rows of Warcraft's map list in 1024×768 page coordinates: its folders
-# (alphabetical, with the game's own download folder), then the maps in its root
-# by number of players and name. Folders of extra maps move every row, so the
-# rows come from the server's map catalog.
-async def map_list_rows(request,url):
+# (alphabetical), then the maps in its root by number of players and name.
+# Folders of extra maps move every row, so the rows come from the server's map
+# catalog. The download folder is listed only when it holds a map: one of the
+# catalog's, or one of the player's own (the browser's map store).
+async def map_list_rows(request,url,own_maps=False):
     maps=(await (await request.get(url+'/api/maps')).json())['maps']
-    folders=sorted({m['path'].split('/')[0].lower() for m in maps if '/' in m['path']}|{'download'})
+    folders=sorted({m['path'].split('/')[0].lower() for m in maps if '/' in m['path']}|({'download'} if own_maps else set()))
     players=lambda path:int(re.match(r'\((\d+)\)',path).group(1)) if re.match(r'\((\d+)\)',path) else 99
     root=sorted((m['path'] for m in maps if '/' not in m['path']),key=lambda path:(players(path),path.lower()))
     row=lambda index:210+round(index*25.65)
@@ -39,13 +46,16 @@ HOST_ACTIONS = [
     {'click':[144,314],'frames':15}, {'click':[876,649],'frames':24},
 ]
 
-BOOT = r'''async ({room,resolution,compat,language}) => {
+BOOT = r'''async ({room,resolution,compat,language,userMap}) => {
   if (!crossOriginIsolated) throw Error('Missing cross-origin isolation');
   const status=await (await fetch('/api/status')).json();
   const module=await import(status.runtime.moduleUrl);
   const {SaveStore}=await import('/src/storage.mjs');
   const {FrameTransport}=await import('/src/transport.mjs');
   window.probeSaves=new SaveStore();
+  const {MapStore}=await import('/src/map-store.mjs');
+  window.probeMaps=new MapStore();
+  if(userMap)await probeMaps.add([new File([Uint8Array.from(atob(userMap.data),c=>c.charCodeAt(0))],userMap.name)]);
   const transport=window.probeTransport=await new FrameTransport(room,{publicLobby:true}).connect();
   window.probe={log:[],report:null,frame:null,network:{sent:{},received:{},recent:[],actionPayloads:[]}};
   const streams=new Map();
@@ -83,7 +93,7 @@ BOOT = r'''async ({room,resolution,compat,language}) => {
   document.body.append(canvas);
   const wasmUrl=compat?status.runtime.compatWasmUrl:status.runtime.wasmUrl;
   if(!wasmUrl)throw Error('The server has no compatible build');
-  window.session=await module.runDiagnostics({canvas,wasmUrl,saves:probeSaves,transport,resolution,language,
+  window.session=await module.runDiagnostics({canvas,wasmUrl,saves:probeSaves,maps:probeMaps,transport,resolution,language,
     audioEnabled:false,timeout:0,dispatchBudget:0,
     onCacheProgress:progress=>probe.cache=progress,
     onStatus:message=>{probe.log.push(message);if(probe.log.length>100)probe.log.shift();},
@@ -130,8 +140,8 @@ class Peer:
         live=await self.page.evaluate('probe');live.update(runId=self.run_id,stage=label)
         (self.output/'live.json').write_text(json.dumps(live,ensure_ascii=False,indent=2)+'\n')
 
-    async def start(self, room, resolution, compat=False):
-        await self.page.evaluate(BOOT, {'room':room,'resolution':resolution,'compat':compat,'language':'ru'})
+    async def start(self, room, resolution, compat=False, user_map=None):
+        await self.page.evaluate(BOOT, {'room':room,'resolution':resolution,'compat':compat,'language':'ru','userMap':user_map})
         await self.wait('!document.querySelector("video") && probe.frame?.frames>=10')
         # The first rendered frames include the native menu's slide-in. Its
         # controls are not ready until that wall-clock animation has finished.
@@ -175,12 +185,27 @@ class Peer:
         result['errors']=self.errors
         result['savedFiles']=await self.page.evaluate('''async()=>Promise.all((await probeSaves.list()).map(async f=>({path:f.path,size:f.data.byteLength,
           sha256:Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',f.data)),b=>b.toString(16).padStart(2,'0')).join('')})))''')
+        result['storedMaps']=await self.page.evaluate('''async()=>{const records=new Map((await probeMaps.list()).map(r=>[r.path,r]));
+          return Promise.all((await probeMaps.files()).map(async f=>({...records.get(f.path),size:f.size,
+          sha256:Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await f.data.arrayBuffer())),b=>b.toString(16).padStart(2,'0')).join('')})))}''')
         (self.output/'report.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
         await self.page.evaluate('probeTransport.close()')
         return result
 
 
-async def main(url,output,timeout,resolution,compat='none',host_browser='chromium',guest_browser='chromium',late_guest=False):
+async def main(url,output,timeout,resolution,compat='none',host_browser='chromium',guest_browser='chromium',late_guest=False,user_map=None):
+    # The host's own map: in its map store, listed in Warcraft's download folder
+    # (the folder's ".." row, then this map), and in no catalog of the server.
+    hosted=None
+    if user_map:
+        data=user_map.read_bytes()
+        hosted={'name':user_map.name,'data':base64.b64encode(data).decode(),'path':user_map.name.lower(),'sha256':hashlib.sha256(data).hexdigest(),'size':len(data)}
+        catalog=json.loads(urllib.request.urlopen(url+'/api/maps').read())['maps']
+        assert not any(m['path'].split('/')[-1].lower()==hosted['path'] for m in catalog),'The server must not have this map'
+    actions=[{**action,'click':[action['click'][0],'download/']} if hosted and action.get('click')==[158,'frozenthrone/'] else
+             {**action,'click':[144,236]} if hosted and action.get('click')==[144,314] else action for action in HOST_ACTIONS]
+    map_text=hosted['path'] if hosted else 'echoisles'
+    host_map=lambda peer:hosted if hosted and peer=='host' else None
     output.mkdir(parents=True,exist_ok=True)
     width,height=map(int,resolution.split('x'))
     run_id=datetime.now(timezone.utc).isoformat()
@@ -207,14 +232,14 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             assert response.status==201,await response.text()
             lobby=await response.json();evidence['lobby']=lobby
             if late_guest:
-                await host.start(lobby['id'],{'width':width,'height':height},compat in ('host','both'))
-                rows=await map_list_rows(host.page.request,url)
-                for action in HOST_ACTIONS:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
+                await host.start(lobby['id'],{'width':width,'height':height},compat in ('host','both'),host_map('host'))
+                rows=await map_list_rows(host.page.request,url,bool(hosted))
+                for action in actions:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
                 # The host already advertises before the guest even launches.
                 # Discovery must work by the later SEARCHGAME/response exchange.
                 await guest.start(lobby['id'],{'width':width,'height':height},compat in ('guest','both'))
             else:
-                await asyncio.gather(*(peer.start(lobby['id'],{'width':width,'height':height},compat in (peer.name,'both')) for peer in peers))
+                await asyncio.gather(*(peer.start(lobby['id'],{'width':width,'height':height},compat in (peer.name,'both'),host_map(peer.name)) for peer in peers))
             listing=await (await host.page.request.get(url+'/api/lobbies')).json()
             assert next(item for item in listing['lobbies'] if item['id']==lobby['id'])['players']==2
             assert (await (await host.page.request.get(url+'/api/status')).json())['presence']['lanGames']==0, 'Waiting in a lobby is not a match'
@@ -222,15 +247,22 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             await guest.action({'click':[230,138],'frames':2})
             await guest.action({'text':'WebGuest','frames':2})
             if not late_guest:
-                rows=await map_list_rows(host.page.request,url)
-                for action in HOST_ACTIONS:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
+                rows=await map_list_rows(host.page.request,url,bool(hosted))
+                for action in actions:await host.action({**action,'click':[action['click'][0],rows[action['click'][1]]]} if isinstance(action.get('click',[0,0])[1],str) else action)
             await guest.wait('(probe.network.received["30"]||0)>0')
             await guest.action({'click':[185,235],'frames':5},'discovered')
             assert await guest.page.evaluate('probe.network.recent.some(p=>p.id==="30"&&p.text?.includes("WebHost"))'),'Original host was not advertised'
             await guest.action({'click':[875,650],'frames':12},'joined')
             await guest.wait('(probe.network.received["04"]||0)>0')
             await host.wait('(probe.network.received["1e"]||0)>0')
-            await guest.wait('probe.network.recent.some(p=>p.id==="3d"&&p.text?.toLowerCase().includes("echoisles"))')
+            await guest.wait(f'probe.network.recent.some(p=>p.id==="3d"&&p.text?.toLowerCase().includes({json.dumps(map_text)}))')
+            if hosted:
+                # Warcraft downloads the host's map; once it closes the file the
+                # map is in the guest's map store, before the match even starts.
+                await guest.wait(f'probeMaps.list().then(maps=>maps.some(m=>m.path==={json.dumps(hosted["path"])}&&m.size==={hosted["size"]}))')
+                await guest.capture('map-downloaded')
+                print(json.dumps({'stage':'map-downloaded','network':await guest.page.evaluate('({sent:probe.network.sent,received:probe.network.received})')}),flush=True)
+                await asyncio.gather(*(peer.frames(10) for peer in peers))
             await host.capture('two-players')
             await host.action({'click':[878,633],'frames':10},'starting')
             await guest.wait('(probe.network.sent["23"]||0)>0 && (probe.network.received["0c"]||0)>=5')
@@ -259,7 +291,7 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             guest_packets=evidence['network']['guest']['received']
             assert guest_packets.get('07',0)==0 and guest_packets.get('1c',0)==0,'Player left or was kicked during the observed match'
             assert evidence['network']['guest']['sent'].get('21',0)==0,'Guest left the match before shutdown'
-            evidence['checks']={'publicLobbyTwoPeers':True,'originalDiscovery':True,'originalJoin':True,'guestLaunchedAfterHosting':late_guest,
+            evidence['checks']={'userMapDownloadedByGuest':bool(hosted),'publicLobbyTwoPeers':True,'originalDiscovery':True,'originalJoin':True,'guestLaunchedAfterHosting':late_guest,
                 'bothLoadedEchoIsles':True,'guestCommandSentAndReceived':True,'continuedLockstepFrames':True,
                 'liveLANGameCount':True,'runtimeFaults':False}
             print(json.dumps({'stage':'match-verified','checks':evidence['checks']}),flush=True)
@@ -289,6 +321,13 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             evidence['status']='failed' if evidence.get('failure') or evidence.get('cleanupErrors') else 'validating'
             summary.write_text(json.dumps(evidence,ensure_ascii=False,indent=2)+'\n')
     assert len(results)==2 and not evidence.get('cleanupErrors'),evidence.get('cleanupErrors')
+    if hosted:
+        stored=dict(zip(['host','guest'],(result['storedMaps'] for result in results)))
+        for name,maps in stored.items():
+            assert [m['path'] for m in maps]==[hosted['path']],(name,maps)
+            assert maps[0]['sha256']==hosted['sha256'] and maps[0]['size']==hosted['size'],(name,maps[0])
+        assert stored['host'][0]['source']=='upload' and stored['guest'][0]['source']=='game',stored
+        for result in results:assert not any('download/' in f['path'] for f in result['savedFiles']),result['savedFiles']
     for result in results:
         report=result['report']
         assert report.get('wasmExecuted') and report.get('profileVerified'),report
@@ -310,4 +349,5 @@ if __name__=='__main__':
     parser.add_argument('--host-browser',choices=['chromium','webkit','firefox'],default='chromium')
     parser.add_argument('--guest-browser',choices=['chromium','webkit','firefox'],default='chromium')
     parser.add_argument('--late-guest',action='store_true',help='Launch the guest only after the host has created its Warcraft game')
-    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution,args.compat,args.host_browser,args.guest_browser,args.late_guest))
+    parser.add_argument('--user-map',type=Path,help='A 2-player map the host plays from its map store; the guest downloads it')
+    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution,args.compat,args.host_browser,args.guest_browser,args.late_guest,args.user_map))

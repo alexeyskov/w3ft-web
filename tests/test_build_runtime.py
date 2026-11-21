@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import subprocess
+import struct
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("build_runtime", ROOT / "tools/build_runtime.py")
@@ -21,6 +22,40 @@ except ValueError:
 
 @unittest.skipUnless(fixture.HAVE_DEPS, "Lifter dependencies required")
 class BuildInputTests(unittest.TestCase):
+    @unittest.skipUnless(SDK, "Local WASI SDK required")
+    def test_shared_flag_handoff_is_fenced_in_both_builds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); image = root / 'fixture.dll'
+            data = fixture.pe32_fixture()
+            data[0x200:0x280] = b'\xcc' * 0x80
+            # Synthetic release/check/conditional-signal function. EDX is a
+            # callback that increments [ECX+8]; no game code/assets are used.
+            code = bytes.fromhex('c70101000000 8b4104 85c0 7402 ffd2 c3')
+            data[0x200:0x200+len(code)] = code
+            data[0x240:0x244] = bytes.fromhex('ff4108 c3')
+            struct.pack_into('<I', data, 0x400, 0x401040)
+            struct.pack_into('<I', data, 0x98+224+8, 0x80)
+            image.write_bytes(data)
+            fixture.adapter.generate(image, root / 'lift', max_functions=0, image_base=0x02000000)
+            source = (root / 'lift/shard_0000.c').read_text()
+            protected, count = builder.fence_shared_publications(source)
+            self.assertEqual(count, 1)
+            self.assertRegex(protected, r'wc3_memory_fence\(\);\s+MR32\(c->ecx\) = \(0x1u\);\s+wc3_memory_fence\(\);')
+            self.assertEqual(builder.fence_shared_publications(protected), (protected, 0))
+            # A plain initializer without a signaling branch, a different
+            # address or a stack store must not become a release handshake.
+            for unrelated in (source.replace('DISPATCH_CALL(c,', 'other_call(c,'),
+                              source.replace('MR32(c->ecx+0x4u)', 'MR32(c->ebx+0x4u)'),
+                              source.replace('c->ecx', 'c->esp')):
+                self.assertEqual(builder.fence_shared_publications(unrelated), (unrelated, 0))
+            for variant in ('standard', 'compat'):
+                builder.build(argparse.Namespace(sdk=SDK, module_dirs=[root / 'lift'], output=root / 'build',
+                    jobs=1, objects_only=False, variant=variant, memory_layout='compact'))
+            tested = subprocess.run(['node', str(ROOT / 'tests/shared_publication_fixture.mjs'), str(root)],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(tested.returncode, 0, tested.stdout + tested.stderr)
+            self.assertIn('compat publication passed', tested.stdout)
+
     @unittest.skipUnless(SDK, "Local WASI SDK required")
     def test_relocated_module_executes_in_the_compact_window(self):
         with tempfile.TemporaryDirectory() as temp:

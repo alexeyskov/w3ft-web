@@ -3,6 +3,7 @@ import {WSA,WSAError,addressPeer,peerAddress} from './winsock.mjs';
 import {installOverlappedWinsock} from './winsock-overlapped.mjs';
 import {installMilesStreams} from './miles-streams.mjs';
 import {installMilesSpatial} from './miles-spatial.mjs';
+import {mpegAudioInfo,MILES_MPEG_TYPE} from './mpeg-audio.mjs';
 
 const F32=0x1406,F64=0x140a,U8=0x1401,U16=0x1403,U32=0x1405;
 const floatScratch=new DataView(new ArrayBuffer(8));
@@ -397,12 +398,21 @@ function installMiles(h) {
   const panValue=value=>(value-64)/(value<64?64:63);
   const sampleDefaults=dig=>({kind:'miles-sample',driver:dig,data:0,length:0,rate:driver(dig).rate,
     bits:driver(dig).bits,channels:driver(dig).channels,volume:127,pan:64,loopCount:1,
-    offset:0,status:2,buffer:null,voice:null,userData:new Uint32Array(8),eos:0,eosDelivered:false});
+    offset:0,status:2,buffer:null,voice:null,userData:new Uint32Array(8),eos:0,eosDelivered:false,encoded:null});
   const releasePlayback=s=>{if(s.voice!==null){audio().releaseVoice(s.voice);s.voice=null;}if(s.buffer!==null){audio().deleteBuffer(s.buffer);s.buffer=null;}};
+  // An mp3 sample's decoded buffer outlives its plays; new content or a
+  // released handle frees it, and a decode still running is discarded.
+  const dropEncoded=s=>{const e=s.encoded;if(!e)return;s.encoded=null;if(e.buffer!==null){try{audio().deleteBuffer(e.buffer);}catch{}}};
   const duration=s=>s.length/(s.channels*s.bits/8*s.rate);
   const position=s=>{
-    if(s.voice===null)return s.offset;
-    const value=audio().getPosition(s.voice),length=duration(s);
+    const length=duration(s);
+    if(s.voice===null){
+      // An mp3 that plays before it is decoded advances by the clock.
+      if(!s.encoded||s.status!==4)return s.offset;
+      const value=s.offset+(performance.now()-s.encoded.since)/1000;
+      return s.loopCount===0&&length?value%length:Math.min(length,value);
+    }
+    const value=audio().getPosition(s.voice)*(s.encoded?s.encoded.sourceRate/s.rate:1);
     return s.loopCount===0&&length?value%length:Math.min(length,value);
   };
   // Miles calls EOS and stream callbacks from its own service thread as soon
@@ -445,7 +455,7 @@ function installMiles(h) {
     if(service.timer||!h.scheduler)return;
     let next=Infinity;const now=performance.now();
     for(const item of [...state.samples].map(id=>h.handles.get(id)).concat(state.streamWatch?.()||[]))
-      if(item&&item.status===4&&item.voice!==null&&item.loopCount!==0&&(item.eos||item.callback)&&!(item.eosDelivered||item.notified))next=Math.min(next,item.endsAt);
+      if(item&&item.status===4&&(item.voice!==null||item.encoded)&&item.loopCount!==0&&(item.eos||item.callback)&&!(item.eosDelivered||item.notified))next=Math.min(next,item.endsAt);
     if(next<Infinity)service.timer=setTimeout(checkEnded,Math.max(1,Math.min(50,next-now)));
   };
   function checkEnded(){
@@ -457,11 +467,15 @@ function installMiles(h) {
   }
   const playing=(s,offset)=>{s.endsAt=performance.now()+Math.max(0,duration(s)-offset)*1000;watch();};
   const ended=(id,s)=>{s.status=2;if(s.eos&&!s.eosDelivered){s.eosDelivered=true;deliver(s.eos,[id]);}};
-  const status=(id,s)=>{if(s.voice!==null&&s.status===4&&audio().getState(s.voice)==='ended'){s.offset=duration(s);ended(id,s);}return s.status;};
+  const status=(id,s)=>{
+    if(s.status===4&&(s.voice!==null?audio().getState(s.voice)==='ended':s.encoded&&s.loopCount!==0&&performance.now()>=s.endsAt)){s.offset=duration(s);ended(id,s);}
+    return s.status;
+  };
   const start=(id,offset=0)=>{
     const s=sample(id);audio();if(!s.data||!s.length)fail('AIL_start_sample','no PCM data assigned');
     if(offset>=duration(s)){releasePlayback(s);s.offset=duration(s);ended(id,s);return;}
     releasePlayback(s);
+    if(s.encoded)return startEncoded(id,s,offset);
     s.buffer=audio().createBuffer({data:h.copyOut(s.data,s.length),format:s.bits===16?'s16le':'u8',channels:s.channels,sampleRate:s.rate});
     try{s.voice=audio().play(s.buffer,{loop:s.loopCount===0,volume:s.volume/127*driver(s.driver).volume,offset,pan:panValue(s.pan),...state.spatialOptions?.(s)});}
     catch(error){audio().deleteBuffer(s.buffer);s.buffer=null;throw error;}
@@ -486,11 +500,47 @@ function installMiles(h) {
     return {...payload,...format,samples:payload.length/format.block};
   };
   const setWav=(id,pointer,length)=>{
-    const wav=parseWav(pointer,length),s=sample(id);releasePlayback(s);Object.assign(s,{data:wav.data,length:wav.length,rate:wav.rate,bits:wav.bits,channels:wav.channels,offset:0,status:2,eosDelivered:false});return 1;
+    const wav=parseWav(pointer,length),s=sample(id);releasePlayback(s);dropEncoded(s);Object.assign(s,{data:wav.data,length:wav.length,rate:wav.rate,bits:wav.bits,channels:wav.channels,offset:0,status:2,eosDelivered:false});return 1;
   };
+  // MPEG audio: Warcraft's music and the sounds maps import are mp3. The
+  // sample's length is its decoded PCM at the stream's rate (16-bit), from
+  // the frame headers, so durations and byte positions mean what Miles' do.
+  const isRiff=(pointer,length)=>length>=4&&String.fromCharCode(...h.copyOut(pointer,4))==='RIFF';
+  const mpeg=(pointer,length,options)=>{if(!length)return null;const at=h.check(pointer,length);return mpegAudioInfo(new Uint8Array(h.memory.buffer,at,length),options);};
+  const setEncoded=(id,pointer,length,info)=>{
+    const s=sample(id);releasePlayback(s);dropEncoded(s);
+    Object.assign(s,{data:pointer,length:info.samples*info.channels*2,rate:info.rate,bits:16,channels:info.channels,offset:0,status:2,eosDelivered:false,
+      encoded:{pointer,length,sourceRate:info.rate,buffer:null,seconds:0,decoding:null,failed:false,since:0}});
+    return 1;
+  };
+  // The browser decodes an mp3 sample on its first play. Until then it plays
+  // silently by the clock: status, position and the end callback come when
+  // the game expects them, and the sound joins at the current position.
+  const voiceFor=(s,offset)=>{
+    const e=s.encoded,rate=s.rate/e.sourceRate;
+    if(!e.seconds||s.loopCount!==0&&offset*rate>=e.seconds)return;
+    s.voice=audio().play(e.buffer,{loop:s.loopCount===0,volume:s.volume/127*driver(s.driver).volume,offset:offset*rate%e.seconds,pan:panValue(s.pan),playbackRate:rate,...state.spatialOptions?.(s)});
+  };
+  const decode=(id,s,e)=>{
+    if(e.decoding||e.failed)return;
+    const bytes=h.copyOut(e.pointer,e.length);let pending;
+    try{pending=audio().createEncodedBufferAsync?audio().createEncodedBufferAsync(bytes):audio().createEncodedBuffer(bytes);}
+    catch(error){pending=Promise.reject(error);}
+    e.decoding=Promise.resolve(pending).then(buffer=>{
+      if(s.encoded!==e||h.handles.get(id)!==s){try{audio().deleteBuffer(buffer);}catch{}return;}
+      e.buffer=buffer;e.seconds=audio().bufferInfo(buffer,'duration');
+      if(s.status===4&&s.voice===null)voiceFor(s,position(s));
+    }).catch(error=>{if(s.encoded===e){e.failed=true;state.error=error.message;h.log?.(`Miles mp3 sample: ${error.message}`);}});
+  };
+  function startEncoded(id,s,offset){
+    const e=s.encoded;
+    s.offset=offset;s.status=4;s.eosDelivered=false;e.since=performance.now();
+    if(e.buffer!==null)voiceFor(s,offset);else decode(id,s,e);
+    playing(s,offset);
+  }
   add('AIL_startup',0,()=>{if(!h.audio){state.error='PCM output unavailable';return 0;}state.started=true;return 1;});
   state.deliverCallback=deliver;state.watchPlayback=watch;
-  add('AIL_shutdown',0,()=>{clearTimeout(service.timer);service.timer=null;state.closeSpatial();state.closeStreams();for(const id of [...state.samples]){releasePlayback(sample(id));h.handles.delete(id);}for(const id of state.drivers)h.handles.delete(id);state.samples.clear();state.drivers.clear();state.started=false;});
+  add('AIL_shutdown',0,()=>{clearTimeout(service.timer);service.timer=null;state.closeSpatial();state.closeStreams();for(const id of [...state.samples]){releasePlayback(sample(id));dropEncoded(sample(id));h.handles.delete(id);}for(const id of state.drivers)h.handles.delete(id);state.samples.clear();state.drivers.clear();state.started=false;});
   add('AIL_last_error',0,()=>{if(!state.errorPointer)state.errorPointer=h.alloc(2048);h.writeString(state.errorPointer,state.error,2048);return state.errorPointer;});
   add('AIL_set_redist_directory',1,([pointer])=>{const previous=h.string(state.redist);state.redist=h.cstr(pointer);return previous;});
   add('AIL_mem_use_malloc',1,([callback])=>{const previous=state.malloc;state.malloc=callback;return previous;});
@@ -503,22 +553,30 @@ function installMiles(h) {
     if(![8,16].includes(bits)||![1,2].includes(channels)||rate<3000||rate>192000||flags!==0)fail('AIL_open_digital_driver','unsupported output format/flags');
     const id=h.handle({kind:'miles-driver',rate,bits,channels,volume:1});state.drivers.add(id);return id;
   });
-  add('AIL_close_digital_driver',1,([id])=>{driver(id);state.closeStreams(id);for(const sampleId of [...state.samples])if(sample(sampleId).driver===id){releasePlayback(sample(sampleId));state.samples.delete(sampleId);h.handles.delete(sampleId);}state.drivers.delete(id);h.handles.delete(id);});
+  add('AIL_close_digital_driver',1,([id])=>{driver(id);state.closeStreams(id);for(const sampleId of [...state.samples])if(sample(sampleId).driver===id){releasePlayback(sample(sampleId));dropEncoded(sample(sampleId));state.samples.delete(sampleId);h.handles.delete(sampleId);}state.drivers.delete(id);h.handles.delete(id);});
   add('AIL_set_digital_master_volume',2,([id,volume])=>{const d=driver(id);integer('Miles volume',volume,0,127);d.volume=volume/127;for(const sampleId of state.samples){const s=sample(sampleId);if(s.driver===id&&s.voice!==null)audio().setVolume(s.voice,s.volume/127*d.volume);}state.updateStreamVolume(id);});
   add('AIL_allocate_sample_handle',1,([dig])=>{driver(dig);const id=h.handle(sampleDefaults(dig));state.samples.add(id);return id;});
-  add('AIL_release_sample_handle',1,([id])=>{releasePlayback(sample(id));state.samples.delete(id);h.handles.delete(id);});
-  add('AIL_init_sample',1,([id])=>{const s=sample(id);releasePlayback(s);Object.assign(s,sampleDefaults(s.driver));});
+  add('AIL_release_sample_handle',1,([id])=>{const s=sample(id);releasePlayback(s);dropEncoded(s);state.samples.delete(id);h.handles.delete(id);});
+  add('AIL_init_sample',1,([id])=>{const s=sample(id);releasePlayback(s);dropEncoded(s);Object.assign(s,sampleDefaults(s.driver));});
   add('AIL_set_sample_type',3,([id,format,flags])=>{const s=sample(id);if(format>3||flags&~1)fail('AIL_set_sample_type','only standard unsigned 8-bit/signed 16-bit PCM supported');releasePlayback(s);s.bits=format&1?16:8;s.channels=format&2?2:1;s.status=2;s.offset=0;});
   add('AIL_set_sample_address',3,([id,pointer,length])=>{const s=sample(id);integer('sample bytes',length,1,256*1024*1024);h.check(pointer,length);if(length%(s.channels*s.bits/8))fail('AIL_set_sample_address','incomplete PCM frame');releasePlayback(s);Object.assign(s,{data:pointer,length,offset:0,status:2});});
-  add('AIL_set_named_sample_file',5,([id,name,pointer,length,block])=>{if(block!==0&&block!==0xffffffff)fail('AIL_set_named_sample_file','VOC block selection unsupported');if(name)h.cstr(name);return setWav(id,pointer,length);});
+  add('AIL_set_named_sample_file',5,([id,name,pointer,length,block])=>{
+    if(block!==0&&block!==0xffffffff)fail('AIL_set_named_sample_file','VOC block selection unsupported');if(name)h.cstr(name);
+    const info=!isRiff(pointer,length)&&mpeg(pointer,length);
+    return info&&info.frames?setEncoded(id,pointer,length,info):setWav(id,pointer,length);
+  });
   add('AIL_set_sample_file',3,([id,pointer,block])=>{if(block!==0&&block!==0xffffffff)fail('AIL_set_sample_file','VOC block selection unsupported');return setWav(id,pointer);});
   add('AIL_WAV_info',2,([pointer,info])=>{
     let wav;try{wav=parseWav(pointer);}catch(error){state.error=error.message;return 0;}
     h.check(info,36);[1,wav.data,wav.length,wav.rate,wav.bits,wav.channels,wav.samples,wav.block,pointer].forEach((value,i)=>h.w32(info+i*4,value));return 1;
   });
-  add('AIL_file_type',2,([pointer,length])=>{try{parseWav(pointer,length);return 1;}catch(error){state.error=error.message;return 0;}});
+  add('AIL_file_type',2,([pointer,length])=>{
+    try{parseWav(pointer,length);return 1;}catch(error){state.error=error.message;}
+    const info=!isRiff(pointer,length)&&mpeg(pointer,length,{countFrames:false});
+    return info?MILES_MPEG_TYPE[info.layer]:0;
+  });
   add('AIL_start_sample',1,([id])=>start(id));
-  add('AIL_stop_sample',1,([id])=>{const s=sample(id);if(status(id,s)===4){s.offset=position(s);audio().pause(s.voice);s.status=8;}});
+  add('AIL_stop_sample',1,([id])=>{const s=sample(id);if(status(id,s)===4){s.offset=position(s);if(s.voice!==null)audio().pause(s.voice);s.status=8;}});
   add('AIL_resume_sample',1,([id])=>{const s=sample(id);if(status(id,s)===4)return;if(s.voice!==null&&s.status===8){audio().resume(s.voice);s.status=4;playing(s,s.offset);}else start(id,s.offset>=duration(s)?0:s.offset);});
   add('AIL_end_sample',1,([id])=>{const s=sample(id);const wasLive=status(id,s)!==2;releasePlayback(s);s.offset=duration(s);s.status=2;if(wasLive)ended(id,s);});
   add('AIL_sample_status',1,([id])=>status(id,sample(id)));
@@ -541,13 +599,17 @@ function installMiles(h) {
   // Driver discovery can fail normally. Do not manufacture a working MIDI
   // synthesizer or let the absence of a MIDI device disable digital output.
   add('AIL_open_XMIDI_driver',1,([flags])=>{state.error=flags&~1?'Invalid XMIDI driver flags':'No XMIDI synthesis driver is available in this browser runtime';return 0;});
+  // Warcraft converts an mp3 to PCM in memory this way only for a sound it
+  // mixes itself (3D samples). That is not available here: Miles' failure
+  // result, which the game handles; that sound stays unloaded, as every mp3
+  // sound did while AIL_file_type did not recognize mp3.
+  add('AIL_decompress_ASI',6,()=>{state.error='ASI decompression into memory is not available';return 0;});
   installMilesStreams(h,{state,add,audio,driver,fail,integer,panValue});
   installMilesSpatial(h,{state,add,audio,sample,sampleDefaults,releasePlayback,fail,integer,f32});
   // Discovering no optional provider is a genuine unavailable result. Invoking
   // an unsupported codec/provider is an explicit fault at its import thunk.
   for(const [name,count] of [
     ['AIL_DLS_open',7],['AIL_DLS_load_memory',3],
-    ['AIL_decompress_ASI',6],
     ['AIL_decompress_ADPCM',3],['AIL_MIDI_to_XMI',5],['AIL_extract_DLS',7],['AIL_find_DLS',6],
   ])add(name,count,()=>fail(name,'compressed sample codecs and XMIDI/DLS are not implemented'));
 }

@@ -59,6 +59,7 @@ class CompatPackageTests(unittest.TestCase):
                         {"runtime_headers": {"runtime/cpu.h": "e" * 64}},
                         {"modules": [{"name": "game", "sha256": "f" * 64}]},
                         {"memory": {"layout": "compact"}},
+                        {"shared_publication_version": 1},
                         {"configuration": {"version": "clang 23", "self_calls": 1}},
                         {"configuration": {"version": "clang 23", "local_registers": True}},
                         {"configuration": {"version": "clang 23", "local_register_version": 1}},

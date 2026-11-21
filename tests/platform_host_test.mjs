@@ -209,6 +209,53 @@ test('Miles rejects non-PCM WAV and unsupported codecs, never returns dummy succ
   const unavailable=new Host();assert.equal(unavailable.invoke('mss32.dll','_AIL_startup@0'),0);assert.equal(unavailable.invoke('wsock32.dll','#115',0x101,128),10091);
 });
 
+// MPEG-1 Layer III 128 kbit/s 44.1 kHz stereo frames: headers and silence.
+const mp3=count=>{const out=new Uint8Array(417*count);for(let i=0;i<count;i++)out.set([0xff,0xfb,0x90,0x00],i*417);return out;};
+test('Miles recognizes mp3: its type and length for GetSoundFileDuration, play by the clock until decoded',async()=>{
+  // COT RPG schedules its music by GetSoundFileDuration: 0 for every mp3
+  // restarted the timer at once, forever.
+  const audio=new Audio(),decodes=[];
+  audio.createEncodedBufferAsync=bytes=>new Promise(resolve=>decodes.push({bytes,resolve}));
+  audio.bufferInfo=(id,field)=>audio.buffers.get(id)[field];
+  const h=new Host({audio}),call=(name,...args)=>h.invoke('mss32.dll',`_${name}@${args.length*4}`,...args),data=mp3(100);
+  call('AIL_startup');const sample=call('AIL_allocate_sample_handle',call('AIL_open_digital_driver',44100,16,2,0));
+  const p=h.alloc(data.length);h.copyIn(p,data);
+  assert.equal(call('AIL_file_type',p,data.length),13,'AILFILETYPE_MPEG_L3_AUDIO');
+  h.copyIn(128,wav());assert.equal(call('AIL_file_type',128,48),1);assert.equal(call('AIL_file_type',h.alloc(64),64),0);
+  // Warcraft's duration query: set the file on a sample and read its length.
+  assert.equal(call('AIL_set_named_sample_file',sample,h.string('.mp3'),p,data.length,0),1);
+  call('AIL_sample_ms_position',sample,512,516);assert.equal(h.u32(512),Math.floor(100*1152/44100*1000));assert.equal(h.u32(516),0);
+  assert.equal(decodes.length,0,'a duration query decodes nothing');
+  call('AIL_register_EOS_callback',sample,0x1234);call('AIL_set_sample_volume',sample,64);call('AIL_start_sample',sample);
+  const s=h.handles.get(sample);assert.equal(call('AIL_sample_status',sample),4);assert.equal(s.voice,null);
+  assert.equal(decodes.length,1);assert.deepEqual(decodes[0].bytes,data);
+  await new Promise(resolve=>setTimeout(resolve,40));
+  call('AIL_sample_ms_position',sample,512,516);assert.ok(h.u32(516)>=25,'the position runs while the browser decodes');
+  const buffer=audio.next++;audio.buffers.set(buffer,{duration:100*1152/44100,sampleRate:48000,numberOfChannels:2});
+  decodes[0].resolve(buffer);await new Promise(resolve=>setTimeout(resolve,0));
+  const voice=audio.voices.get(s.voice);assert.equal(voice.buffer,buffer);assert.ok(voice.offset>=.025,'joins at the current position');
+  assert.equal(voice.playbackRate,1);assert.equal(voice.volume,64/127);
+  call('AIL_set_sample_playback_rate',sample,88200);assert.equal(audio.voices.get(s.voice).playbackRate,2,'Miles rate over the stream rate');
+  call('AIL_stop_sample',sample);assert.equal(call('AIL_sample_status',sample),8);
+  call('AIL_resume_sample',sample);assert.equal(call('AIL_sample_status',sample),4);
+  audio.voices.get(s.voice).state='ended';assert.equal(call('AIL_sample_status',sample),2);assert.deepEqual(h.callbackCalls,[{address:0x1234,args:[sample]}]);
+  call('AIL_start_sample',sample);assert.equal(decodes.length,1,'later plays reuse the decoded sound');assert.equal(audio.voices.get(s.voice).buffer,buffer);
+  call('AIL_init_sample',sample);assert.equal(audio.buffers.has(buffer),false,'new content frees it');
+  // Converting mp3 to PCM in memory (3D sounds) is unavailable: Miles' failure result, no fault.
+  assert.equal(call('AIL_decompress_ASI',p,data.length,h.string('.mp3'),600,604,0),0);
+  call('AIL_release_sample_handle',sample);call('AIL_shutdown');
+});
+test('Miles mp3 sample that cannot be decoded still ends on time and reports its end',async()=>{
+  const audio=new Audio();audio.createEncodedBufferAsync=()=>Promise.reject(new Error('EncodingError'));
+  const logs=[],h=new Host({audio,log:message=>logs.push(message)}),call=(name,...args)=>h.invoke('mss32.dll',`_${name}@${args.length*4}`,...args),data=mp3(2);
+  call('AIL_startup');const sample=call('AIL_allocate_sample_handle',call('AIL_open_digital_driver',44100,16,2,0));
+  const p=h.alloc(data.length);h.copyIn(p,data);call('AIL_set_named_sample_file',sample,h.string('.mp3'),p,data.length,0);
+  call('AIL_register_EOS_callback',sample,0x99);call('AIL_start_sample',sample);assert.equal(call('AIL_sample_status',sample),4);
+  await new Promise(resolve=>setTimeout(resolve,2*1152/44100*1000+30));
+  assert.equal(call('AIL_sample_status',sample),2);assert.deepEqual(h.callbackCalls,[{address:0x99,args:[sample]}]);
+  assert.match(logs.join('\n'),/EncodingError/);call('AIL_shutdown');
+});
+
 test('Miles software 3D provider drives spatial PCM, listener coordinates, Doppler and lifecycle',()=>{
   const audio=new Audio();
   audio.setSpatial=(id,spatial)=>audio.voices.get(id).spatial=spatial;

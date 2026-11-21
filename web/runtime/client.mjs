@@ -168,7 +168,7 @@ export function prepareGame({wasmUrl='/runtime/wc3.wasm',wasmSize=0,language,ski
 
 // An actual translated-code boot diagnostic. Campaign/multiplayer remain
 // disabled in the runtime manifest until their acceptance tests pass.
-export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtime/wc3.wasm',saves,transport=null,map=null,onStatus=()=>{},onReport=()=>{},onFrame=()=>{},onSnapshot,onScreenshot,onCacheProgress=()=>{},backgroundCache=true,skipIntro=true,captureGraphics=false,graphicsDebugChecks=false,batchGraphics=true,nativeGraphics=false,legacyClampToEdge=true,nativeTextureShader=true,streamingBuffers=false,strictFinish=false,vsync=true,maxFps=0,profileRpc=false,audioEnabled=true,resolution,graphicsSettings,onGraphicsSetting=()=>{},language,timeout=30000,dispatchBudget=10000000}={}) {
+export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtime/wc3.wasm',saves,maps,transport=null,map=null,onStatus=()=>{},onReport=()=>{},onFrame=()=>{},onSnapshot,onScreenshot,onCacheProgress=()=>{},backgroundCache=true,skipIntro=true,captureGraphics=false,graphicsDebugChecks=false,batchGraphics=true,nativeGraphics=false,legacyClampToEdge=true,nativeTextureShader=true,streamingBuffers=false,strictFinish=false,vsync=true,maxFps=0,profileRpc=false,audioEnabled=true,resolution,graphicsSettings,onGraphicsSetting=()=>{},language,timeout=30000,dispatchBudget=10000000}={}) {
   if(!Number.isInteger(dispatchBudget)||dispatchBudget<0||dispatchBudget>0xffffffff)throw new Error('Diagnostic dispatch budget must be uint32 (zero disables the limit)');
   if(!Number.isInteger(timeout)||timeout<0||timeout>0x7fffffff)throw new Error('Invalid session timeout (zero disables the limit)');
   resolution=gameResolution(resolution);graphicsSettings=gameGraphics(graphicsSettings);
@@ -179,6 +179,9 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
   // start after long downloads, when that click no longer counts as activation.
   const player=new PCMPlayer({muted:!audioEnabled,...audioContext?{context:audioContext}:{}}),audio=new AudioDispatcher(player);
   const saveWriter=new SaveWriter(saves,error=>onStatus(`Сохранения: ${error.message}`));
+  // The player's maps (Warcraft's download folder) have their own store: the
+  // launcher's Maps tab. Without one they stay with the saves, as before.
+  const mapWriter=new SaveWriter(maps,error=>onStatus(`Карты: ${error.message}`));
   // Muting the final mix keeps Miles playback clocks and cinematic triggers
   // running. Removing the audio device makes guest code poll forever.
   try { await player.unlock(); }
@@ -272,7 +275,7 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
     try{
       // Snapshots already accepted from the guest remain valid after a crash.
       // Do not allow a relaunch to read the profile until their writes settle.
-      try{await saveWriter.pending;}catch(error){report.persistenceError=error.message;}
+      try{await Promise.all([saveWriter.pending,mapWriter.pending]);}catch(error){report.persistenceError=error.message;}
       if(saveWriter.error)report.persistenceError=saveWriter.error.message;
       onReport(report);
     }finally{await cleanup();}
@@ -308,6 +311,7 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
       else if(message.type==='snapshot')onSnapshot?.(message.snapshot);
       else if(message.type==='screenshot')void screenshot(message);
       else if(message.type==='save-changes')await saveWriter.enqueue(message.changes);
+      else if(message.type==='map-changes')await mapWriter.enqueue(message.changes);
       else if(message.type==='packet'){
         if(message.destination===255){try{transport?.send(255,message.data);}catch{ /* Optional telemetry. */ }}
         else transport?.send(message.destination,message.data);
@@ -319,17 +323,21 @@ export async function runDiagnostics({canvas,audioContext,media,wasmUrl='/runtim
       else if(message.type==='finished'){
         finished=true;clearTimeout(shutdownTimer);clearTimeout(timer);
         try{
-          await saveWriter.enqueue({files:message.savedFiles||[],deleted:message.deletedFiles||[],full:true});
+          await Promise.all([saveWriter.enqueue({files:message.savedFiles||[],deleted:message.deletedFiles||[],full:true}),
+            mapWriter.enqueue({files:message.mapFiles||[],deleted:message.deletedMaps||[]})]);
           if(saveWriter.error)message.report.persistenceError=saveWriter.error.message;
+          if(mapWriter.error)message.report.mapStoreError=mapWriter.error.message;
           onReport(message.report);
         }finally{await cleanup();}
       }
     }catch(error){await fail(error);}
   };
   try{
+    // Maps first: a launcher moving maps out of older saves finishes that first.
+    const userMaps=await maps?.files().catch(error=>{onStatus(`Карты: ${error.message}`);return [];})||[];
     const savedFiles=await saves?.list()||[];
     const offscreen=canvas?.transferControlToOffscreen();
-    worker.postMessage({type:'start',options:{wasmUrl,canvas:offscreen,map,backgroundCache,skipIntro,captureGraphics,graphicsDebugChecks,batchGraphics,nativeGraphics,legacyClampToEdge,nativeTextureShader,streamingBuffers,strictFinish,vsync,maxFps,profileRpc,resolution,graphicsSettings,language,monitor:typeof onSnapshot==='function',persist:!!saves,timeout,budget:dispatchBudget,audio:true,peerId:transport?.peerId,peerIds:transport?.peerIds,savedFiles}},offscreen?[offscreen]:[]);
+    worker.postMessage({type:'start',options:{wasmUrl,canvas:offscreen,map,backgroundCache,skipIntro,captureGraphics,graphicsDebugChecks,batchGraphics,nativeGraphics,legacyClampToEdge,nativeTextureShader,streamingBuffers,strictFinish,vsync,maxFps,profileRpc,resolution,graphicsSettings,language,monitor:typeof onSnapshot==='function',persist:!!saves,separateMaps:!!maps,userMaps,timeout,budget:dispatchBudget,audio:true,peerId:transport?.peerId,peerIds:transport?.peerIds,savedFiles}},offscreen?[offscreen]:[]);
   }catch(error){await cleanup();throw error;}
   // On-screen keys (touch screens): the same messages a keyboard sends.
   const key=(type,{keyCode,text='',extended=false}={})=>{

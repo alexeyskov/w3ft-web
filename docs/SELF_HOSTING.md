@@ -217,6 +217,42 @@ Changes to Python dependencies, server code or container configuration still
 require rebuilding/recreating the application. Interface-only updates do not
 update the packaged game runtime in `var/runtime`.
 
+The local deployment helper can update only maps without restarting services:
+
+```sh
+bash ./sync-vps.sh --maps --dry-run
+bash ./sync-vps.sh --maps
+```
+
+Set `VPS=user@host` first (`VPS_DIR` defaults to `/opt/w3ft-web`). This uploads
+only `.w3m`, `.w3x` and `.w3n` files from existing local `resources/Maps/` and
+`var/maps/` directories in one rsync transfer. It does not update the website,
+server, game runtime or startup sets, and does not delete remote maps.
+To also remove maps deleted locally, use the separate mirror mode:
+
+```sh
+bash ./sync-vps.sh --maps-full-sync --dry-run
+bash ./sync-vps.sh --maps-full-sync
+```
+
+This deletes remote `.w3m`, `.w3x` and `.w3n` files missing from the selected
+local map roots after transfers finish. Other file types and hidden files are
+preserved. Only existing local roots participate: a missing local root does
+not delete its remote counterpart, while an existing empty local root clears
+its remote maps. The map root directories themselves remain in place so their
+live Docker bind mounts keep working. This mode also uses one rsync transfer
+and does not restart containers or disconnect players.
+
+The helper checks the running container's read-only map bind mounts before
+uploading; missing mounts require a separately scheduled deployment update.
+Each completed file replaces its destination by rename, keeping partial
+uploads out of the catalogue. An interrupted transfer leaves completed maps
+in place; rerun the command to retry unfinished files. The server rescans the
+catalogue on request. Running games keep their mounted map list and active
+matches; relaunch the game to see newly added maps. Prefer a new filename
+when releasing a changed map so clients already downloading its old version
+can finish it unchanged.
+
 Other devices need HTTPS for SharedArrayBuffer. The supplied Caddy configuration uses `WC3_DOMAIN`; keep WebSocket Upgrade, byte-range behavior and cross-origin isolation headers through any reverse proxy. Never put game directories under a public GitHub repository or bake them into a public container image without the required permissions. The current server sends game resources and game-derived code to clients; this guide is not permission to operate a public service. Review [LEGAL.md](LEGAL.md) first.
 
 The four permanent public lobbies are shared by all game languages, with 200

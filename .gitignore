@@ -28,6 +28,8 @@ test-results/
 /tests/browser_smoke.py
 /tests/admin_browser.py
 /tests/issues_browser.py
+/tests/user_maps_browser.py
+/tests/map_store_test.mjs
 /tests/test_admin.py
 /tests/test_activity.py
 /tests/test_issues.py

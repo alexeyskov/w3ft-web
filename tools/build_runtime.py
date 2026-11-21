@@ -47,6 +47,7 @@ VARIANTS = {
 TRAMPOLINE_VERSION = 1
 SELF_CALL_VERSION = 2
 LOCAL_REGS_VERSION = 2
+SHARED_PUBLICATION_VERSION = 1
 # A call statement of its own: at the start of a line or after ; { }.
 DIRECT_CALL = re.compile(r"(?:^|(?<=[;{}]))[ \t]*sub_[0-9a-f]{8}\(c\);", re.M)
 CALL_LIKE = re.compile(r"\bsub_[0-9a-f]{8}\(")
@@ -58,6 +59,48 @@ DIRECT_GUEST_CALL = re.compile(r"PUSH32\((0x[0-9a-f]+u)\); sub_([0-9a-f]{8})\(c\
 _local_spec = importlib.util.spec_from_file_location("wc3_local_regs", ROOT / "tools/local_regs.py")
 _local_regs = importlib.util.module_from_spec(_local_spec)
 _local_spec.loader.exec_module(_local_regs)
+
+
+def fence_shared_publications(text):
+    """Order a flag-publication / waiter-check handoff on shared WASM memory.
+
+    A small lock-release routine writes 1 through a register, then loads the
+    adjacent waiter state and conditionally signals it. Plain WASM loads and
+    stores do not provide this inter-thread ordering. On ARM, two contenders
+    can both sleep with the lock already free: the releaser saw no waiter and
+    the waiter still saw the old lock value. The game's 60-second retry only
+    hides the lost wakeup after a long freeze.
+
+    Fence protected writes before publication, and publication before the
+    waiter check. Match the instruction shape, not a game address or symbol;
+    leave general guest memory accesses and the guest's wait logic unchanged.
+    Fences preserve registers/flags and also work for unaligned operands.
+    """
+    # Generated instructions have a single-line comment. Do not let a failed
+    # match backtrack through every subsequent comment in a large function.
+    gap = r'\s*(?:/\*[^\n]*\*/\s*)?'
+    publication = re.compile(
+        r'(?P<store>MR32\((?P<base>c->(?:eax|ecx|edx|ebx|ebp|esi|edi))\) = \(0x1u\);)'
+        + rf'(?P<gap>{gap})'
+        + r'(?P<check>c->(?:eax|ecx|edx|ebx|ebp|esi|edi) = \(uint32_t\)\(MR32\((?P=base)\+0x4u\)\);)',
+        re.S)
+    count = 0
+
+    def rewrite(match):
+        source = match.group(0)
+        # Only the conditional signaling shape, not an ordinary initializer.
+        if 'if(CC_E)' not in source or 'DISPATCH_CALL(c,' not in source:
+            return source
+
+        def fence(store):
+            nonlocal count
+            count += 1
+            return ('wc3_memory_fence();\n    ' + store['store'] +
+                    '\n    wc3_memory_fence();' + store['gap'] + store['check'])
+
+        return publication.sub(fence, source)
+
+    return FUNCTION_BODY.sub(rewrite, text), count
 
 
 def local_register_source(text):
@@ -385,9 +428,11 @@ def build(args):
         source_hash = digest(source)
         include_hash = digest(include / "decls.h") if include else ""
         text = None
-        transforms = {'local_register_functions': 0, 'self_call_loops': 0, 'inlined_wrappers': 0}
+        transforms = {'local_register_functions': 0, 'self_call_loops': 0, 'inlined_wrappers': 0,
+                      'shared_publications': 0}
         if include:
-            text, transforms['inlined_wrappers'] = inline_virtual_wrappers(source.read_text(), callees)
+            text, transforms['shared_publications'] = fence_shared_publications(source.read_text())
+            text, transforms['inlined_wrappers'] = inline_virtual_wrappers(text, callees)
             text, transforms['self_call_loops'] = self_call_source(text)
             if configuration['local_registers']:
                 text, transforms['local_register_functions'] = local_register_source(text)
@@ -469,6 +514,7 @@ def build(args):
     temporary.replace(wasm)
     result = {
         "schema": 1, "artifact": names["artifact"], "variant": variant, "features": features,
+        "shared_publication_version": SHARED_PUBLICATION_VERSION,
         "sha256": digest(wasm), "bytes": wasm.stat().st_size,
         "configuration": configuration, "link_flags": link_flags, "runtime_headers": original_header_hashes,
         "memory": {"import": "env.memory", "shared": True, "initial_pages": 1024,
@@ -490,7 +536,7 @@ def build(args):
                     for module in modules],
         "sources": [{key: value for key, value in item.items() if key not in ("path", "cached")} for item in objects],
         "optimizations": {key: sum(item[key] for item in objects) for key in (
-            'local_register_functions', 'self_call_loops', 'inlined_wrappers')},
+            'local_register_functions', 'self_call_loops', 'inlined_wrappers', 'shared_publications')},
         "strict_memory": bool(getattr(args, "strict_memory", False)),
         "wasm_built": True, "playable": False, "campaign_verified": False, "multiplayer_verified": False,
         "elapsed_seconds": round(time.monotonic() - started, 2),
