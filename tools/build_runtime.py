@@ -61,6 +61,37 @@ _local_regs = importlib.util.module_from_spec(_local_spec)
 _local_spec.loader.exec_module(_local_regs)
 
 
+# Warcraft III 1.26 refuses LAN maps over 8 MiB ("Слишком большой размер
+# файла", NETERROR_MAPFILEBADSIZE): game.dll compares a map's size with
+# 0x800000 in three places. Patch 1.29 raised the limit to 128 MiB, which is
+# also the largest file the runtime lets the game write (a LAN download). The
+# comparisons are raised in the lifted C; the image itself stays unchanged.
+# Offsets are from game.dll's image base, for the one game.dll listed by its
+# SHA-256; each comparison must be found exactly once. game.dll+0x401315
+# also compares with 0x800000, but it limits other data the game writes to a
+# file, not maps, and stays.
+MAP_SIZE_LIMIT = 0x8000000
+MAP_SIZE_CHECKS = {
+    "6d21bd9a0f9fbc8446f455c9e89ac994fed68174426fe608fcb9baefd4dec53c": (
+        0x6577e3,  # loading the map chosen for a LAN game: 0x33 (NETERROR_MAPFILEBADSIZE) above the limit
+        0x66ed7e,  # a game's map record from the network (path, size, checksums): dropped above the limit
+        0x67ec60,  # the same record in the second network handler
+    ),
+}
+MAP_SIZE_VERSION = 1
+
+
+def map_size_source(text, image_base, offsets):
+    """Raise Warcraft's 8 MiB map-size comparisons at these offsets."""
+    count = 0
+    for offset in offsets:
+        pattern = re.compile(rf"(/\* {image_base + offset:08x}  cmp eax, 0x800000 \*/\n[ \t]*"
+                             r"\{ uint32_t _a=c->eax,_b=)0x800000u,")
+        text, found = pattern.subn(rf"\g<1>0x{MAP_SIZE_LIMIT:x}u,", text)
+        count += found
+    return text, count
+
+
 def fence_shared_publications(text):
     """Order a flag-publication / waiter-check handoff on shared WASM memory.
 
@@ -397,6 +428,8 @@ def build(args):
     version = subprocess.run([str(compiler), "--version"], check=True, capture_output=True, text=True).stdout
     modules = module_inputs(args.module_dirs)
     callees = virtual_callees(source for module in modules for source in module['sources'])
+    map_size = {module['name']: (int(module['report']['image_base'], 16), MAP_SIZE_CHECKS[module['report']['sha256']])
+                for module in modules if module['report'].get('sha256') in MAP_SIZE_CHECKS}
     layout_name = getattr(args, "memory_layout", "legacy")
     layout = memory_layout(layout_name, modules)
     output = args.output.resolve()
@@ -429,9 +462,12 @@ def build(args):
         include_hash = digest(include / "decls.h") if include else ""
         text = None
         transforms = {'local_register_functions': 0, 'self_call_loops': 0, 'inlined_wrappers': 0,
-                      'shared_publications': 0}
+                      'shared_publications': 0, 'map_size_checks': 0}
         if include:
-            text, transforms['shared_publications'] = fence_shared_publications(source.read_text())
+            text = source.read_text()
+            if module in map_size:
+                text, transforms['map_size_checks'] = map_size_source(text, *map_size[module])
+            text, transforms['shared_publications'] = fence_shared_publications(text)
             text, transforms['inlined_wrappers'] = inline_virtual_wrappers(text, callees)
             text, transforms['self_call_loops'] = self_call_source(text)
             if configuration['local_registers']:
@@ -443,7 +479,7 @@ def build(args):
         compiled_hash = hashlib.sha256(text.encode()).hexdigest() if text is not None else source_hash
         key = hashlib.sha256((source_hash + compiled_hash + include_hash + header_key + configuration_key).encode()).hexdigest()
         if object_path.exists() and hash_path.exists() and hash_path.read_text().strip() == key:
-            return {"path": object_path, "cached": True, "source": str(source), "sha256": source_hash, **transforms}
+            return {"path": object_path, "cached": True, "source": str(source), "sha256": source_hash, "module": module, **transforms}
         temporary = object_path.with_suffix(".tmp.o")
         command = [str(compiler), *flags, "-I" + str(ROOT / "runtime")]
         if include:
@@ -460,7 +496,7 @@ def build(args):
             raise RuntimeError(f"Compile failed: {source}\n{process.stderr[-6000:]}")
         temporary.replace(object_path)
         hash_path.write_text(key + "\n")
-        return {"path": object_path, "cached": False, "source": str(source), "sha256": source_hash, **transforms}
+        return {"path": object_path, "cached": False, "source": str(source), "sha256": source_hash, "module": module, **transforms}
 
     jobs = [(source, module["name"], module["folder"])
             for module in modules for source in module["sources"]]
@@ -473,6 +509,11 @@ def build(args):
                 print(json.dumps({"phase": "objects", "done": index, "total": len(jobs),
                                   "cached": sum(item["cached"] for item in objects),
                                   "seconds": round(time.monotonic() - started)}), flush=True)
+    for name, (_, offsets) in map_size.items():
+        found = sum(item['map_size_checks'] for item in objects if item['module'] == name)
+        if found != len(offsets):
+            raise RuntimeError(f"Found {found} of {len(offsets)} map-size comparisons in {name}; "
+                               "the lifted code does not match the known game.dll")
     if args.objects_only:
         return {"objects": len(objects), "cached_objects": sum(item["cached"] for item in objects),
                 "linked": False, "playable": False}
@@ -515,6 +556,8 @@ def build(args):
     result = {
         "schema": 1, "artifact": names["artifact"], "variant": variant, "features": features,
         "shared_publication_version": SHARED_PUBLICATION_VERSION,
+        # The largest map a LAN game hosts or joins (see MAP_SIZE_CHECKS).
+        "map_size_limit": MAP_SIZE_LIMIT if map_size else 0x800000, "map_size_version": MAP_SIZE_VERSION,
         "sha256": digest(wasm), "bytes": wasm.stat().st_size,
         "configuration": configuration, "link_flags": link_flags, "runtime_headers": original_header_hashes,
         "memory": {"import": "env.memory", "shared": True, "initial_pages": 1024,
@@ -534,9 +577,9 @@ def build(args):
                      "functions": module["report"]["generated_functions"],
                      "unsupported_instructions": module["report"]["unsupported_instructions"]}
                     for module in modules],
-        "sources": [{key: value for key, value in item.items() if key not in ("path", "cached")} for item in objects],
+        "sources": [{key: value for key, value in item.items() if key not in ("path", "cached", "module")} for item in objects],
         "optimizations": {key: sum(item[key] for item in objects) for key in (
-            'local_register_functions', 'self_call_loops', 'inlined_wrappers', 'shared_publications')},
+            'local_register_functions', 'self_call_loops', 'inlined_wrappers', 'shared_publications', 'map_size_checks')},
         "strict_memory": bool(getattr(args, "strict_memory", False)),
         "wasm_built": True, "playable": False, "campaign_verified": False, "multiplayer_verified": False,
         "elapsed_seconds": round(time.monotonic() - started, 2),

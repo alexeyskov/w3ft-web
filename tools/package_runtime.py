@@ -9,7 +9,8 @@ import shutil
 ROOT = Path(__file__).resolve().parents[1]
 # What both builds must share: the compat build differs only in how tail jumps
 # are made (tools/build_runtime.py --variant compat).
-SHARED = ('modules', 'runtime_headers', 'strict_memory', 'link_flags', 'memory', 'shared_publication_version')
+SHARED = ('modules', 'runtime_headers', 'strict_memory', 'link_flags', 'memory', 'shared_publication_version',
+          'map_size_limit', 'map_size_version')
 
 
 def runtime_build_id(build, sources, compat=None):

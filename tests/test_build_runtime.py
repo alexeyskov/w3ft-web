@@ -20,6 +20,33 @@ except ValueError:
     SDK = None
 
 
+class MapSizeTests(unittest.TestCase):
+    GAME = "6d21bd9a0f9fbc8446f455c9e89ac994fed68174426fe608fcb9baefd4dec53c"
+
+    def test_only_the_listed_map_size_comparisons_are_raised(self):
+        block = ("    /* {0:08x}  cmp eax, 0x800000 */\n"
+                 "    {{ uint32_t _a=c->eax,_b=0x800000u,_r=_a-_b; FLAGS_SUB_M(_a,_b,_r,32,0x3fu); }}\n")
+        offsets = builder.MAP_SIZE_CHECKS[self.GAME]
+        source = "".join(block.format(0x02000000 + offset) for offset in offsets) + block.format(0x02401315)
+        patched, count = builder.map_size_source(source, 0x02000000, offsets)
+        self.assertEqual(count, 3)
+        self.assertEqual(patched.count("_b=0x8000000u,"), 3)
+        self.assertIn(block.format(0x02401315), patched, "the saved-data limit is not a map limit")
+        self.assertEqual(builder.map_size_source(patched, 0x02000000, offsets), (patched, 0))
+        # Another image base: other addresses, nothing raised.
+        self.assertEqual(builder.map_size_source(source, 0x6f000000, offsets), (source, 0))
+
+    @unittest.skipUnless((ROOT / "var/lift-compact/game/report.json").is_file(), "Lifted game.dll required")
+    def test_each_comparison_is_found_once_in_the_lifted_game(self):
+        report = json.loads((ROOT / "var/lift-compact/game/report.json").read_text())
+        if report.get("sha256") != self.GAME:
+            self.skipTest("Another game.dll")
+        base = int(report["image_base"], 16)
+        found = sum(builder.map_size_source(path.read_text(), base, builder.MAP_SIZE_CHECKS[self.GAME])[1]
+                    for path in sorted((ROOT / "var/lift-compact/game").glob("shard_*.c")))
+        self.assertEqual(found, 3)
+
+
 @unittest.skipUnless(fixture.HAVE_DEPS, "Lifter dependencies required")
 class BuildInputTests(unittest.TestCase):
     @unittest.skipUnless(SDK, "Local WASI SDK required")

@@ -11,6 +11,8 @@ browsers without WebAssembly tail calls: the lockstep match must stay in step.
 --user-map PATH: the host plays that map from its browser's map store (Maps/Download,
 the site's Maps tab); the guest must download it through Warcraft and keep it in
 its own map store, byte for byte. Neither map goes to the server.
+--load-only: after both clients load the map, check only that the lockstep match
+goes on (for a map without workers to order, such as an RPG).
 """
 import argparse
 import asyncio
@@ -57,13 +59,15 @@ BOOT = r'''async ({room,resolution,compat,language,userMap}) => {
   window.probeMaps=new MapStore();
   if(userMap)await probeMaps.add([new File([Uint8Array.from(atob(userMap.data),c=>c.charCodeAt(0))],userMap.name)]);
   const transport=window.probeTransport=await new FrameTransport(room,{publicLobby:true}).connect();
-  window.probe={log:[],report:null,frame:null,network:{sent:{},received:{},recent:[],actionPayloads:[]}};
+  // A map download is thousands of packets: map checks are kept apart from the recent ones.
+  window.probe={log:[],report:null,frame:null,network:{sent:{},received:{},recent:[],actionPayloads:[],mapChecks:[]}};
   const streams=new Map();
   const record=(direction,peer,packet)=>{
     const id=packet[1],key=id.toString(16).padStart(2,'0'),net=probe.network;
     net[direction][key]=(net[direction][key]||0)+1;
     const event={direction,peer,id:key,size:packet.length,time:performance.now(),head:Array.from(packet.subarray(0,48))};
     if(id===0x30||id===0x3d)event.text=new TextDecoder().decode(packet);
+    if(id===0x3d)net.mapChecks.push({direction,text:event.text});
     net.recent.push(event);if(net.recent.length>500)net.recent.shift();
     if(id===0x26&&direction==='sent')net.actionPayloads.push(Array.from(packet.subarray(8)));
   };
@@ -193,7 +197,7 @@ class Peer:
         return result
 
 
-async def main(url,output,timeout,resolution,compat='none',host_browser='chromium',guest_browser='chromium',late_guest=False,user_map=None):
+async def main(url,output,timeout,resolution,compat='none',host_browser='chromium',guest_browser='chromium',late_guest=False,user_map=None,load_only=False):
     # The host's own map: in its map store, listed in Warcraft's download folder
     # (the folder's ".." row, then this map), and in no catalog of the server.
     hosted=None
@@ -255,7 +259,7 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             await guest.action({'click':[875,650],'frames':12},'joined')
             await guest.wait('(probe.network.received["04"]||0)>0')
             await host.wait('(probe.network.received["1e"]||0)>0')
-            await guest.wait(f'probe.network.recent.some(p=>p.id==="3d"&&p.text?.toLowerCase().includes({json.dumps(map_text)}))')
+            await guest.wait(f'probe.network.mapChecks.some(p=>p.text.toLowerCase().includes({json.dumps(map_text)}))')
             if hosted:
                 # Warcraft downloads the host's map; once it closes the file the
                 # map is in the guest's map store, before the match even starts.
@@ -272,15 +276,18 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             await asyncio.gather(*(peer.frames(15) for peer in peers))
             await asyncio.gather(*(peer.capture('gameplay') for peer in peers))
             baseline=await guest.page.evaluate('({actions:probe.network.sent["26"]||0,steps:probe.network.received["0c"]||0})')
-            # F8 selects an idle worker for any of the randomly assigned races,
-            # without depending on its exact starting world coordinates.
-            await guest.action({'key':'F8','frames':8},'units-selected')
-            baseline['actions']=await guest.page.evaluate('probe.network.sent["26"]||0')
-            host_actions_before=await host.page.evaluate('probe.network.received["26"]||0')
-            await guest.action({'click':[730,430],'button':'right','frames':12},'unit-command')
-            await guest.wait(f'(probe.network.sent["26"]||0)>{baseline["actions"]}')
-            await host.wait(f'(probe.network.received["26"]||0)>{host_actions_before}')
-            await guest.wait(f'(probe.network.received["0c"]||0)>={baseline["steps"]+20}')
+            if load_only:
+                await guest.wait(f'(probe.network.received["0c"]||0)>={baseline["steps"]+50}')
+            else:
+                # F8 selects an idle worker for any of the randomly assigned races,
+                # without depending on its exact starting world coordinates.
+                await guest.action({'key':'F8','frames':8},'units-selected')
+                baseline['actions']=await guest.page.evaluate('probe.network.sent["26"]||0')
+                host_actions_before=await host.page.evaluate('probe.network.received["26"]||0')
+                await guest.action({'click':[730,430],'button':'right','frames':12},'unit-command')
+                await guest.wait(f'(probe.network.sent["26"]||0)>{baseline["actions"]}')
+                await host.wait(f'(probe.network.received["26"]||0)>{host_actions_before}')
+                await guest.wait(f'(probe.network.received["0c"]||0)>={baseline["steps"]+20}')
             await asyncio.gather(*(peer.capture('after-command') for peer in peers))
             evidence['network']={peer.name:await peer.page.evaluate('probe.network') for peer in peers}
             for peer in peers:
@@ -292,7 +299,7 @@ async def main(url,output,timeout,resolution,compat='none',host_browser='chromiu
             assert guest_packets.get('07',0)==0 and guest_packets.get('1c',0)==0,'Player left or was kicked during the observed match'
             assert evidence['network']['guest']['sent'].get('21',0)==0,'Guest left the match before shutdown'
             evidence['checks']={'userMapDownloadedByGuest':bool(hosted),'publicLobbyTwoPeers':True,'originalDiscovery':True,'originalJoin':True,'guestLaunchedAfterHosting':late_guest,
-                'bothLoadedEchoIsles':True,'guestCommandSentAndReceived':True,'continuedLockstepFrames':True,
+                'bothLoadedTheMap':True,'guestCommandSentAndReceived':not load_only,'continuedLockstepFrames':True,
                 'liveLANGameCount':True,'runtimeFaults':False}
             print(json.dumps({'stage':'match-verified','checks':evidence['checks']}),flush=True)
         except BaseException as error:
@@ -349,5 +356,6 @@ if __name__=='__main__':
     parser.add_argument('--host-browser',choices=['chromium','webkit','firefox'],default='chromium')
     parser.add_argument('--guest-browser',choices=['chromium','webkit','firefox'],default='chromium')
     parser.add_argument('--late-guest',action='store_true',help='Launch the guest only after the host has created its Warcraft game')
-    parser.add_argument('--user-map',type=Path,help='A 2-player map the host plays from its map store; the guest downloads it')
-    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution,args.compat,args.host_browser,args.guest_browser,args.late_guest,args.user_map))
+    parser.add_argument('--user-map',type=Path,help='A map for 2+ players the host plays from its map store; the guest downloads it')
+    parser.add_argument('--load-only',action='store_true',help='Check loading and lockstep only, without ordering a worker')
+    args=parser.parse_args();asyncio.run(main(args.url,args.output,args.timeout,args.resolution,args.compat,args.host_browser,args.guest_browser,args.late_guest,args.user_map,args.load_only))
